@@ -172,13 +172,6 @@ void TunerApplet::buildUI()
         "QPushButton:hover { background: {{color.background.1}}; }");
     btnCol->addWidget(m_tuneBtn);
 
-    m_operateBtn = new QPushButton("OPERATE");
-    m_operateBtn->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Expanding);
-    AetherSDR::ThemeManager::instance().applyStyleSheet(m_operateBtn, "QPushButton { background: {{color.background.2}}; border: 1px solid {{color.background.2}}; "
-        "border-radius: 3px; color: {{color.text.primary}}; font-size: 10px; font-weight: bold; }"
-        "QPushButton:hover { background: {{color.background.1}}; }");
-    btnCol->addWidget(m_operateBtn);
-
     bottomRow->addLayout(btnCol, 3);  // stretch 3 (30%)
 
     vbox->addLayout(bottomRow);
@@ -221,6 +214,40 @@ void TunerApplet::buildUI()
         vbox->addWidget(m_antContainer);
     }
 
+    // Direct-access mode buttons (replaces the old single cycling button):
+    // one press each for OPERATE / BYPASS / STANDBY, no click-through-3-states.
+    // Laid out the same way as the antenna row directly above so the two
+    // rows read as one aligned 3-column control group (ANT under OPER, etc).
+    {
+        auto* modeRow = new QHBoxLayout;
+        modeRow->setSpacing(2);
+
+        static const char* kModeBtnStyle =
+            "QPushButton { background: {{color.background.2}}; border: 1px solid {{color.background.2}}; "
+            "border-radius: 3px; color: {{color.text.primary}}; font-size: 10px; font-weight: bold; }"
+            "QPushButton:hover { background: {{color.background.1}}; }";
+
+        auto makeModeBtn = [](const QString& text) {
+            auto* btn = new QPushButton(text);
+            btn->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+            btn->setFixedHeight(22);
+            return btn;
+        };
+
+        m_operateBtn = makeModeBtn("OPER");
+        m_bypassBtn  = makeModeBtn("BYP");
+        m_standbyBtn = makeModeBtn("STBY");
+        AetherSDR::ThemeManager::instance().applyStyleSheet(m_operateBtn, kModeBtnStyle);
+        AetherSDR::ThemeManager::instance().applyStyleSheet(m_bypassBtn, kModeBtnStyle);
+        AetherSDR::ThemeManager::instance().applyStyleSheet(m_standbyBtn, kModeBtnStyle);
+
+        modeRow->addWidget(m_operateBtn);
+        modeRow->addWidget(m_bypassBtn);
+        modeRow->addWidget(m_standbyBtn);
+
+        vbox->addLayout(modeRow);
+    }
+
     outer->addWidget(body);
 
     // TUNE button: send autotune command
@@ -236,9 +263,22 @@ void TunerApplet::buildUI()
     connect(static_cast<RelayBar*>(m_c2Bar), &RelayBar::relayAdjusted, this,
             [this](int dir) { if (m_model) m_model->adjustRelay(2, dir); });
 
-    // OPERATE button: cycle through OPERATE → BYPASS → STANDBY → OPERATE
-    connect(m_operateBtn, &QPushButton::clicked, this,
-            &TunerApplet::cycleOperateState);
+    // Direct-access mode buttons: each sets state in one click.
+    connect(m_operateBtn, &QPushButton::clicked, this, [this]() {
+        if (!m_model) return;
+        m_model->setBypass(false);
+        m_model->setOperate(true);
+    });
+    connect(m_bypassBtn, &QPushButton::clicked, this, [this]() {
+        if (!m_model) return;
+        m_model->setBypass(true);
+        m_model->setOperate(true);
+    });
+    connect(m_standbyBtn, &QPushButton::clicked, this, [this]() {
+        if (!m_model) return;
+        m_model->setBypass(false);
+        m_model->setOperate(false);
+    });
 }
 
 void TunerApplet::setTunerModel(TunerModel* model)
@@ -324,45 +364,35 @@ void TunerApplet::syncFromModel()
     static_cast<RelayBar*>(m_lBar)->setValue(m_relayL);
     static_cast<RelayBar*>(m_c2Bar)->setValue(m_relayC2);
 
-    // Operate/Bypass/Standby button — 3-state display
-    // operate=1, bypass=0 → OPERATE (green)
-    // operate=1, bypass=1 → BYPASS  (orange)
-    // operate=0            → STANDBY (default)
-    if (m_model->isOperate() && !m_model->isBypass()) {
-        m_operateBtn->setText("OPERATE");
-        AetherSDR::ThemeManager::instance().applyStyleSheet(m_operateBtn, "QPushButton { background: #006030; border: 1px solid #008040; "
-            "border-radius: 3px; color: {{color.text.primary}}; font-size: 10px; font-weight: bold; }"
-            "QPushButton:hover { background: #007040; }");
-    } else if (m_model->isOperate() && m_model->isBypass()) {
-        m_operateBtn->setText("BYPASS");
-        AetherSDR::ThemeManager::instance().applyStyleSheet(m_operateBtn, "QPushButton { background: #8a6000; border: 1px solid #a07000; "
-            "border-radius: 3px; color: {{color.text.primary}}; font-size: 10px; font-weight: bold; }"
-            "QPushButton:hover { background: #9a7000; }");
-    } else {
-        m_operateBtn->setText("STANDBY");
-        AetherSDR::ThemeManager::instance().applyStyleSheet(m_operateBtn, "QPushButton { background: {{color.background.2}}; border: 1px solid {{color.background.2}}; "
-            "border-radius: 3px; color: {{color.text.primary}}; font-size: 10px; font-weight: bold; }"
-            "QPushButton:hover { background: {{color.background.1}}; }");
-    }
-}
+    // Three direct-access buttons — highlight whichever matches current state.
+    // operate=1, bypass=0 → OPERATE active (green)
+    // operate=1, bypass=1 → BYPASS  active (orange)
+    // operate=0            → STANDBY active (default/neutral)
+    static const char* kInactiveStyle =
+        "QPushButton { background: {{color.background.2}}; border: 1px solid {{color.background.2}}; "
+        "border-radius: 3px; color: {{color.text.primary}}; font-size: 10px; font-weight: bold; }"
+        "QPushButton:hover { background: {{color.background.1}}; }";
+    static const char* kOperateActiveStyle =
+        "QPushButton { background: #006030; border: 1px solid #008040; "
+        "border-radius: 3px; color: {{color.text.primary}}; font-size: 10px; font-weight: bold; }"
+        "QPushButton:hover { background: #007040; }";
+    static const char* kBypassActiveStyle =
+        "QPushButton { background: #8a6000; border: 1px solid #a07000; "
+        "border-radius: 3px; color: {{color.text.primary}}; font-size: 10px; font-weight: bold; }"
+        "QPushButton:hover { background: #9a7000; }";
+    static const char* kStandbyActiveStyle =
+        "QPushButton { background: #205070; border: 1px solid #2a6a90; "
+        "border-radius: 3px; color: {{color.text.primary}}; font-size: 10px; font-weight: bold; }"
+        "QPushButton:hover { background: #256080; }";
 
-void TunerApplet::cycleOperateState()
-{
-    if (!m_model) return;
+    const bool operateActive = m_model->isOperate() && !m_model->isBypass();
+    const bool bypassActive  = m_model->isOperate() && m_model->isBypass();
+    const bool standbyActive = !m_model->isOperate();
 
-    // Cycle: OPERATE → BYPASS → STANDBY → OPERATE
-    if (m_model->isOperate() && !m_model->isBypass()) {
-        // Currently OPERATE → go to BYPASS
-        m_model->setBypass(true);
-    } else if (m_model->isOperate() && m_model->isBypass()) {
-        // Currently BYPASS → go to STANDBY
-        m_model->setBypass(false);
-        m_model->setOperate(false);
-    } else {
-        // Currently STANDBY → go to OPERATE
-        m_model->setBypass(false);
-        m_model->setOperate(true);
-    }
+    auto& theme = AetherSDR::ThemeManager::instance();
+    theme.applyStyleSheet(m_operateBtn, operateActive ? kOperateActiveStyle : kInactiveStyle);
+    theme.applyStyleSheet(m_bypassBtn,  bypassActive  ? kBypassActiveStyle  : kInactiveStyle);
+    theme.applyStyleSheet(m_standbyBtn, standbyActive ? kStandbyActiveStyle : kInactiveStyle);
 }
 
 void TunerApplet::updateMeters(float fwdPower, float swr)

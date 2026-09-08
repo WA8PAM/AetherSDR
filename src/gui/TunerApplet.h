@@ -42,7 +42,6 @@ public slots:
 private:
     void buildUI();
     void syncFromModel();
-    void cycleOperateState();
     void updateAntennaButtons(int antA);
     void updateValueLabels();
 
@@ -67,6 +66,8 @@ private:
     // Buttons
     QPushButton* m_tuneBtn{nullptr};
     QPushButton* m_operateBtn{nullptr};
+    QPushButton* m_bypassBtn{nullptr};
+    QPushButton* m_standbyBtn{nullptr};
 
     // Antenna switch buttons (TGXL 3x1)
     QPushButton* m_ant1Btn{nullptr};
