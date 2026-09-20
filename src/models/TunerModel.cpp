@@ -138,6 +138,13 @@ void TunerModel::setOperate(bool on)
         qCDebug(lcTuner) << "TunerModel::setOperate: no handle yet, ignoring";
         return;
     }
+    // A new single-command transition supersedes any combined-command hold that
+    // may still be armed from a previous setOperateAndBypass() call. Without
+    // this, a stale m_heldBypass (e.g., val=true from STANDBY→BYPASS) would
+    // block the bypass=0 echo that arrives when the tuner returns to OPERATE,
+    // leaving m_bypass stuck at true and the UI showing BYPASS indefinitely.
+    m_heldOperate = false;
+    m_heldBypass  = false;
     // Neutral intent → Flex "tgxl set handle=<h> mode=" wire (via RadioModel).
     emit operateRequested(on);
     // Optimistic update: reflect the commanded state immediately so the
@@ -151,6 +158,11 @@ void TunerModel::setBypass(bool on)
         qCDebug(lcTuner) << "TunerModel::setBypass: no handle yet, ignoring";
         return;
     }
+    // Same hold-clearing rationale as setOperate(): a new single-command
+    // transition must not be masked by a hold armed in a prior two-command
+    // sequence that never received its confirmation echo.
+    m_heldOperate = false;
+    m_heldBypass  = false;
     // Neutral intent → Flex "tgxl set handle=<h> bypass=" wire (via RadioModel).
     emit bypassRequested(on);
     // Optimistic update: reflect the commanded state immediately so the
