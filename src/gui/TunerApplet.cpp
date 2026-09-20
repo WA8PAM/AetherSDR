@@ -113,7 +113,7 @@ constexpr const char* kBypassActiveStyle =
 TunerApplet::TunerApplet(QWidget* parent)
     : QWidget(parent)
 {
-    theme::setContainer(this, QStringLiteral("applet/tuner"));
+theme::setContainer(this, QStringLiteral("applet/tuner"));
     hide();   // hidden by default until toggled on
     setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Fixed);
 
@@ -915,6 +915,11 @@ void TunerApplet::setAlertText(const QString& text)
     }
 }
 
+void TunerApplet::persistPttSeen(bool& flag, const QString& /*settingsKey*/)
+{
+    flag = true;  // in-memory latch only; source label hides for the session
+}
+
 void TunerApplet::updatePortRows()
 {
     if (!m_portA || !m_portB) return;
@@ -924,22 +929,28 @@ void TunerApplet::updatePortRows()
     // where the client can only report the one radio it happens to be
     // connected to.
     if (m_model && m_model->hasDirectConnection() && m_model->hasPortInfo()) {
-        applyPortInfo(m_portA, m_model->portA());
-        applyPortInfo(m_portB, m_model->portB());
+        if (m_model->portA().ptt) persistPttSeen(m_pttSeenA, QStringLiteral("pttSeenPortA"));
+        if (m_model->portB().ptt) persistPttSeen(m_pttSeenB, QStringLiteral("pttSeenPortB"));
+        applyPortInfo(m_portA, m_model->portA(), m_pttSeenA);
+        applyPortInfo(m_portB, m_model->portB(), m_pttSeenB);
         updateActivePort();
         return;
     }
 
-    // Fallback: the Flex-relayed "amplifier" status carries no per-port block
-    // at all, so without the direct connection this is the client's view of
-    // its own radio rather than the tuner's report. Port A is assumed to be
-    // the networked radio's and port B to be on RF sense — true of the common
-    // wiring, and the honest limit of what is knowable on this path.
+    // Relay path: the Flex-relayed status carries no per-port trigger-mode
+    // field, so the source label is only shown where we have positive evidence.
+    // Port A: we know it is the connected radio — show the radio name unless
+    // PTT has been latched (which reveals it is PTT-triggered, not RF sense).
+    // Port B: trigger mode is unknown; leave the label hidden rather than
+    // guess "RF SENSE" and mislead PTT-mode users.
     const QString modelName = m_radioModelName.trimmed();
-    m_portA->setSourceText(m_radioConnected && !modelName.isEmpty()
-                               ? modelName
-                               : tr("NO RADIO"));
-    m_portB->setSourceText(tr("RF SENSE"));
+    if (m_model && m_model->pttA()) persistPttSeen(m_pttSeenA, QStringLiteral("pttSeenPortA"));
+    if (m_model && m_model->pttB()) persistPttSeen(m_pttSeenB, QStringLiteral("pttSeenPortB"));
+    const bool showA = !m_pttSeenA && m_radioConnected && !modelName.isEmpty();
+    m_portA->setSourceVisible(showA);
+    if (showA)
+        m_portA->setSourceText(modelName);
+    m_portB->setSourceVisible(false);  // trigger mode unknown on relay path
 
     const bool haveFreq = m_radioConnected && m_portAFreqMhz > 0.0;
     m_portA->setFrequencyMhz(haveFreq ? m_portAFreqMhz : 0.0);
@@ -955,15 +966,21 @@ void TunerApplet::updatePortRows()
     updateActivePort();
 }
 
-void TunerApplet::applyPortInfo(AccessoryPortRow* row, const TunerPortInfo& info)
+void TunerApplet::applyPortInfo(AccessoryPortRow* row, const TunerPortInfo& info,
+                                bool pttSeen)
 {
-    // A port the tuner has no live reading on is one nothing is being heard
-    // on. It is labelled RF SENSE rather than with the radio name the tuner
-    // reports there anyway: `flexB` reads FLEX-8600 on a port carrying
-    // nothing, so trusting it would put a radio on a port that has none.
-    row->setSourceText(info.live && !info.source.trimmed().isEmpty()
-                           ? info.source.trimmed()
-                           : tr("RF SENSE"));
+    // Source label: shown only when we have positive evidence of what is on
+    // the port (live reading, no PTT latch). Hidden otherwise — "RF SENSE" was
+    // an assumption about trigger mode the protocol never confirms, so showing
+    // nothing is more honest than guessing. Once PTT fires on a port the latch
+    // keeps the label hidden for the session; on the next connection the label
+    // starts hidden (default) and stays hidden until a live non-PTT read.
+    const bool showSource = !pttSeen
+                            && info.live
+                            && !info.source.trimmed().isEmpty();
+    row->setSourceVisible(showSource);
+    if (showSource)
+        row->setSourceText(info.source.trimmed());
 
     // freqX is kHz on the wire. The band comes from that frequency through
     // the project's own band table rather than from the tuner's `bandX`
@@ -1064,6 +1081,14 @@ void TunerApplet::setTunerModel(TunerModel* model)
     connect(m_model, &TunerModel::pttChanged, this, [this](bool a, bool b) {
         m_portA->setPtt(a);
         m_portB->setPtt(b);
+        // Latch the PTT-seen flag and hide the source label for that port.
+        // On the direct path, portsChanged -> updatePortRows -> applyPortInfo
+        // owns the label; on the relay path we update it here.
+        // Either way: once PTT fires the label stays hidden for the session.
+        if (a) persistPttSeen(m_pttSeenA, QStringLiteral("pttSeenPortA"));
+        if (b) persistPttSeen(m_pttSeenB, QStringLiteral("pttSeenPortB"));
+        if (m_portA && m_pttSeenA) m_portA->setSourceVisible(false);
+        if (m_portB && m_pttSeenB) m_portB->setSourceVisible(false);
     });
 
     connect(m_model, &TunerModel::directConnectionChanged, this, updateAntVisible);
