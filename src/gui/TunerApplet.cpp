@@ -550,23 +550,33 @@ void TunerApplet::buildExpandedUI(QVBoxLayout* vbox)
     connect(m_stbyBtn, &QPushButton::clicked, this, [this]() {
         if (!m_model) return;
         if (!m_model->isOperate()) {
-            // Already in standby — return to operate. Same order as
-            // cycleOperateState's standby leg so both paths command the
-            // tuner identically.
-            m_model->setBypass(false);
+            // Already in standby — return to operate. Bypass is always clear in
+            // standby, so only one command is needed; setOperate handles it.
             m_model->setOperate(true);
+        } else if (m_model->isBypass()) {
+            // BYPASS → STANDBY: two commands (bypass=0, operate=0). Use the
+            // combined method to hold both fields against intermediate echoes —
+            // without it the first echo reverts the optimistic update for the
+            // second field and the display briefly flashes OPERATE.
+            m_model->setOperateAndBypass(false, false);
         } else {
-            m_model->setBypass(false);
+            // OPERATE → STANDBY: bypass is already 0, one command suffices.
             m_model->setOperate(false);
         }
     });
     connect(m_bypBtn, &QPushButton::clicked, this, [this]() {
         if (!m_model) return;
         if (m_model->isOperate() && m_model->isBypass()) {
-            m_model->setBypass(false);   // back to operate, still out of standby
-        } else {
-            m_model->setOperate(true);
+            // BYPASS → OPERATE: single command, no echo race possible.
+            m_model->setBypass(false);
+        } else if (m_model->isOperate()) {
+            // OPERATE → BYPASS: single command.
             m_model->setBypass(true);
+        } else {
+            // STANDBY → BYPASS: two commands (operate=1, bypass=1). Use the
+            // combined method to prevent intermediate echoes from flashing the
+            // OPERATE state between the two command confirmations.
+            m_model->setOperateAndBypass(true, true);
         }
     });
 }
@@ -1186,15 +1196,16 @@ void TunerApplet::cycleOperateState()
 
     // Cycle: OPERATE → BYPASS → STANDBY → OPERATE
     if (m_model->isOperate() && !m_model->isBypass()) {
-        // Currently OPERATE → go to BYPASS
+        // Currently OPERATE → go to BYPASS (single command, no echo race).
         m_model->setBypass(true);
     } else if (m_model->isOperate() && m_model->isBypass()) {
-        // Currently BYPASS → go to STANDBY
-        m_model->setBypass(false);
-        m_model->setOperate(false);
+        // Currently BYPASS → go to STANDBY (two commands). Use the combined
+        // method so intermediate echoes cannot revert the optimistic update
+        // for the second field and briefly flash OPERATE in the UI.
+        m_model->setOperateAndBypass(false, false);
     } else {
-        // Currently STANDBY → go to OPERATE
-        m_model->setBypass(false);
+        // Currently STANDBY → go to OPERATE. Bypass is always 0 in standby,
+        // so one command suffices (bypass guard is satisfied by invariant).
         m_model->setOperate(true);
     }
 }
