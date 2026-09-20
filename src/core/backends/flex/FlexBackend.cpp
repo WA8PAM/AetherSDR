@@ -118,6 +118,11 @@ void FlexBackend::setCommandSink(std::function<void(const QString&)> sink)
     m_sink = std::move(sink);
 }
 
+void FlexBackend::setTxCommandSink(std::function<void(const QString&, const TxCoordinator::Command&)> sink)
+{
+    m_txSink = std::move(sink);
+}
+
 void FlexBackend::setSliceCommandSink(std::function<void(const QString&)> sink)
 {
     m_sliceSink = std::move(sink);
@@ -171,6 +176,10 @@ RadioCapabilities FlexBackend::capabilities() const
     caps.txPowerBands = {};
     caps.declaredBandRanges = {};
     caps.family = QStringLiteral("flex");
+    // SmartSDR `transmit set tune_mode=two_tone` is a real on-radio two-tone
+    // generator; FlexBackend is the only consumer of that key.
+    caps.twoToneGenerator = RadioCapabilities::TwoToneGenerator{
+        QStringLiteral("transmit set tune_mode=two_tone")};
     caps.manufacturer = QStringLiteral("FlexRadio");
     caps.model = m_modelProvider ? m_modelProvider() : QString();
     caps.fmTonePresentation = FmTonePresentation::Legacy;
@@ -217,6 +226,11 @@ RadioCapabilities FlexBackend::capabilities() const
     caps.canTransmit = true;
     // Flex meter samples retain the established client-side PEP response.
     caps.forwardPowerRequiresSmoothing = true;
+    // `transmit rfpower=` is parsed off radio status, so the value the model
+    // carries is confirmed radio state rather than this client's request
+    // (#5518, Principle II).
+    caps.transmitDriveControl = RadioCapabilities::TransmitDriveControl{
+        SliceFrequencyControl::Authority::Radio};
     // A Flex transmits in every mode it demodulates, so there is nothing for the
     // receive-only mode guard to refuse. Stated rather than defaulted, per the
     // "adding a field" rule in RadioCapabilities.h.
@@ -486,30 +500,42 @@ void FlexBackend::sendSliceWaveformCommand(int sliceId, const QString& command)
                   .arg(command));
 }
 
-void FlexBackend::setKeying(bool key)
+void FlexBackend::sendTx(const QString& command, const TxCoordinator::Command& fence)
+{
+    if (!fence.permitsDispatch(TxCoordinator::monotonicMs())) {
+        return;
+    }
+    if (!m_txSink) {
+        qCWarning(lcProtocol) << "FlexBackend: no operation-fenced TX command sink; refusing command";
+        return;
+    }
+    m_txSink(command, fence);
+}
+
+void FlexBackend::setKeying(bool key, const AetherSDR::TxCoordinator::Operation& operation, const AetherSDR::TxCoordinator::Completion& completion)
 {
     // Keying is only translated here; the interlock/authorization decision is
     // made above the seam (RFC §6). Matches RadioModel::setTransmit's wire form.
-    send(QStringLiteral("xmit %1").arg(key ? 1 : 0));
+    sendTx(QStringLiteral("xmit %1").arg(key ? 1 : 0), {operation, key, completion});
 }
 
-void FlexBackend::setTune(bool on, int tunePowerPercent)
+void FlexBackend::setTune(bool on, int tunePowerPercent, const AetherSDR::TxCoordinator::Operation& operation, const AetherSDR::TxCoordinator::Completion& completion)
 {
     // FlexLib 4.2.18 Radio.TXTune. Power is a separate radio setting; do not
     // re-send it here. Host-modulating backends need it on this same verb.
     Q_UNUSED(tunePowerPercent);
-    send(QStringLiteral("transmit tune %1").arg(on ? 1 : 0));
+    sendTx(QStringLiteral("transmit tune %1").arg(on ? 1 : 0), {operation, on, completion});
 }
 
-void FlexBackend::setAtu(bool start)
+void FlexBackend::setAtu(bool start, const AetherSDR::TxCoordinator::Operation& operation, const AetherSDR::TxCoordinator::Completion& completion)
 {
     // FlexLib 4.2.18 Radio.ATUTuneStart / ATUTuneBypass.
-    send(start ? QStringLiteral("atu start") : QStringLiteral("atu bypass"));
+    sendTx(start ? QStringLiteral("atu start") : QStringLiteral("atu bypass"), {operation, start, completion});
 }
 
-void FlexBackend::abortCwText()
+void FlexBackend::abortCwText(const TxCoordinator::Operation& operation, const AetherSDR::TxCoordinator::Completion& completion)
 {
-    send(QStringLiteral("cwx clear"));
+    sendTx(QStringLiteral("cwx clear"), {operation, false, completion});
 }
 
 void FlexBackend::invokeExtension(const QString& ns, const QString& verb,
@@ -1095,6 +1121,29 @@ void FlexBackend::decodeTunerStatus(const QString& handle, const QMap<QString, Q
         d.model = kvs.value(QStringLiteral("model"));
     if (kvs.contains(QStringLiteral("ip")))
         d.ip = kvs.value(QStringLiteral("ip"));
+    // Per-port antenna, "ANT1,ANT2". Split exactly as FlexLib's
+    // Tuner.ParseAntenna does: first field is port A, second is port B, a
+    // missing second field leaves B empty, and anything past the second is
+    // ignored rather than treated as an error.
+    if (kvs.contains(QStringLiteral("ant"))) {
+        // split() always yields at least one element, so at(0) is safe.
+        const QStringList ants = kvs.value(QStringLiteral("ant")).split(QLatin1Char(','));
+        d.portAAnt = ants.at(0).trimmed();
+        d.portBAnt = ants.size() > 1 ? ants.at(1).trimmed() : QString();
+    }
+
+    // PTT-per-port. Casing unconfirmed — FlexLib lower-cases every key before
+    // matching, so its "ptta"/"pttb" cases do not pin the wire's spelling.
+    // Both are accepted; a string compare is cheaper than a lamp that stays
+    // dark with no way to tell why.
+    if (kvs.contains(QStringLiteral("pttA")))
+        d.pttA = (kvs.value(QStringLiteral("pttA")) == QLatin1String("1"));
+    else if (kvs.contains(QStringLiteral("ptta")))
+        d.pttA = (kvs.value(QStringLiteral("ptta")) == QLatin1String("1"));
+    if (kvs.contains(QStringLiteral("pttB")))
+        d.pttB = (kvs.value(QStringLiteral("pttB")) == QLatin1String("1"));
+    else if (kvs.contains(QStringLiteral("pttb")))
+        d.pttB = (kvs.value(QStringLiteral("pttb")) == QLatin1String("1"));
     if (kvs.contains(QStringLiteral("operate")))
         d.operate = (kvs.value(QStringLiteral("operate")) == QLatin1String("1"));
     if (kvs.contains(QStringLiteral("bypass")))

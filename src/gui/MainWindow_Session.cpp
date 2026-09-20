@@ -37,7 +37,7 @@
 #include "core/backends/sim/SimBackend.h"   // demo owns its audio — see wirePanStreamRxAudioSinks
 #include "core/CwSidetoneGenerator.h"
 #include "core/CwTrace.h"
-#include "gui/CwDecodeSettings.h"   // rxEnabled() gate for the RX-audio CW feed
+#include "models/CwDecodeSettings.h"   // rxEnabled() gate for the RX-audio CW feed
 #include "core/CwxLocalKeyer.h"
 #include "core/IambicKeyer.h"
 #include "core/PerfTelemetry.h"
@@ -1075,8 +1075,9 @@ void MainWindow::wireRadioModel()
     // operator's gain TWICE, in series, which is not what a slider labelled once
     // can mean. The modulator's is the one to keep: setPcMicGain only ever
     // attenuates (0..100 maps to 0.0..1.0, and AudioEngine skips it entirely at
-    // unity), while the ALC behind the modulator needs the mic pushed UP past
-    // its hold threshold — see Hl2Backend::setMicGain.
+    // unity), while the modulator's slider reaches +40 dB and is now the only
+    // thing that lifts a quiet mic at all — the ALC behind it only reduces.
+    // See Hl2Backend::setMicGain.
     //
     // This gate is also why the control was dead rather than doubled before now:
     // micSelection() is "MIC" until a radio reports otherwise, and an HL2 has no
@@ -1226,8 +1227,12 @@ void MainWindow::wireRadioModel()
                     << " down=" << down
                     << " schedMs=" << cwTraceMsAt(when);
             }
-            m_radioModel.queueCwKeyEdge(down, QStringLiteral("cw:iambic-keyer"),
-                                       traceId, sourceMs, when);
+        });
+        m_iambicKeyer->setOnRoutedKeyDownChange([this](bool down,
+                std::chrono::steady_clock::time_point when, const TxCoordinator::Request& input) {
+            m_radioModel.queueProducerCwKeyEdge(input, down, QStringLiteral("cw:iambic-keyer"),
+                m_lastCwPaddleTraceId.load(std::memory_order_relaxed),
+                m_lastCwPaddleSourceMs.load(std::memory_order_relaxed), when);
         });
         m_iambicKeyer->setOnPaddleEvent([this](bool dit, bool dah) {
             // The radio's break-in setting decides whether key edges produce
@@ -1373,6 +1378,10 @@ void MainWindow::wireRadioModel()
         if (!tx) {
             m_appletPanel->phoneCwApplet()->updateCompression(0.0f);
             m_appletPanel->phoneCwApplet()->resetAlc();
+            // Same reason as resetAlc: the last gain the ALC applied describes
+            // a transmission that has ended, and left on the face it reads as
+            // the gain being applied now.
+            m_appletPanel->phoneCwApplet()->resetAlcGain();
         }
         if (tx) {
             AetherSDR::ThemeManager::instance().applyStyleSheet(m_txIndicator, "QLabel { color: white; background: {{color.accent.danger}}; font-weight: bold; "
@@ -2238,37 +2247,8 @@ void MainWindow::wireCatPorts()
     // the shared helper the post-swap rebind also calls (#4448).
     wirePanStreamTciSinks();
 
-    // RX audio for a backend that demodulates in-process (HL2). That backend has
-    // no PanadapterStream, so wirePanStreamTciSinks() above binds nothing and TCI
-    // clients heard silence — WSJT-X connected, tracked frequency and mode, and
-    // never decoded a single signal.
-    //
-    // The payload is already what onDaxAudioReady expects: float32 interleaved
-    // stereo at 24 kHz (Hl2RxDsp::Config::audioSampleRateHz).
-    //
-    // PER SLICE, and this used to be hardcoded to channel 1.
-    //
-    // That was correct while such a radio ran ONE receiver: with no slice
-    // claiming a DAX channel, onDaxAudioReady's fallback maps channel N to
-    // trx N-1, so 1 → trx 0, the only receiver advertised in trx_count. With
-    // two receivers it is the bug — nothing ever fed channel 2, so a second TCI
-    // client bound to RX2 got full CAT control and total silence. Worse, the
-    // signal it was fed carries the MIXED speaker audio, so even routed to
-    // channel 2 it would have been the sum of every receiver rather than slice B.
-    //
-    // sliceId + 1 continues the same fallback: slice 0 → channel 1 → trx 0,
-    // slice 1 → channel 2 → trx 1. Single-receiver behaviour is unchanged.
-    //
-    // Bound to m_radioModel, not the backend, so it survives a family swap. Flex
-    // never emits this signal — its per-slice audio arrives as real DAX channels
-    // through wirePanStreamTciSinks() above — so there is no double-feed and no
-    // change to the Flex path.
-    connect(&m_radioModel, &RadioModel::backendSliceAudioFrameReady,
-            this, [this](int sliceId, const PcmFrame& frame) {
-        const QByteArray pcm = frame.legacyStereo24();
-        if (tciServer() && !pcm.isEmpty())
-            tciServer()->onDaxAudioReady(sliceId + 1, pcm);
-    });
+    // TciServer owns the typed RadioModel per-slice subscription. It resolves
+    // live stable slice identities without a GUI relay or speaker-mix feed.
 
     // TCI client count changes no longer auto-create/remove the audio stream.
     // Control-only TCI clients (StreamDeck) don't need audio, and auto-creating
@@ -2366,20 +2346,13 @@ void MainWindow::wireRxDemodAudioSinks()
 {
     if (m_qsoRecorder) {
         connect(&m_radioModel, &RadioModel::rxDemodAudioReady,
-                m_qsoRecorder, [recorder = m_qsoRecorder](const PcmFrame& frame) {
-            const QByteArray pcm = frame.legacyStereo24();
-            if (!pcm.isEmpty()) {
-                recorder->feedRxAudio(pcm);
-            }
-        });
+                m_qsoRecorder, &QsoRecorder::feedRxFrame);
     }
 
     // CW decoder RX feed — gated live on the toggle (#2417).
     connect(&m_radioModel, &RadioModel::rxDemodAudioReady,
             &m_cwDecoder, [this](const PcmFrame& frame) {
-                const QByteArray pcm = frame.legacyStereo24();
-                if (!pcm.isEmpty() && CwDecodeSettings::rxEnabled())
-                    m_cwDecoder.feedAudio(pcm);
+                if (CwDecodeSettings::rxEnabled()) { m_cwDecoder.feed(frame); }
             });
 
     // RTTY decoder RX feed — gated on the decoder being running.
@@ -2394,12 +2367,31 @@ void MainWindow::wireRxDemodAudioSinks()
 // TX VITA-49 packets → the registered PanadapterStream socket. Flex-only (the
 // socket lives on the stream); a non-Flex/RX-only backend has none. Shared by
 // wireRadioModel() and the post-swap rebind.
+void MainWindow::wireTxAudioAuthority()
+{
+    // The continuous Flex microphone contract supports VOX/met_in_rx. Host-
+    // routed PCM has no such RX transport contract: stamp it at PTT admission.
+    const TxCoordinator::Producer producer = m_radioModel.registerTxProducer(m_audio);
+    connect(&m_radioModel, &RadioModel::localTransmitEngaged, this, [this, producer] {
+        const TxCoordinator::Context context = m_radioModel.captureTxMedia(producer);
+        QMetaObject::invokeMethod(m_audio, [audio = m_audio, context] {
+            audio->setHostMicrophoneContext(context);
+        }, Qt::QueuedConnection);
+    });
+}
+
 void MainWindow::wirePanStreamTxSink()
 {
     auto* ps = m_radioModel.panStream();
     if (!ps || !m_audio)
         return;
-    connect(m_audio, &AudioEngine::txPacketReady, ps, &PanadapterStream::sendToRadio);
+    connect(m_audio, &AudioEngine::txPacketReady, ps,
+            [ps](const QByteArray& packet, const TxCoordinator::Context& context) {
+        const TxCoordinator::Dispatch dispatch = context.beginDispatch(TxCoordinator::monotonicMs());
+        if (dispatch) {
+            ps->sendToRadio(packet);
+        }
+    });
 }
 
 // TCI audio/IQ/waterfall feeds from PanadapterStream. Shared by the TCI wiring
@@ -2411,12 +2403,7 @@ void MainWindow::wirePanStreamTciSinks()
     if (!ps || !tciServer())
         return;
     connect(ps, &PanadapterStream::daxPcmReady,
-            tciServer(), [server = tciServer()](int channel, const PcmFrame& frame) {
-        const QByteArray pcm = frame.legacyStereo24();
-        if (!pcm.isEmpty()) {
-            server->onDaxAudioReady(channel, pcm);
-        }
-    });
+            tciServer(), &TciServer::onDaxPcmReady, Qt::UniqueConnection);
     connect(ps, &PanadapterStream::iqDataReady,
             tciServer(), &TciServer::onIqDataReady);
     connect(ps, &PanadapterStream::waterfallRowReady,
@@ -2635,8 +2622,18 @@ bool MainWindow::startAutomationBridge(const QString& sockName)
     m_automation->setSliceReceiveSourceHandler(
         [this](const QString& arg) { return automationSetSliceReceiveSource(arg); });
     m_automation->setModemAutomationHandler(
-        [this](const QString& verb, const QString& action, const QString& value) {
-            return automationModemCommand(verb, action, value);
+        [this](const QString& verb, const QString& action, const QString& value,
+               const std::shared_ptr<TxController>& controller, const TxController::Input& input) {
+            return automationModemCommand(verb, action, value, controller, input);
+        });
+    m_automation->setShortcutAutomationHandler(
+        [this](const QString& id, bool allowTx, const std::shared_ptr<TxController>& controller) {
+            return fireShortcutAction(id, allowTx, controller);
+        });
+    m_automation->setKeyEventAutomationHandler(
+        [this](const QString& spec, bool press, bool allowTx,
+               const std::shared_ptr<TxController>& controller) {
+            return injectKeyEventForAutomation(spec, press, allowTx, controller);
         });
     m_automation->setSliceCenterLockHandler(
         [this](int sliceId, bool enabled) { return automationSetCenterLock(sliceId, enabled); });
@@ -2911,7 +2908,13 @@ void MainWindow::applyTxAudioCapabilities(bool connected, const RadioCapabilitie
     // Repeated capabilities must not enqueue duplicate capture starts.
     AudioEngine* audio = m_audio;
     const QHostAddress address = m_radioModel.radioAddress();
-    QMetaObject::invokeMethod(audio, [audio, connected, caps, pcAudioEnabled, address] {
+    if (!m_microphoneTxProducer.valid()) {
+        m_microphoneTxProducer = m_radioModel.registerTxProducer(audio, true);
+    }
+    const TxCoordinator::Context microphone = connected
+        ? m_radioModel.captureTxMedia(m_microphoneTxProducer) : TxCoordinator::Context{};
+    QMetaObject::invokeMethod(audio, [audio, connected, caps, pcAudioEnabled, address, microphone] {
+        audio->setMicrophoneContext(microphone);
         audio->applyBackendAudioCapabilities(connected, caps, pcAudioEnabled, address);
     });
     if (connected) {

@@ -29,6 +29,7 @@
 #include "PanadapterApplet.h"
 #include "PanadapterStack.h"
 #include "RttyDecodeSettings.h"
+#include "models/CwDecodeSettings.h"
 #include "SpectrumOverlayMenu.h"
 #include "SpectrumWidget.h"
 #include "WfmDeviceDialog.h"
@@ -61,6 +62,100 @@
 #include <cmath>
 
 namespace AetherSDR {
+
+#ifdef HAVE_DEEPFIST
+void MainWindow::refreshCwRxContext()
+{
+    SliceModel* slice = activeSlice();
+    if (slice == m_cwRxSlice) { return; }
+    disconnect(m_cwRxFrequencyConnection);
+    disconnect(m_cwRxModeConnection);
+    m_cwRxSlice = slice;
+    m_cwDecoder.reset();
+    m_cwCallsignSpotter.clear();
+    if (slice) {
+        // Stream continuity across a retune is a DeepFist concern. ggmorse's
+        // reset() is a worker-thread join plus restart (CwDecoder::stop() is
+        // "A JOIN, never a timeout"), which is far too costly to run on every
+        // frequencyChanged emission while the operator spins the tuning knob.
+        m_cwRxFrequencyConnection = connect(slice, &SliceModel::frequencyChanged,
+            this, [this] {
+                if (CwDecodeSettings::deepFistSelected()) { m_cwDecoder.reset(); }
+            });
+        m_cwRxModeConnection = connect(slice, &SliceModel::modeChanged,
+            this, [this] {
+                if (CwDecodeSettings::deepFistSelected()) { m_cwDecoder.reset(); }
+            });
+    }
+}
+void MainWindow::selectCwRxBackend(const QString& backend)
+{
+    if (!m_cwDecoder.selectBackend(backend)) { return; }
+    m_cwCallsignSpotter.clear();
+    CwDecodeSettings::setBackend(backend);
+    if (m_cwDecoderApplet && m_cwDecoder.supportsTuning()) {
+        m_cwDecoder.setPitchRange(m_cwDecoderApplet->pitchRangeLow(), m_cwDecoderApplet->pitchRangeHigh());
+        m_cwDecoder.setSpeedRange(m_cwDecoderApplet->speedRangeLow(), m_cwDecoderApplet->speedRangeHigh());
+    }
+    if (m_panStack) {
+        for (PanadapterApplet* applet : m_panStack->allApplets()) {
+            for (VfoWidget* vfo : applet->findChildren<VfoWidget*>()) {
+                vfo->refreshCwDecoderControls();
+            }
+        }
+    }
+    if (m_cwDecoderApplet) {
+        m_cwDecoderApplet->clearCwText();
+        m_cwDecoderApplet->setCwStats(0, 0);
+    }
+    refreshCwDecodeState();
+}
+void MainWindow::refreshCwRxStatus()
+{
+    // Every pan builds its own engine combo and tuning controls, so stating
+    // only the targeted applet leaves the others advertising the wrong backend
+    // and, worse, leaves a previously-targeted pan's controls disabled for good.
+    // Same broadcast selectCwRxBackend() already does for the Zero Beat button.
+    if (m_panStack) {
+        for (PanadapterApplet* applet : m_panStack->allApplets()) {
+            applet->setCwBackendState(m_cwDecoder.backendKey(), m_cwDecoder.supportsTuning(),
+                m_cwDecoder.status(), m_cwDecoder.preparing(), m_cwDecoder.canRetry(),
+                m_cwDecoder.detail());
+        }
+    } else if (m_cwDecoderApplet) {
+        m_cwDecoderApplet->setCwBackendState(m_cwDecoder.backendKey(), m_cwDecoder.supportsTuning(),
+            m_cwDecoder.status(), m_cwDecoder.preparing(), m_cwDecoder.canRetry(), m_cwDecoder.detail());
+    }
+}
+void MainWindow::cwRxModelAction()
+{
+    if (m_cwDecoder.preparing()) { m_cwDecoder.cancelPreparation(); }
+    else { m_cwDecoder.retry(); }
+}
+void MainWindow::appendUnscoredCwText(const QString& text)
+{
+    if (m_cwDecoderApplet && m_cwDecoder.isRunning()) {
+        m_cwDecoderApplet->appendUnscoredCwText(text);
+    }
+}
+void MainWindow::refreshCwRxBackend()
+{
+    m_cwDecoder.selectBackend(CwDecodeSettings::backend());
+    connect(&m_cwDecoder, &CwRxModel::unscoredTextDecoded,
+        this, &MainWindow::appendUnscoredCwText, Qt::UniqueConnection);
+    connect(&m_cwDecoder, &CwRxModel::statusChanged,
+        this, &MainWindow::refreshCwRxStatus, Qt::UniqueConnection);
+    if (m_cwDecoderApplet) {
+        connect(m_cwDecoderApplet, &PanadapterApplet::cwEngineChanged,
+            this, &MainWindow::selectCwRxBackend, Qt::UniqueConnection);
+        connect(m_cwDecoderApplet, &PanadapterApplet::cwModelActionRequested,
+            this, &MainWindow::cwRxModelAction, Qt::UniqueConnection);
+        connect(m_cwDecoderApplet, &PanadapterApplet::cwPanelCloseRequested,
+            &m_cwDecoder, &CwRxModel::stop, Qt::UniqueConnection);
+    }
+    refreshCwRxStatus();
+}
+#endif
 
 void MainWindow::scheduleDigitalVoiceAutoStart()
 {
@@ -173,7 +268,9 @@ Ax25HfPacketDecodeDialog* MainWindow::ensureAx25HfPacketDecodeDialog()
 
 QJsonObject MainWindow::automationModemCommand(const QString& verb,
                                                const QString& action,
-                                               const QString& value)
+                                               const QString& value,
+                                               const std::shared_ptr<TxController>& controller,
+                                               const TxController::Input& input)
 {
     Ax25HfPacketDecodeDialog* dlg = ensureAx25HfPacketDecodeDialog();
     if (!dlg) {
@@ -181,7 +278,7 @@ QJsonObject MainWindow::automationModemCommand(const QString& verb,
             {QStringLiteral("ok"), false},
             {QStringLiteral("error"), QStringLiteral("could not construct the AetherModem window")}};
     }
-    return dlg->automationCommand(verb, action, value);
+    return dlg->automationCommand(verb, action, value, controller, input);
 }
 
 // External-controller methods (FlexControl, HID encoders / RC-28 / TMate 2 /
@@ -529,7 +626,8 @@ void MainWindow::activateRADE(int sliceId)
     // tx=true: new over starting — clear pending flag and reset engine EOO state.
     // tx=false + !pending + isTransmitting: unintercepted unkey — request EOO as
     //   best-effort (radio may already be in RX, but at least the app won't hang).
-    const auto beginOver = [this] {
+    const TxCoordinator::Producer radeProducer = m_radioModel.registerTxProducer(m_radeEngine);
+    const auto beginOver = [this, radeProducer] {
         if (!m_radeEngine || !m_radeEngine->isActive()
             || (m_radeTxActive && !m_radeEooPending)) {
             return;
@@ -541,8 +639,14 @@ void MainWindow::activateRADE(int sliceId)
         m_radeEooPending = false;
         m_radeTxActive = true;
         syncKiwiSdrTransmitMute();
-        QMetaObject::invokeMethod(m_radeEngine, [engine = m_radeEngine]() {
-            engine->resetTx();
+        const TxCoordinator::Context context = m_radioModel.captureTxMedia(radeProducer);
+        QMetaObject::invokeMethod(m_radeEngine, [engine = m_radeEngine, context]() {
+            if (context.permitsDispatch(TxCoordinator::monotonicMs())) {
+                engine->resetTx(context);
+            }
+        }, Qt::QueuedConnection);
+        QMetaObject::invokeMethod(m_audio, [audio = m_audio, context] {
+            audio->setRawMicrophoneContext(context);
         }, Qt::QueuedConnection);
         qCDebug(lcRade) << "MainWindow: MOX asserted — RADE TX state reset for new over";
     };
@@ -561,7 +665,7 @@ void MainWindow::activateRADE(int sliceId)
             // there is no carrier-release authority to borrow from a later TX.
             m_radeFallbackReleaseFence = std::make_shared<std::atomic<bool>>(true);
             const std::shared_ptr<std::atomic<bool>> fence = m_radeFallbackReleaseFence;
-            m_radePttRelease = {[fence] { return fence->load(std::memory_order_acquire); }, {}};
+            m_radePttRelease = {[fence] { return fence->load(std::memory_order_acquire); }, {}, {}};
             const quint64 requestId = ++m_radeEooRequestId;
             syncKiwiSdrTransmitMute();
             QMetaObject::invokeMethod(m_radeEngine, [engine = m_radeEngine, fence, requestId]() {
@@ -1246,11 +1350,19 @@ bool MainWindow::startDax()
 
     // Wire DAX TX: apps → bridge → AudioEngine → VITA-49.
     // AudioEngine chooses packet format/routing based on DaxTxLowLatency.
+    // This is one configured shared endpoint, not an inferred process identity.
+    const TxCoordinator::Producer daxProducer = m_radioModel.registerTxProducer(m_daxBridge);
+    connect(&m_radioModel, &RadioModel::localTransmitEngaged, m_daxBridge,
+            [this, bridge = m_daxBridge, daxProducer] {
+        bridge->setTxContext(m_radioModel.captureTxMedia(daxProducer));
+    });
     connect(m_daxBridge, &DaxBridge::txAudioReady,
-            this, [this](const QByteArray& pcm) {
+            this, [this](const QByteArray& pcm, const TxCoordinator::Context& context) {
         if (m_audio->isRadeMode()) return;
         if (!m_audio->isDaxTxMode()) return;
-        QMetaObject::invokeMethod(m_audio, [this, pcm]() { m_audio->feedDaxTxAudio(pcm); });
+        QMetaObject::invokeMethod(m_audio, [audio = m_audio, pcm, context] {
+            audio->feedDaxTxAudio(pcm, context);
+        });
     });
 
     // Save current mic selection before forcing PC audio source.

@@ -76,7 +76,6 @@ QString stageLabel(AudioEngine::RxChainStage s)
         case AudioEngine::RxChainStage::Comp:  return "AGC-C";
         case AudioEngine::RxChainStage::Tube:  return "TUBE";
         case AudioEngine::RxChainStage::Pudu:  return "EVO";
-        case AudioEngine::RxChainStage::DeEss: return "DESS";
         case AudioEngine::RxChainStage::None:  return "";
     }
     return "";
@@ -148,7 +147,6 @@ bool ClientRxChainWidget::isStageImplemented(AudioEngine::RxChainStage s) const
         case AudioEngine::RxChainStage::Comp:  return true;
         case AudioEngine::RxChainStage::Tube:  return true;
         case AudioEngine::RxChainStage::Pudu:  return true;
-        case AudioEngine::RxChainStage::DeEss: return true;
         case AudioEngine::RxChainStage::None:  return false;
     }
     return false;
@@ -168,8 +166,6 @@ bool ClientRxChainWidget::isStageBypassed(AudioEngine::RxChainStage s) const
             return m_audio->clientTubeRx() ? !m_audio->clientTubeRx()->isEnabled() : true;
         case AudioEngine::RxChainStage::Pudu:
             return m_audio->clientPuduRx() ? !m_audio->clientPuduRx()->isEnabled() : true;
-        case AudioEngine::RxChainStage::DeEss:
-            return m_audio->clientDeEssRx() ? !m_audio->clientDeEssRx()->isEnabled() : true;
         case AudioEngine::RxChainStage::None:
             return true;
     }
@@ -248,7 +244,8 @@ void ClientRxChainWidget::toggleStageBypass(int boxIdx)
     if (box.kind == TileKind::StatusDsp) {
         const bool anyOn = m_audio->nr2Enabled()  || m_audio->nr4Enabled()
                         || m_audio->mnrEnabled()  || m_audio->dfnrEnabled()
-                        || m_audio->rn2Enabled()  || m_audio->nvAfxEnabled();
+                        || m_audio->rn2Enabled()  || m_audio->nvAfxEnabled()
+                        || m_audio->nnrEnabled();
         if (anyOn) {
             QMetaObject::invokeMethod(m_audio, [audio = m_audio]() {
                 if (audio->nr2Enabled())  audio->setNr2Enabled(false);
@@ -257,6 +254,7 @@ void ClientRxChainWidget::toggleStageBypass(int boxIdx)
                 if (audio->dfnrEnabled()) audio->setDfnrEnabled(false);
                 if (audio->rn2Enabled())  audio->setRn2Enabled(false);
                 if (audio->nvAfxEnabled())  audio->setNvAfxEnabled(false);
+                if (audio->nnrEnabled())    audio->setNnrEnabled(false);
             });
         } else {
             const QString name = AppSettings::instance()
@@ -274,6 +272,7 @@ void ClientRxChainWidget::toggleStageBypass(int boxIdx)
                 else if (name == "DFNR") audio->setDfnrEnabled(true);
                 else if (name == "RN2")  audio->setRn2Enabled(true);
                 else if (name == "BNR")  audio->setNvAfxEnabled(true);
+                else if (name == "NNR")  audio->setNnrEnabled(true);
             });
         }
         return;
@@ -312,12 +311,6 @@ void ClientRxChainWidget::toggleStageBypass(int boxIdx)
             if (auto* p = m_audio->clientPuduRx()) {
                 p->setEnabled(willEnable);
                 m_audio->saveClientPuduRxSettings();
-            }
-            break;
-        case AudioEngine::RxChainStage::DeEss:
-            if (auto* d = m_audio->clientDeEssRx()) {
-                d->setEnabled(willEnable);
-                m_audio->saveClientDeEssRxSettings();
             }
             break;
         default:
