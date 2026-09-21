@@ -1,4 +1,6 @@
 #include "core/backends/rtl/RtlSdrBackend.h"
+
+#include <QPointer>
 #include "core/backends/rtl/RtlSdrWorker.h"
 #include "core/backends/rtl/RtlSdrDdc.h"
 #include "core/backends/RadioDelta.h"
@@ -91,7 +93,43 @@ RtlSdrBackend::~RtlSdrBackend()
 
 RadioCapabilities RtlSdrBackend::capabilities() const
 {
+    // #5594 (M1) item 4: this backend deliberately never emits
+    // capabilitiesChanged, and that is the honest answer rather than a gap.
+    //
+    // Every field below is either a compile-time constant for the R820T/RTL2832U
+    // pair or comes from the USB descriptor strings (m_vendor, m_product /
+    // m_modelName, and m_serial), read during connectRadio() before connected()
+    // and cleared on disconnect or a configuration failure before connection.
+    // The declaration is fixed for the whole session: no mid-session revision, and
+    // a synthetic emission would be noise dressed up as a contract.
+    //
+    // If a future tuner-dependent field is added here (a per-tuner gain table,
+    // a direct-sampling range that depends on the IC), it becomes revisable and
+    // this comment stops being true.
     RadioCapabilities c;
+    // THE dBm AXIS IS UNCALIBRATED, and on this backend that is not a nuance:
+    // RtlSdrDdc's FFT path computes `20 * log10(mag / kFftSize)` on raw ADC
+    // magnitudes and emits that straight out as the spectrum frame. There is no
+    // reference object, no offset and no per-unit figure anywhere in this
+    // family -- the axis is dBFS relative to the converter's own full scale.
+    //
+    // A relative reading is still useful; an absolute one is not available, so
+    // a level from this radio may not be published as a spot, held against
+    // another station's report, or used as an absolute threshold.
+    PanAmplitudeModel amplitude;
+    amplitude.calibratedDbm = false;
+    // The spectrum bins are computed on THIS host from raw ADC magnitudes and
+    // carry no reference level: RtlSdrDdc::processSpectrum takes the FFT output,
+    // forms `mag = sqrt(re*re + im*im) / kFftSize` and emits
+    // `20 * log10(max(mag, 1e-6))` straight into the frame. Nothing in that
+    // expression can move when the display reference level moves, so the
+    // noise-floor auto-adjust has a fixed target and terminates — see
+    // PanAmplitudeModel::binsAbsolute. radioOwnsDbmScale is deliberately
+    // left at its permissive default here and NOT flipped in the same change:
+    // this radio has no range command, but correcting that declaration is a
+    // separate question from this one and belongs with its own reasoning.
+    amplitude.binsAbsolute = true;
+    c.panAmplitude = amplitude;
     c.family = QStringLiteral("rtl");
     c.model  = m_modelName;
     c.manufacturer = m_vendor.isEmpty() ? QStringLiteral("Realtek") : m_vendor;
@@ -100,9 +138,11 @@ RadioCapabilities RtlSdrBackend::capabilities() const
     c.canTransmit = false;
     c.txPowerMaxWatts = 0.0;
     c.hostModulates = false;  // CRITICAL: must not open mic on connect (#4449)
+    // transmitDriveControl absent: no transmitter, so no drive to own (#5518).
     c.hasRadioPttReadback = false;  // receive-only: nothing to key, nothing to read back
     c.hasFmRepeaterOffset = false;
     c.hasCwTune = false;
+    c.twoToneGenerator = std::nullopt;  // receive only; there is no transmitter.
     c.hasAmCarrierLevel = false;
     c.hasVoxDelay = false;
     c.hasAgcThreshold = false;
@@ -120,12 +160,24 @@ RadioCapabilities RtlSdrBackend::capabilities() const
     c.cwPitchStepHz = 10;
 
     // Receiver limits
+    c.canCreateSlices = false;
     c.maxSlices = 1;
     c.maxPanadapters = 1;
 
     // Tuning range — R820T: 24 MHz – 1.766 GHz (HF via direct sampling)
     c.tuningMinHz = 24'000;
     c.tuningMaxHz = 1'766'000'000;
+    c.sliceFrequencyControl = {SliceFrequencyControl::Authority::Engine,
+                               24'000, 1'766'000'000};
+    c.receiveModeControl = ReceiveModeControl{SliceFrequencyControl::Authority::Engine,
+        {QStringLiteral("AM"), QStringLiteral("SAM"), QStringLiteral("FM"),
+         QStringLiteral("FMN"), QStringLiteral("WFM"), QStringLiteral("USB"),
+         QStringLiteral("LSB"), QStringLiteral("CW"), QStringLiteral("CWR")}};
+    c.receiveFilterControl = std::nullopt; // DDC currently stores, but never consumes, filter edges
+    c.receiveAudioControl = ReceiveAudioControl{SliceFrequencyControl::Authority::Engine};
+    c.receivePanCenterControl = std::nullopt; // setPanCenter also retunes slice 0
+    c.receivePanBandwidthControl = ReceivePanRangeControl{SliceFrequencyControl::Authority::Engine,
+                                                         225'001, 3'000'000};
 
     // Sample rates — non-contiguous legal windows for R820T
     c.sampleRatesHz = {
@@ -179,7 +231,9 @@ void RtlSdrBackend::connectRadio(const RadioConnectRequest& request)
 
     int idx = -1;
     if (!targetSerial.isEmpty()) {
-        if (targetSerial.startsWith(QLatin1String("rtl:"))) {
+        if ((request.serialIdentity.indexLocator
+             || request.serialIdentity.reportedSerial.isEmpty())
+            && targetSerial.startsWith(QLatin1String("rtl:"))) {
             bool ok = false;
             int parsedIdx = targetSerial.mid(4).toInt(&ok);
             if (ok && parsedIdx >= 0 && parsedIdx < count) {
@@ -253,11 +307,11 @@ void RtlSdrBackend::connectRadio(const RadioConnectRequest& request)
     if (rtlsdr_get_device_usb_strings(idx, vendorBuf, productBuf, serialBuf) == 0) {
         m_vendor  = QString::fromUtf8(vendorBuf);
         m_product = QString::fromUtf8(productBuf);
-        m_serial  = QString::fromUtf8(serialBuf);
+        m_serial  = QString::fromUtf8(serialBuf).trimmed();
     } else {
         m_vendor  = tr("Realtek");
         m_product = tr("RTL2832U");
-        m_serial  = QString::number(idx);
+        m_serial.clear(); // Enumeration indices are connection locators, never serials.
     }
 
     // ── Configure initial frequency, direct sampling, and gain ───────────────
@@ -348,6 +402,10 @@ void RtlSdrBackend::connectRadio(const RadioConnectRequest& request)
 
     // ── Instantiate Worker (owns RtlSdrDdc processing engine) ─────────────
     m_worker = std::make_unique<RtlSdrWorker>(m_device);
+    // A new DDC starts at unity/unmuted. Do not publish the old worker's
+    // mixer observation across a reconnect.
+    m_receiveGain = 100;
+    m_receiveMuted = false;
 
     if (RtlSdrDdc* ddcEngine = m_worker->ddc()) {
         ddcEngine->setSampleRate(m_sampleRateHz);
@@ -363,9 +421,12 @@ void RtlSdrBackend::connectRadio(const RadioConnectRequest& request)
     connect(m_worker.get(), &RtlSdrWorker::waterfallRowReady,
             this, &IRadioBackend::waterfallRowReady);
     connect(m_worker.get(), &RtlSdrWorker::audioFrameReady,
-            this, [this](const QByteArray& pcm) {
-                emit audioFrameReady(pcm);
-                emit sliceAudioFrameReady(0, pcm);
+            this, [this, producer = QPointer<RtlSdrWorker>(m_worker.get())](const QByteArray& pcm) {
+                if (!producer || producer.data() != m_worker.get()) {
+                    return;
+                }
+                publishLegacyAudio(pcm);
+                publishLegacySliceAudio(0, pcm);
             });
     connect(m_worker.get(), &RtlSdrWorker::readError,
             this, [this](const QString& err) {
@@ -387,6 +448,7 @@ void RtlSdrBackend::connectRadio(const RadioConnectRequest& request)
 
 void RtlSdrBackend::disconnectRadio()
 {
+    retirePcmStreams();
     if (!m_connected) {
         return;
     }
@@ -598,6 +660,10 @@ void RtlSdrBackend::setSliceAudioMute(int sliceId, bool mute)
     if (sliceId == 0) {
         if (RtlSdrDdc* ddcEngine = ddc()) {
             ddcEngine->setAudioMute(mute);
+            m_receiveMuted = mute;
+            SliceDelta delta;
+            delta.audioMute = mute;
+            emit sliceChanged(sliceId, delta);
         }
     }
 }
@@ -607,6 +673,10 @@ void RtlSdrBackend::setSliceAudioGain(int sliceId, int gainPercent)
     if (sliceId == 0) {
         if (RtlSdrDdc* ddcEngine = ddc()) {
             ddcEngine->setAudioGain(gainPercent);
+            m_receiveGain = std::clamp(gainPercent, 0, 100);
+            SliceDelta delta;
+            delta.audioGain = m_receiveGain;
+            emit sliceChanged(sliceId, delta);
         }
     }
 }
@@ -640,8 +710,10 @@ void RtlSdrBackend::setPanRfGain(const QString& panId, int gainDb)
 // IRadioBackend — transmit (guarded — RX-only)
 // ──────────────────────────────────────────────────────────────────────────────
 
-void RtlSdrBackend::setKeying(bool key)
+void RtlSdrBackend::setKeying(bool key, const AetherSDR::TxCoordinator::Operation& operation, const AetherSDR::TxCoordinator::Completion& completion)
 {
+    Q_UNUSED(operation);
+    Q_UNUSED(completion);
     Q_UNUSED(key);
     // RTL-SDR is receive-only. This is a no-op.
     // The bridge TX gate (AETHER_AUTOMATION_ALLOW_TX) is the real guard.
@@ -888,6 +960,8 @@ void RtlSdrBackend::emitInitialState()
     sDelta.mode = m_sliceMode;
     sDelta.filterLow = m_sliceFilterLow;
     sDelta.filterHigh = m_sliceFilterHigh;
+    sDelta.audioGain = m_receiveGain;
+    sDelta.audioMute = m_receiveMuted;
     // No txAntenna or rxAntenna list on hardware without software antenna switches (Constitution Principle II & VI)
     sDelta.modeList = QStringList{QStringLiteral("AM"), QStringLiteral("SAM"),
                                   QStringLiteral("FM"), QStringLiteral("FMN"),

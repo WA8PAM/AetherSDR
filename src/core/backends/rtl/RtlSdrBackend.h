@@ -58,7 +58,7 @@ public:
     void setSliceAudioMute(int sliceId, bool mute) override;
     void setSliceAudioGain(int sliceId, int gainPercent) override;
     void setSliceAudioPan(int sliceId, int panPercent) override;
-    void setKeying(bool key) override;
+    void setKeying(bool key, const AetherSDR::TxCoordinator::Operation& operation, const AetherSDR::TxCoordinator::Completion& completion = {}) override;
     void invokeExtension(const QString& ns, const QString& verb,
                          quint64 requestId, const QVariant& arg = {}) override;
 
@@ -108,6 +108,8 @@ private:
     // Slice 0 state — default to 95.2 MHz FM Wide
     double m_sliceFreqHz{95'200'000.0};
     QString m_sliceMode{"WFM"};
+    int m_receiveGain{100};
+    bool m_receiveMuted{false};
     int m_sliceFilterLow{-100000};
     int m_sliceFilterHigh{100000};
 

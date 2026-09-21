@@ -64,6 +64,12 @@ FlexBackend::FlexBackend(QObject* parent)
             this, &IRadioBackend::disconnected);
     connect(m_connection, &RadioConnection::errorOccurred,
             this, &IRadioBackend::connectionError);
+    connect(m_connection, &RadioConnection::independentPttStopped,
+            this, [this](const TxStopEvidence& evidence) {
+        if (isConnected() && evidence.valid()) {
+            emit independentTxStopped(evidence);
+        }
+    });
 }
 
 FlexBackend::~FlexBackend()
@@ -118,6 +124,11 @@ void FlexBackend::setCommandSink(std::function<void(const QString&)> sink)
     m_sink = std::move(sink);
 }
 
+void FlexBackend::setTxCommandSink(std::function<void(const QString&, const TxCoordinator::Command&)> sink)
+{
+    m_txSink = std::move(sink);
+}
+
 void FlexBackend::setSliceCommandSink(std::function<void(const QString&)> sink)
 {
     m_sliceSink = std::move(sink);
@@ -128,12 +139,88 @@ void FlexBackend::setModelProvider(std::function<QString()> provider)
     m_modelProvider = std::move(provider);
 }
 
+void FlexBackend::setIndependentTxSequenceProvider(std::function<quint32()> sequence)
+{
+    m_sequenceProvider = std::move(sequence);
+}
+
+IndependentTxControl FlexBackend::independentTxControl() const
+{
+    // Shared SmartSDR protocol eligibility, not a model/firmware allowlist.
+    // Actual admission also requires complete, TX-allowed live idle readback;
+    // every handoff still needs the original operation's ordered stop proof.
+    // SmartLink uses another transport and remains unavailable on this path.
+    if (!m_connection || !m_connection->independentPttSupported() || !m_sequenceProvider) {
+        return {};
+    }
+    return {static_cast<unsigned>(TxCoordinator::Activity::Mox)};
+}
+
+bool FlexBackend::independentTxReady() const
+{
+    return independentTxControl().activities != 0 && m_connection->independentPttReady();
+}
+
+void FlexBackend::stopIndependentTx(const TxCoordinator::Operation& operation,
+                                    const TxCoordinator::StopRequest& request)
+{
+    // Cleanup must remain available even if a capability/provider changed.
+    if (!m_connection || !m_sequenceProvider || !request.matchesOperation(operation)) {
+        return;
+    }
+    const quint32 sequence = m_sequenceProvider();
+    QMetaObject::invokeMethod(m_connection, [connection = m_connection, sequence, operation, request] {
+        connection->stopIndependentPtt(sequence, operation, request);
+    }, Qt::QueuedConnection);
+}
+
+void FlexBackend::setRadioReportedCapacity(int maxSlices, int maxPanadapters)
+{
+    const bool slicesMoved = maxSlices > 0 && maxSlices != m_reportedMaxSlices;
+    const bool pansMoved = maxPanadapters > 0 && maxPanadapters != m_reportedMaxPanadapters;
+    if (!slicesMoved && !pansMoved)
+        return;
+    if (slicesMoved)
+        m_reportedMaxSlices = maxSlices;
+    if (pansMoved)
+        m_reportedMaxPanadapters = maxPanadapters;
+    // A real revision of the descriptor the control protocol serializes, so it
+    // is announced like any other (#5594 item 1). Guarded above: the caller
+    // republishes on every capacity-bearing edge, and an announcement per call
+    // would be the storm the model guard already avoids.
+    emit capabilitiesChanged();
+}
+
 RadioCapabilities FlexBackend::capabilities() const
 {
     RadioCapabilities caps;
+    // FlexLib 4.2.18 Slice.Freq delegates range refusal to firmware; its old
+    // bounds are commented out. Do not guess coverage (including transverters).
+    caps.sliceFrequencyControl = {SliceFrequencyControl::Authority::Radio, 0, 0};
+    // FlexLib 4.2.18 Slice.DemodMode and FilterLow/High. Waveform modes and
+    // pitch/mark-dependent CW/RTTY filters require a separate runtime contract.
+    caps.receiveModeControl = ReceiveModeControl{SliceFrequencyControl::Authority::Radio,
+        {QStringLiteral("USB"), QStringLiteral("LSB"), QStringLiteral("DIGU"),
+         QStringLiteral("DIGL"), QStringLiteral("AM"), QStringLiteral("SAM"),
+         QStringLiteral("DSB"), QStringLiteral("CW"), QStringLiteral("FM"), QStringLiteral("NFM")}};
+    caps.receiveFilterControl = ReceiveFilterControl{SliceFrequencyControl::Authority::Radio, {
+        {QStringLiteral("USB"), 0, 11990, 10, 12000, 10, 12000},
+        {QStringLiteral("DIGU"), 0, 11990, 10, 12000, 10, 12000},
+        {QStringLiteral("LSB"), -12000, -10, -11990, 0, 10, 12000},
+        {QStringLiteral("DIGL"), -12000, -10, -11990, 0, 10, 12000},
+        {QStringLiteral("AM"), -12000, -10, 10, 12000, 20, 24000},
+        {QStringLiteral("SAM"), -12000, -10, 10, 12000, 20, 24000},
+        {QStringLiteral("DSB"), -12000, -10, 10, 12000, 20, 24000}}};
+    caps.receiveAudioControl = std::nullopt; // legacy wire mixer path has not migrated
+    caps.receivePanCenterControl = std::nullopt; // unknown coverage including transverters
+    caps.receivePanBandwidthControl = std::nullopt; // legacy coupled geometry path
     caps.txPowerBands = {};
     caps.declaredBandRanges = {};
     caps.family = QStringLiteral("flex");
+    // SmartSDR `transmit set tune_mode=two_tone` is a real on-radio two-tone
+    // generator; FlexBackend is the only consumer of that key.
+    caps.twoToneGenerator = RadioCapabilities::TwoToneGenerator{
+        QStringLiteral("transmit set tune_mode=two_tone")};
     caps.manufacturer = QStringLiteral("FlexRadio");
     caps.model = m_modelProvider ? m_modelProvider() : QString();
     caps.fmTonePresentation = FmTonePresentation::Legacy;
@@ -143,10 +230,21 @@ RadioCapabilities FlexBackend::capabilities() const
     // derived-from-name truth used to *seed* the reported capabilities; a fuller
     // FlexBackend refines these from live radio status as touchpoints convert.
     const ModelCapabilities mc = capabilitiesFor(caps.model);
-    caps.maxSlices = mc.maxSlices;
-    // approx: pan capacity is not strictly slice count on real Flex hardware;
-    // refined from live radio status in a later touchpoint conversion.
-    caps.maxPanadapters = mc.maxSlices;
+    caps.canCreateSlices = true;
+    // What the radio declared wins over the model table when it said anything
+    // (#5594 item 3). The table is a per-model estimate keyed off the model
+    // string; these are what THIS radio reports for its own hardware and
+    // licence. Both fall back to the table at 0, so firmware that never sends
+    // the discovery keys behaves exactly as before.
+    caps.maxSlices = m_reportedMaxSlices > 0 ? m_reportedMaxSlices : mc.maxSlices;
+    // Pan capacity is no longer assumed equal to slice capacity. That was a
+    // documented approximation ("pan capacity tracks the radio's SCU/slice
+    // capacity, which is identical across every current model",
+    // ModelCapabilities.h) — true of the current line-up, but an assumption the
+    // radio settles for itself: a FLEX-8600 broadcasts max_panadapters=4 and
+    // max_slices=4 as separate keys, and nothing guarantees they stay equal.
+    caps.maxPanadapters =
+        m_reportedMaxPanadapters > 0 ? m_reportedMaxPanadapters : mc.maxSlices;
     caps.hasExtendedDsp = mc.hasExtendedDsp();
     // The LMS/FFT family is base Flex firmware, not an 8000-series extra —
     // every radio with hasRadioSideDsp below also has NRL/ANFL/ANFT.
@@ -169,6 +267,11 @@ RadioCapabilities FlexBackend::capabilities() const
     caps.canTransmit = true;
     // Flex meter samples retain the established client-side PEP response.
     caps.forwardPowerRequiresSmoothing = true;
+    // `transmit rfpower=` is parsed off radio status, so the value the model
+    // carries is confirmed radio state rather than this client's request
+    // (#5518, Principle II).
+    caps.transmitDriveControl = RadioCapabilities::TransmitDriveControl{
+        SliceFrequencyControl::Authority::Radio};
     // A Flex transmits in every mode it demodulates, so there is nothing for the
     // receive-only mode guard to refuse. Stated rather than defaulted, per the
     // "adding a field" rule in RadioCapabilities.h.
@@ -193,6 +296,7 @@ RadioCapabilities FlexBackend::capabilities() const
     // group on the Receive page, and it is NOT this flag. False here means "the
     // client does not apply a frequency scalar", which is correct for a Flex.
     caps.hostFrequencyCalibration = false;
+    caps.hostDroopCalibration = false;   // no known DDC edge droop on this radio
     // Global / TX / mic profiles are a SmartSDR feature on every current model.
     caps.hasProfiles = true;
     caps.hasSelectableMicInputs = true;
@@ -437,11 +541,55 @@ void FlexBackend::sendSliceWaveformCommand(int sliceId, const QString& command)
                   .arg(command));
 }
 
-void FlexBackend::setKeying(bool key)
+void FlexBackend::sendTx(const QString& command, const TxCoordinator::Command& fence)
 {
+    if (!fence.permitsDispatch(TxCoordinator::monotonicMs())) {
+        return;
+    }
+    if (!m_txSink) {
+        qCWarning(lcProtocol) << "FlexBackend: no operation-fenced TX command sink; refusing command";
+        return;
+    }
+    m_txSink(command, fence);
+}
+
+void FlexBackend::setKeying(bool key, const AetherSDR::TxCoordinator::Operation& operation, const AetherSDR::TxCoordinator::Completion& completion)
+{
+    if (operation.independent()) {
+        if (key && independentTxControl().activities != 0) {
+            const quint32 sequence = m_sequenceProvider();
+            const TxCoordinator::Command command{operation, true, completion};
+            QMetaObject::invokeMethod(m_connection, [connection = m_connection, sequence, command] {
+                connection->writeIndependentPtt(sequence, command);
+            }, Qt::QueuedConnection);
+        } else {
+            // The qualified stop verb owns unkey and its stop-attempt token.
+            completion.finish();
+        }
+        return;
+    }
     // Keying is only translated here; the interlock/authorization decision is
     // made above the seam (RFC §6). Matches RadioModel::setTransmit's wire form.
-    send(QStringLiteral("xmit %1").arg(key ? 1 : 0));
+    sendTx(QStringLiteral("xmit %1").arg(key ? 1 : 0), {operation, key, completion});
+}
+
+void FlexBackend::setTune(bool on, int tunePowerPercent, const AetherSDR::TxCoordinator::Operation& operation, const AetherSDR::TxCoordinator::Completion& completion)
+{
+    // FlexLib 4.2.18 Radio.TXTune. Power is a separate radio setting; do not
+    // re-send it here. Host-modulating backends need it on this same verb.
+    Q_UNUSED(tunePowerPercent);
+    sendTx(QStringLiteral("transmit tune %1").arg(on ? 1 : 0), {operation, on, completion});
+}
+
+void FlexBackend::setAtu(bool start, const AetherSDR::TxCoordinator::Operation& operation, const AetherSDR::TxCoordinator::Completion& completion)
+{
+    // FlexLib 4.2.18 Radio.ATUTuneStart / ATUTuneBypass.
+    sendTx(start ? QStringLiteral("atu start") : QStringLiteral("atu bypass"), {operation, start, completion});
+}
+
+void FlexBackend::abortCwText(const TxCoordinator::Operation& operation, const AetherSDR::TxCoordinator::Completion& completion)
+{
+    sendTx(QStringLiteral("cwx clear"), {operation, false, completion});
 }
 
 void FlexBackend::invokeExtension(const QString& ns, const QString& verb,
@@ -1027,6 +1175,29 @@ void FlexBackend::decodeTunerStatus(const QString& handle, const QMap<QString, Q
         d.model = kvs.value(QStringLiteral("model"));
     if (kvs.contains(QStringLiteral("ip")))
         d.ip = kvs.value(QStringLiteral("ip"));
+    // Per-port antenna, "ANT1,ANT2". Split exactly as FlexLib's
+    // Tuner.ParseAntenna does: first field is port A, second is port B, a
+    // missing second field leaves B empty, and anything past the second is
+    // ignored rather than treated as an error.
+    if (kvs.contains(QStringLiteral("ant"))) {
+        // split() always yields at least one element, so at(0) is safe.
+        const QStringList ants = kvs.value(QStringLiteral("ant")).split(QLatin1Char(','));
+        d.portAAnt = ants.at(0).trimmed();
+        d.portBAnt = ants.size() > 1 ? ants.at(1).trimmed() : QString();
+    }
+
+    // PTT-per-port. Casing unconfirmed — FlexLib lower-cases every key before
+    // matching, so its "ptta"/"pttb" cases do not pin the wire's spelling.
+    // Both are accepted; a string compare is cheaper than a lamp that stays
+    // dark with no way to tell why.
+    if (kvs.contains(QStringLiteral("pttA")))
+        d.pttA = (kvs.value(QStringLiteral("pttA")) == QLatin1String("1"));
+    else if (kvs.contains(QStringLiteral("ptta")))
+        d.pttA = (kvs.value(QStringLiteral("ptta")) == QLatin1String("1"));
+    if (kvs.contains(QStringLiteral("pttB")))
+        d.pttB = (kvs.value(QStringLiteral("pttB")) == QLatin1String("1"));
+    else if (kvs.contains(QStringLiteral("pttb")))
+        d.pttB = (kvs.value(QStringLiteral("pttb")) == QLatin1String("1"));
     if (kvs.contains(QStringLiteral("operate")))
         d.operate = (kvs.value(QStringLiteral("operate")) == QLatin1String("1"));
     if (kvs.contains(QStringLiteral("bypass")))
@@ -1052,6 +1223,19 @@ void FlexBackend::clearExtensionHandles()
     // handle can't survive into a reconnect (possibly a different radio).
     m_ampHandle.clear();
     m_tunerHandle.clear();
+    // #5594 (M1): a reconnect must be able to announce its model again, even if
+    // it is the same radio — capabilities were republished from scratch at the
+    // connect edge, so the previous session's announcement describes nothing.
+    m_announcedModel.clear();
+    // #5594 item 3: and it must not inherit the previous radio's capacity — a
+    // FLEX-6700 followed by a FLEX-6400 would otherwise keep reporting 8.
+    //
+    // Deliberately silent. Every other capacity change announces, but this one
+    // runs on the disconnect edge, where RadioModel republishes capabilities
+    // through connectionStateChanged anyway; announcing here as well would be a
+    // duplicate on a path where no client can act on it.
+    m_reportedMaxSlices = 0;
+    m_reportedMaxPanadapters = 0;
 }
 
 void FlexBackend::decodeApdStatus(const QMap<QString, QString>& kvs)
@@ -1127,6 +1311,32 @@ void FlexBackend::decodeRadioStatus(const QMap<QString, QString>& kvs)
     carry(kvs, "daxiq_capacity", d.daxiqCapacity);
     carry(kvs, "daxiq_available", d.daxiqAvailable);
     emit radioChanged(d);
+
+    // #5594 (M1): announce the capability revision this status just caused.
+    //
+    // The Flex capability table is DERIVED FROM THE MODEL NAME — capabilities()
+    // runs capabilitiesFor(caps.model) to seed maxSlices, the DSP tier and the
+    // rest — and the model name is not known at the connect edge. It arrives
+    // here, in a `radio ...` status, some time after. Until now nothing said so,
+    // so every consumer that bound to capabilitiesChanged saw the pre-model
+    // table forever; RadioModel's own comment at the meterDefined handler
+    // records the symptom this produced (a mic gauge hidden at connect and
+    // un-hidden only if an unrelated status happened to land afterwards).
+    //
+    // Deliberately AFTER emit radioChanged(d): a consumer woken by
+    // capabilitiesChanged calls capabilities(), which reads the model back
+    // through m_modelProvider, and that provider only returns the new name once
+    // RadioModel has applied this delta. Same thread, direct delivery, so the
+    // apply above has already happened by the time this line runs.
+    //
+    // Change-guarded against the LAST ANNOUNCED name, not merely against the
+    // key being present: a Flex repeats `radio ...` status on unrelated edits
+    // (callsign, nickname, the audio gains above), and re-announcing on each
+    // would make a republish storm out of typing in a text field.
+    if (d.model && *d.model != m_announcedModel) {
+        m_announcedModel = *d.model;
+        emit capabilitiesChanged();
+    }
 }
 
 void FlexBackend::decodeGpsStatus(const QString& rawBody)

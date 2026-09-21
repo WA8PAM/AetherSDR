@@ -7,6 +7,7 @@
 #include <QThread>
 #include <QUuid>
 
+#include <algorithm>
 #include <utility>
 
 namespace AetherSDR::control {
@@ -16,10 +17,12 @@ Q_LOGGING_CATEGORY(lcControlSession, "aether.control.session")
 ControlSession::ControlSession(ControlResourceStore* resources,
                                qint64 maxQueuedOutputBytes,
                                SessionAuthorization authorization,
-                               QObject* parent)
+                               QObject* parent,
+                               std::function<qint64()> monotonicNanoseconds)
     : QObject(parent),
       m_resources(resources),
       m_authorization(authorization),
+      m_monotonicNanoseconds(std::move(monotonicNanoseconds)),
       m_maxQueuedOutputBytes(maxQueuedOutputBytes)
 {
     Q_ASSERT(m_resources);
@@ -29,23 +32,93 @@ ControlSession::ControlSession(ControlResourceStore* resources,
             this, &ControlSession::onResourceRemoved);
 }
 
+ControlSession::~ControlSession()
+{
+    endAuthorization();
+}
+
 bool ControlSession::isAuthenticated() const
 {
     return !m_revoked
-        && (m_authorization == SessionAuthorization::Observer
+        && (!m_principalBound || m_principal.valid())
+        && (m_principalBound || m_authorization == SessionAuthorization::Observer
+            || m_authorization == SessionAuthorization::Controller
+            || m_authorization == SessionAuthorization::ObserverController
             || m_authorization == SessionAuthorization::AuthenticatedWithoutGrants);
+}
+
+QString ControlSession::principalId() const
+{
+    return isAuthenticated() && isNegotiated() ? m_principal.id() : QString{};
+}
+
+bool ControlSession::canAdministerGrants() const
+{
+    return isAuthenticated() && isNegotiated() && m_principal.canAdministerGrants();
+}
+
+std::function<bool()> ControlSession::credentialFence() const
+{
+    if (QThread::currentThread() != thread() || !isAuthenticated() || !isNegotiated()
+        || !m_principalBound || !m_principal.valid()) {
+        return [] { return false; };
+    }
+    return [principal = m_principal] { return principal.valid(); };
+}
+
+bool ControlSession::bindPrincipal(const ControlCredentials::Principal& principal)
+{
+    if (QThread::currentThread() != thread() || isNegotiated() || m_revoked || m_principalBound
+        || !principal.valid() || !principal.m_source || principal.m_source->thread() != thread()) {
+        return false;
+    }
+    m_principalBound = true;
+    m_principal = principal;
+    connect(principal.m_source, &ControlCredentials::changed, this, [this] {
+        if (!m_principal.valid()) { revokeAuthorization(); }
+    }, Qt::DirectConnection);
+    connect(principal.m_source, &QObject::destroyed, this, &ControlSession::revokeAuthorization);
+    return true;
 }
 
 bool ControlSession::canObserve() const
 {
     return isAuthenticated() && isNegotiated()
-        && m_authorization == SessionAuthorization::Observer;
+        && (m_authorization == SessionAuthorization::Observer
+            || m_authorization == SessionAuthorization::ObserverController);
+}
+
+bool ControlSession::canControl() const
+{
+    return isAuthenticated() && isNegotiated()
+        && (m_authorization == SessionAuthorization::Controller
+            || m_authorization == SessionAuthorization::ObserverController);
 }
 
 void ControlSession::completeNegotiation()
 {
     Q_ASSERT(isAuthenticated() && !isNegotiated());
     m_sessionId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    m_requestClock.start();
+    m_lastRequestTime = m_monotonicNanoseconds ? m_monotonicNanoseconds() : 0;
+}
+
+bool ControlSession::consumeRequest()
+{
+    if (m_requestLimitExceeded) {
+        return false;
+    }
+    const qint64 now = m_monotonicNanoseconds ? m_monotonicNanoseconds() : m_requestClock.nsecsElapsed();
+    const qint64 elapsed = std::max(qint64{0}, now - m_lastRequestTime);
+    m_lastRequestTime = std::max(now, m_lastRequestTime);
+    m_requestTokens = std::min(static_cast<double>(kRequestBurst),
+                              m_requestTokens + static_cast<double>(elapsed) * kRequestsPerSecond / 1'000'000'000.0);
+    if (m_requestTokens < 1.0) {
+        m_requestLimitExceeded = true;
+        return false;
+    }
+    m_requestTokens -= 1.0;
+    return true;
 }
 
 std::optional<ProtocolError> ControlSession::observationError() const
@@ -71,7 +144,20 @@ std::optional<ProtocolError> ControlSession::observationError() const
 
 void ControlSession::revokeAuthorization()
 {
-    if (m_revoked) {
+    if (QThread::currentThread() != thread() || m_abortRequested) {
+        return;
+    }
+    m_abortRequested = true;
+    const QPointer<ControlSession> guard(this);
+    endAuthorization();
+    if (guard) {
+        emit authorizationRevoked();
+    }
+}
+
+void ControlSession::endAuthorization()
+{
+    if (QThread::currentThread() != thread() || m_revoked) {
         return;
     }
     m_revoked = true;
@@ -79,7 +165,28 @@ void ControlSession::revokeAuthorization()
     m_selectorsByType.clear();
     m_pending.clear();
     m_pendingBytes = 0;
-    emit authorizationRevoked();
+    // Move first: cleanup may synchronously re-enter or destroy the session.
+    const std::function<void()> retire = std::move(m_retireAuthority);
+    if (m_authorityContext && retire) {
+        retire();
+    }
+}
+
+bool ControlSession::bindAuthorityLifetime(QObject* context, std::function<void()> retire)
+{
+    if (QThread::currentThread() != thread() || !context || context->thread() != thread()
+        || !retire || m_authorityLifetimeBound) {
+        return false;
+    }
+    m_authorityLifetimeBound = true;
+    m_authorityContext = context;
+    connect(context, &QObject::destroyed, this, &ControlSession::revokeAuthorization);
+    if (m_revoked) {
+        retire();
+    } else {
+        m_retireAuthority = std::move(retire);
+    }
+    return true;
 }
 
 void ControlSession::bindOutputTransport(
@@ -101,6 +208,7 @@ void ControlSession::bindOutputTransport(
     m_outputTransportBound = true;
     const QPointer<ControlSession> session(this);
     const QPointer<QObject> transport(transportContext);
+    connect(transportContext, &QObject::destroyed, this, &ControlSession::endAuthorization);
     connect(this, &ControlSession::outputReady, transportContext,
             [session, transport, writeFrame = std::move(writeFrame)] {
                 if (!session) {
@@ -109,13 +217,17 @@ void ControlSession::bindOutputTransport(
                 const QList<QByteArray> frames = session->takePendingFrames();
                 for (const QByteArray& frame : frames) {
                     // A write can revoke the session or destroy either endpoint.
-                    if (!session || !transport || !session->canObserve() || !writeFrame(frame)) {
+                    if (!session || !transport || !session->canObserve()) {
+                        return;
+                    }
+                    if (!writeFrame(frame)) {
+                        if (session) {
+                            session->revokeAuthorization();
+                        }
                         return;
                     }
                 }
             }, Qt::QueuedConnection);
-    connect(this, &ControlSession::outputOverflow,
-            transportContext, abortTransport, Qt::QueuedConnection);
     // Same owning thread: do not defer the abort behind an already queued flush.
     connect(this, &ControlSession::authorizationRevoked,
             transportContext, abortTransport);
@@ -139,25 +251,36 @@ std::optional<ProtocolError> ControlSession::subscribe(
                              QStringLiteral("maximum subscriptions reached"), {}, false};
     }
 
+    QJsonArray resources;
+    const QList<ResourceSnapshot> snapshots = m_resources->snapshot(selectors);
+    for (const ResourceSnapshot& snapshot : snapshots) {
+        resources.append(snapshot.toJson());
+    }
+    const QString subscriptionId = QStringLiteral("sub-%1").arg(m_nextSubscription);
+    const QJsonObject baseline{{QStringLiteral("subscription"), subscriptionId},
+                              {QStringLiteral("sequence"), static_cast<qint64>(m_drainedSequence)},
+                              {QStringLiteral("resources"), resources}};
+    // Reserve more than the largest escaped request id + response envelope.
+    // Refuse before registration, including during resync: an oversized atomic
+    // baseline cannot be split into partial success or silently drop resources.
+    constexpr qint64 kEnvelopeReserve = 1024;
+    const qint64 limit = ProtocolLimits::kMaxMessageBytes;
+    if (QJsonDocument(baseline).toJson(QJsonDocument::Compact).size() + kEnvelopeReserve > limit) {
+        return ProtocolError{QStringLiteral("transport.limit_exceeded"),
+                             QStringLiteral("subscription baseline is too large; narrow selectors"), {}, false};
+    }
     if (m_resyncRequired) {
         // A fresh atomic baseline supersedes an undrained resync notice. Do not
         // deliver that older invalidation after the successful subscribe reply.
         m_pending.clear();
         m_pendingBytes = 0;
     }
-    const QString subscriptionId = QStringLiteral("sub-%1").arg(m_nextSubscription++);
+    ++m_nextSubscription;
     m_subscriptions.insert(subscriptionId, selectors);
     rebuildSelectorIndex();
     m_resyncRequired = false;
 
-    QJsonArray resources;
-    const QList<ResourceSnapshot> snapshots = m_resources->snapshot(selectors);
-    for (const ResourceSnapshot& snapshot : snapshots) {
-        resources.append(snapshot.toJson());
-    }
-    *result = {{QStringLiteral("subscription"), subscriptionId},
-               {QStringLiteral("sequence"), static_cast<qint64>(m_drainedSequence)},
-               {QStringLiteral("resources"), resources}};
+    *result = baseline;
     return std::nullopt;
 }
 
@@ -322,7 +445,9 @@ void ControlSession::requireResync()
                               {QStringLiteral("subscriptionsInvalidated"), true}};
     const QByteArray frame = encodeFrame(message);
     if (frame.size() > m_maxQueuedOutputBytes) {
-        emit outputOverflow();
+        // Terminal overflow must fence engine authority now, not on a queued
+        // socket abort that could lose to already queued keying work.
+        revokeAuthorization();
         return;
     }
     m_pending.append(PendingMessage{QString(), std::nullopt, frame, m_sequence});

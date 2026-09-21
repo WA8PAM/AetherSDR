@@ -1,5 +1,6 @@
 #include "TxApplet.h"
 #include "AtuPreTuneDialog.h"
+#include "ScopedChildWidget.h"
 #include "GuardedSlider.h"
 #include "ComboStyle.h"
 #include "HGauge.h"
@@ -111,35 +112,6 @@ TxApplet::TxApplet(QWidget* parent)
     setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Fixed);
     buildUI();
 
-    // PEP peak-hold ballistics — 50 ms tick advances decay after the 2 s
-    // hold window, matching SmartSDR's peak-hold bar and the RX S-meter
-    // peak-hold pattern in SMeterWidget. (#2561)
-    m_peakTick.setInterval(50);
-    connect(&m_peakTick, &QTimer::timeout, this, [this]() {
-        if (!m_peakHoldRunning) {
-            m_peakTick.stop();
-            return;
-        }
-        const qint64 elapsedMs = m_peakHoldTimer.elapsed();
-        constexpr qint64 kHoldMs = 2000;
-        if (elapsedMs <= kHoldMs)
-            return;
-        // After the hold, decay the peak toward the current smoothed value
-        // at a rate scaled to the gauge full-scale so the visual feel
-        // (~2.5 s from peak to floor) stays consistent across barefoot
-        // (120 W gauge) and Aurora 500 W exciter (600 W gauge).  Set by
-        // setPowerScale; defaults to the barefoot 48 W/s.
-        const float decaySecs = static_cast<float>(elapsedMs - kHoldMs) / 1000.0f;
-        const float decayed = m_peakDecayStart - m_peakDecayWattsPerSec * decaySecs;
-        if (decayed <= m_smoothedPower) {
-            m_peakPower = m_smoothedPower;
-            m_peakHoldRunning = false;
-            m_peakTick.stop();
-        } else {
-            m_peakPower = decayed;
-        }
-        static_cast<HGauge*>(m_fwdGauge)->setPeakValue(m_peakPower);
-    });
 }
 
 void TxApplet::buildUI()
@@ -406,10 +378,7 @@ void TxApplet::buildUI()
     // TUNE button — toggle tune
     connect(m_tuneBtn, &QPushButton::clicked, this, [this]() {
         if (!m_model) return;
-        if (m_model->isTuning())
-            m_model->stopTune();
-        else
-            m_model->startTune();
+        requestTune(!m_model->isTuning(), localTxInput(TxController::Activity::Tune));
     });
 
     // MOX button — toggle transmit.  Routes through requestPttOn/Off so
@@ -418,10 +387,7 @@ void TxApplet::buildUI()
     // is disabled or the active TX slice isn't on a phone mode.
     connect(m_moxBtn, &QPushButton::toggled, this, [this](bool on) {
         if (m_updatingFromModel || !m_model) return;
-        if (on)
-            m_model->requestPttOn(TransmitModel::PttSource::Mox);
-        else
-            m_model->requestPttOff(TransmitModel::PttSource::Mox);
+        requestMox(on, localTxInput(TxController::Activity::Mox));
     });
 
     // ATU button — toggle between tune and bypass.
@@ -432,22 +398,130 @@ void TxApplet::buildUI()
     //     prior status was Successful/OK
     // Mirrors SmartSDR's per-frequency toggle. (#1993)
     connect(m_atuBtn, &QPushButton::clicked, this, [this]() {
-        if (!m_model) return;
-        const auto status = m_model->atuStatus();
-        const bool tuned = (status == ATUStatus::Successful || status == ATUStatus::OK);
-        const double curFreq = m_model->transmitFreq();
-        const bool sameFreq = (m_atuTunedFreqMhz > 0.0
-                               && std::abs(curFreq - m_atuTunedFreqMhz) < 1e-6);
-        if (tuned && sameFreq)
-            m_model->atuBypass();
-        else
-            m_model->atuStart();
+        requestAtu(localTxInput(TxController::Activity::Atu));
     });
 
     // MEM button — toggle ATU memories
     connect(m_memBtn, &QPushButton::toggled, this, [this](bool on) {
         if (!m_updatingFromModel && m_model)
             m_model->setAtuMemories(on);
+    });
+    configureTxActions();
+}
+
+TxController::Input TxApplet::localTxInput(TxController::Activity activity)
+{
+    if (!m_radioModel) {
+        return {};
+    }
+    if (!m_txController || !m_txController->valid()) {
+        m_txController = m_radioModel->localTxController();
+    }
+    return m_txController->capture(activity);
+}
+
+void TxApplet::requestTune(bool on, const TxController::Input& input)
+{
+    if (!m_model) {
+        return;
+    }
+    if (m_radioModel) {
+        if (!input.belongsTo(m_radioModel)) {
+            return;
+        }
+        if (on) {
+            (void)input.start();
+        } else {
+            input.stop();
+        }
+    } else if (on) {
+        m_model->startTune();
+    } else {
+        m_model->stopTune();
+    }
+}
+
+void TxApplet::requestMox(bool on, const TxController::Input& input)
+{
+    if (!m_model) {
+        return;
+    }
+    if (m_radioModel) {
+        if (!input.belongsTo(m_radioModel)) {
+            return;
+        }
+        if (on) {
+            (void)input.start();
+        } else {
+            input.stop();
+        }
+    } else if (on) {
+        m_model->requestPttOn(TransmitModel::PttSource::Mox);
+    } else {
+        m_model->requestPttOff(TransmitModel::PttSource::Mox);
+    }
+}
+
+void TxApplet::requestAtu(const TxController::Input& input)
+{
+    if (!m_model) {
+        return;
+    }
+    const ATUStatus status = m_model->atuStatus();
+    const bool tuned = status == ATUStatus::Successful || status == ATUStatus::OK;
+    const bool sameFreq = m_atuTunedFreqMhz > 0.0
+        && std::abs(m_model->transmitFreq() - m_atuTunedFreqMhz) < 1e-6;
+    if (m_radioModel) {
+        if (!input.belongsTo(m_radioModel)) {
+            return;
+        }
+        if (tuned && sameFreq) {
+            (void)input.bypassAtu();
+        } else {
+            (void)input.start();
+        }
+    } else if (tuned && sameFreq) {
+        m_model->atuBypass();
+    } else {
+        m_model->atuStart();
+    }
+}
+
+void TxApplet::configureTxActions()
+{
+    registerTxKeyingAction(m_tuneBtn, [this](const std::shared_ptr<TxController>& controller,
+        const QString& action, const QString&) -> TxKeyingAction::Prepared {
+        if (!m_model || !controller->belongsTo(m_radioModel)
+            || (action != QLatin1String("click") && action != QLatin1String("toggle"))) {
+            return {};
+        }
+        const TxController::Input input = controller->capture(TxController::Activity::Tune);
+        const bool on = !m_model->isTuning();
+        return [this, input, on] { requestTune(on, input); };
+    });
+    registerTxKeyingAction(m_moxBtn, [this](const std::shared_ptr<TxController>& controller,
+        const QString& action, const QString& value) -> TxKeyingAction::Prepared {
+        if (!m_model || !controller->belongsTo(m_radioModel)
+            || (action != QLatin1String("click") && action != QLatin1String("toggle")
+                && action != QLatin1String("setChecked"))) {
+            return {};
+        }
+        const QString normalized = value.trimmed().toLower();
+        const bool on = action == QLatin1String("setChecked")
+            ? normalized == QLatin1String("true") || normalized == QLatin1String("1")
+                || normalized == QLatin1String("on") || normalized == QLatin1String("yes")
+            : !m_moxBtn->isChecked();
+        const TxController::Input input = controller->capture(TxController::Activity::Mox);
+        return [this, input, on] { requestMox(on, input); };
+    });
+    registerTxKeyingAction(m_atuBtn, [this](const std::shared_ptr<TxController>& controller,
+        const QString& action, const QString&) -> TxKeyingAction::Prepared {
+        if (!m_model || !controller->belongsTo(m_radioModel)
+            || (action != QLatin1String("click") && action != QLatin1String("toggle"))) {
+            return {};
+        }
+        const TxController::Input input = controller->capture(TxController::Activity::Atu);
+        return [this, input] { requestAtu(input); };
     });
 }
 
@@ -688,12 +762,10 @@ void TxApplet::syncAtuIndicators()
 void TxApplet::updateMeters(float fwdPower, float swr, bool swrValid)
 {
     if (!m_transmitting) {
-        m_smoothedPower = 0.0f;
         static_cast<HGauge*>(m_fwdGauge)->setValueImmediate(0.0f);
         static_cast<HGauge*>(m_swrGauge)->setValueImmediate(1.0f);
         return;
     }
-    m_smoothedPower = fwdPower;
     HGauge* powerGauge = static_cast<HGauge*>(m_fwdGauge);
     if (m_forwardPowerRequiresSmoothing) {
         powerGauge->setValue(fwdPower);
@@ -708,17 +780,13 @@ void TxApplet::updateMeters(float fwdPower, float swr, bool swrValid)
 
 void TxApplet::updatePeakPower(float fwdPowerInstant)
 {
-    if (!m_transmitting)
+    if (!m_transmitting) {
         return;
-    if (fwdPowerInstant > m_peakPower) {
-        m_peakPower = fwdPowerInstant;
-        m_peakDecayStart = fwdPowerInstant;
-        m_peakHoldTimer.restart();
-        m_peakHoldRunning = true;
-        if (!m_peakTick.isActive())
-            m_peakTick.start();
-        static_cast<HGauge*>(m_fwdGauge)->setPeakValue(m_peakPower);
     }
+    // This is a raw FWDPWR sample, not a separately measured peak. Feed the
+    // gauge's sliding window without changing the already-smoothed bar; the
+    // window derives the readable PEP marker from the instantaneous stream.
+    static_cast<HGauge*>(m_fwdGauge)->recordWindowPeakSample(fwdPowerInstant);
 }
 
 void TxApplet::setTransmitting(bool tx)
@@ -728,13 +796,10 @@ void TxApplet::setTransmitting(bool tx)
         // Clear BOTH the live readings and peak-hold immediately. Merely
         // stopping meter polling leaves the last power sample painted forever,
         // and an already-in-flight reply may still arrive after this edge.
-        m_smoothedPower = 0.0f;
-        m_peakPower = 0.0f;
-        m_peakDecayStart = 0.0f;
-        m_peakHoldRunning = false;
-        m_peakTick.stop();
         static_cast<HGauge*>(m_fwdGauge)->setValueImmediate(0.0f);
-        static_cast<HGauge*>(m_fwdGauge)->setPeakValue(0.0f);
+        // clearPeak() drops the gauge's sliding window as well, so nothing
+        // survives the unkey edge to be glided back into view.
+        static_cast<HGauge*>(m_fwdGauge)->clearPeak();
         static_cast<HGauge*>(m_swrGauge)->setValueImmediate(1.0f);
     }
 }
@@ -748,6 +813,7 @@ void TxApplet::setRadioModel(RadioModel* radio)
         disconnect(m_capabilitiesConnection);
         m_capabilitiesConnection = {};
     }
+    m_txController.reset();
     m_radioModel = radio;
     m_forwardPowerRequiresSmoothing = !radio || !radio->isConnected()
         || radio->backendCapabilities().forwardPowerRequiresSmoothing;
@@ -779,9 +845,13 @@ void TxApplet::setBandPlanManager(BandPlanManager* bandPlan)
     m_bandPlanMgr = bandPlan;
 }
 
-void TxApplet::showAtuContextMenu(const QPoint& pos)
+void TxApplet::buildAtuContextMenu(QMenu& menu)
 {
-    QMenu menu(m_atuBtn);
+    // Qt has suppressed per-action tooltips since 5.1 unless the menu opts in,
+    // so the "why is this disabled" text below never reached the operator: a
+    // correctly-greyed Pre-tune item read as a dead control, because a disabled
+    // QAction also does not highlight on hover. (#5510)
+    menu.setToolTipsVisible(true);
 
     auto* preTune = menu.addAction(QString::fromUtf8("Pre-tune bands\xE2\x80\xA6"));
     const bool memOn = m_model && m_model->memoriesEnabled();
@@ -797,15 +867,22 @@ void TxApplet::showAtuContextMenu(const QPoint& pos)
     clearMem->setEnabled(m_radioHasTunerMemories);
     connect(clearMem, &QAction::triggered,
             this, &TxApplet::confirmAndClearAtuMemories);
+}
 
+void TxApplet::showAtuContextMenu(const QPoint& pos)
+{
+    QMenu menu(m_atuBtn);
+    buildAtuContextMenu(menu);
     menu.exec(m_atuBtn->mapToGlobal(pos));
 }
 
-void TxApplet::showTuneContextMenu(const QPoint& pos)
+void TxApplet::buildTuneContextMenu(QMenu& menu)
 {
     if (!m_model) return;
 
-    QMenu menu(m_tuneBtn);
+    // Same opt-in as the ATU menu: without it these entries' tooltips, which
+    // say what the next Tune press will actually transmit, never render.
+    menu.setToolTipsVisible(true);
 
     // Reflect the radio's current tune_mode in the check marks so the user
     // can see what the next Tune press will do.  Selecting either entry is
@@ -832,7 +909,14 @@ void TxApplet::showTuneContextMenu(const QPoint& pos)
         if (m_model)
             m_model->setTuneMode(QStringLiteral("two_tone"));
     });
+}
 
+void TxApplet::showTuneContextMenu(const QPoint& pos)
+{
+    if (!m_model) return;
+
+    QMenu menu(m_tuneBtn);
+    buildTuneContextMenu(menu);
     menu.exec(m_tuneBtn->mapToGlobal(pos));
 }
 
@@ -856,7 +940,10 @@ void TxApplet::openPreTuneDialog()
 void TxApplet::confirmAndClearAtuMemories()
 {
     if (!m_model) return;
-    QMessageBox box(this->window());
+    const QPointer<TxApplet> self(this);
+    const QPointer<TransmitModel> model(m_model);
+    ScopedChildWidget<QMessageBox> boxOwner(this->window());
+    QMessageBox& box = *boxOwner.get();
     box.setWindowTitle("Clear ATU memories");
     box.setIcon(QMessageBox::Warning);
     box.setText("Clear the radio's entire ATU memory database?");
@@ -868,8 +955,10 @@ void TxApplet::confirmAndClearAtuMemories()
     auto* clearBtn = box.addButton("Clear all bands", QMessageBox::DestructiveRole);
     box.addButton("Cancel", QMessageBox::RejectRole);
     box.exec();
-    if (box.clickedButton() == clearBtn)
-        m_model->atuClearMemories();
+    if (self && boxOwner && model && self->m_model == model.data()
+        && box.clickedButton() == clearBtn) {
+        model->atuClearMemories();
+    }
 }
 
 void TxApplet::setPowerScale(int maxWatts, bool hasAmplifier)
@@ -915,10 +1004,6 @@ void TxApplet::setPowerScale(int maxWatts, bool hasAmplifier)
             {tick(0.0f), tick(ratedW * 0.4f), tick(ratedW * 0.8f),
              tick(ratedW), tick(gaugeFullScaleW)});
     }
-    // Scale peak-hold decay to the gauge full-scale (~2.5 s from full to
-    // zero) so the visual feel is the same whether the rig is barefoot
-    // or an Aurora 500 W exciter. (#2561)
-    m_peakDecayWattsPerSec = gaugeFullScaleW / 2.5f;
 }
 
 } // namespace AetherSDR

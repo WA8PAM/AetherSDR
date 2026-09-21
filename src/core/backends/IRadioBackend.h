@@ -1,6 +1,15 @@
 #pragma once
 
+#include "IndependentTxControl.h"
+
+#include "core/RadioSettingsIdentity.h"
+#include "core/TxCoordinator.h"
+#include "core/PcmFrame.h"
+
+#include <map>
+
 #include <QByteArray>
+#include <QLoggingCategory>
 #include <QMap>
 #include <QObject>
 #include <QString>
@@ -14,14 +23,19 @@
 #include "core/backends/MeterDef.h"
 #include "core/backends/NotchDelta.h"
 #include "core/backends/ProfileDelta.h"
+#include "core/backends/FrontEndOverload.h"
 #include "core/backends/RadioCapabilities.h"
 #include "core/backends/RestoredRadioState.h"
 #include "core/backends/RadioDelta.h"
 #include "core/backends/SliceDelta.h"
 #include "core/backends/TransmitDelta.h"
 #include "core/backends/TunerDelta.h"
+#include "core/backends/TxAudioSource.h"
 
 namespace AetherSDR {
+
+// Borrowed handle returned by autoRfGainControl(); see AutoRfGainControl.h.
+class IAutoRfGainControl;
 
 // Neutral, family-agnostic connect descriptor. Core fields cover the common
 // case; vendor-specific parameters (SmartLink token, Kiwi endpoint path, …)
@@ -31,6 +45,7 @@ struct RadioConnectRequest {
     quint16 port = 0;
     QString serial;         // when a family identifies radios by serial
     QVariantMap params;     // family-specific extras (namespaced by the backend)
+    RadioSerialIdentity serialIdentity;
 };
 
 // Complete radio-owned memory state applied after the common frequency/mode
@@ -72,17 +87,139 @@ struct MemoryRecallDetails {
 // samples owns an engine-side DSP chain — either way it emits the same
 // normalized signals, so no consumer can tell the difference.
 //
+// ---- THREADING AND LIFETIME CONTRACT ----------------------------------------
+//
+// Every implementor honours the following, and backend_seam_affinity_test /
+// backend_family_switch_test pin it. A backend that needs an exception does
+// not take one quietly: it changes this text first.
+//
+//  1. THE BACKEND OBJECT LIVES ON ITS OWNER'S THREAD. RadioModel constructs
+//     the backend on the thread RadioModel itself lives on (the GUI thread in
+//     the desktop app, the daemon's main thread in aetherd) and never moves
+//     it. Every virtual on this interface is called on that thread, and a
+//     backend may assume so — no verb needs a lock against another verb.
+//
+//  2. EVERY SEAM SIGNAL IS EMITTED FROM THAT THREAD. This includes the
+//     high-rate data plane (audioFrameReady, sliceAudioFrameReady,
+//     spectrumFrameReady, waterfallRowReady, meterUpdate) and the cadence
+//     signals (linkStatsUpdated). A backend whose socket, DSP or timer lives
+//     on a worker thread brings the result back to its own thread FIRST — a
+//     queued connection with `this` as the receiver context, or
+//     QMetaObject::invokeMethod(this, …) — and emits from there. It never
+//     emits a seam signal from inside a worker-thread callback, a
+//     Qt::DirectConnection lambda bound to a worker-thread sender, or a
+//     std::function the worker invokes.
+//
+//     Consequence for consumers: RadioModel may connect to any seam signal
+//     with the default (Auto) connection type and get a direct call, in
+//     order, with no re-entrancy across threads. Consumers must NOT rely on
+//     Qt::DirectConnection to reach a worker thread through the seam — there
+//     is no such thread to reach.
+//
+//  3. WORKERS ARE THE BACKEND'S PRIVATE BUSINESS. Threads, sockets, DSP
+//     objects and their affinity are implementation detail. Nothing above the
+//     seam may observe, name, or wait on them; a consumer that needs a
+//     backend-side value asks the backend on the backend's thread
+//     (healthSnapshot(), linkStats(), dspChains()) and the backend answers
+//     from its own cache — see the SYNCHRONOUS note on healthSnapshot().
+//
+//     TRANSITIONAL EXCEPTION, and the only one: FlexBackend::connection() /
+//     panStream() and SimBackend's equivalents are backend-owned wire objects
+//     living on worker threads that RadioModel still harvests and drives
+//     directly — including Qt::BlockingQueuedConnection invokes — while the
+//     command plane moves behind the seam (#5262 M4, #5554 §2.6). They are the
+//     only objects above the seam that may wait on a backend thread, no new
+//     call site may join them, and every handler bound to them is
+//     generation-guarded per rule 5. When M4 lands, this paragraph goes.
+//
+//  4. SEAM PAYLOADS ARE DECLARED AND REGISTERED IN ONE PLACE. Every value
+//     type that crosses the seam (the *Delta structs, MeterDef, LinkStats) is
+//     declared with Q_DECLARE_METATYPE in its own header AND registered with
+//     qRegisterMetaType in RadioModel's constructor. A new payload type adds
+//     itself to both, in the same change that introduces it.
+//
+//     This is NOT what makes a queued connection deliver. On Qt 6 moc embeds
+//     each signal parameter's QMetaType in the meta-object and a
+//     pointer-to-member-function connection self-registers at connect time, so
+//     a queued seam signal delivers with neither line present — the Qt 5
+//     "Cannot queue arguments of type …" failure this rule used to cite does
+//     not reproduce here. The registration is for the NAME-based paths that do
+//     not go through moc's embedded type: QMetaType::fromName, QVariant round
+//     trips, string-based SIGNAL/SLOT connects, and QSignalSpy argument
+//     capture (tests/hl2_backend_test.cpp relies on exactly that). Registering
+//     in one place keeps those working and keeps the answer to "is this a seam
+//     payload?" in a single list.
+//
+//  5. TEARDOWN IS BOUNDED AND ORDERED. disconnectRadio() returns with no
+//     worker still able to reach a seam signal: it stops its sources, quits
+//     and joins its threads (or hands them to a self-deleting reaper the way
+//     RtlSdrBackend does for a stuck open), and emits disconnected() exactly
+//     once, from its own thread, before returning or asynchronously — but
+//     never twice and never from a worker. The destructor completes the
+//     same drain for a backend destroyed while connected, and must never
+//     wait on a BlockingQueuedConnection whose target thread may itself be
+//     waiting on this thread — that is the wait cycle the family-switch test
+//     exists to catch. RadioModel::teardownBackend() disconnects every seam
+//     signal BEFORE destroying the backend, but THAT IS NOT SUFFICIENT and a
+//     consumer must not believe it is: QObject::disconnect stops new posts and
+//     Qt purges a queued QMetaCallEvent only when the RECEIVER dies, so a call
+//     already posted by a dying backend (or by a wire object on its worker
+//     thread) is still delivered afterwards. What actually drops it is the
+//     receiver generation: teardownBackend() bumps a counter, and every
+//     handler bound to a backend-owned object captures it and returns early
+//     when it no longer matches (RadioModel::setupBackend()). Believing the
+//     disconnect was enough is what let a torn-down session's trailing status
+//     line delete the next session's slice.
+//
+//  6. A BACKEND EMITS NOTHING AFTER disconnected(). A frame a worker sent
+//     before it was stopped may still be queued when disconnectRadio()
+//     returns; the backend gates its re-emit on its own connected flag (see
+//     SimBackend's audio forwards) so the seam stays silent once it has said
+//     goodbye. sim_backend_test pins this for the reference implementation.
+//
 // This is the CORE seed. It carries the lifecycle, capability, canonical-verb,
 // and extension surface; it grows one method at a time as the touchpoint
 // burndown (docs/architecture/aetherd-touchpoints.md) converts each gui→engine
 // touchpoint into a protocol/backend verb. Do NOT dump all 140 touchpoints
 // here at once.
+// Owned by the model, borrowed by a backend. See backends/OfflineHealthSource.h.
+class IOfflineHealthSource;
+
 class IRadioBackend : public QObject {
     Q_OBJECT
 
 public:
-    explicit IRadioBackend(QObject* parent = nullptr) : QObject(parent) {}
+    explicit IRadioBackend(QObject* parent = nullptr) : QObject(parent)
+    {
+        connect(this, &IRadioBackend::connected, this, [this] {
+            m_slicePcm.clear();
+            ++m_pcmSession;
+            m_pcmLive = m_speakerPcm.start(PcmPurpose::Speaker, -1, {}, m_pcmSession);
+            if (!m_pcmLive) {
+                // Refusing here means total RX silence on this backend. Say so:
+                // every downstream refusal is a silent return, so without this
+                // the failure is indistinguishable from a dead radio.
+                qWarning() << "IRadioBackend: speaker PCM producer refused to start for session"
+                           << m_pcmSession << "- RX audio will be silent on this connection";
+            }
+        });
+        connect(this, &IRadioBackend::disconnected, this, [this] {
+            retirePcmStreams();
+        });
+        connect(this, &IRadioBackend::sliceRemoved, this, [this](int id) {
+            m_slicePcm.erase(id);
+        });
+    }
     ~IRadioBackend() override = default;
+
+    // Owner-thread retirement before disconnect/teardown can pump events.
+    // Revokes already queued compatibility frames without touching the radio.
+    void retirePcmStreams()
+    {
+        m_pcmLive = false;
+        m_speakerPcm.invalidate();
+        m_slicePcm.clear();
+    }
 
     // ---- identity & capability (feeds the protocol `welcome`, §4.1) ----
     virtual RadioCapabilities capabilities() const = 0;
@@ -226,6 +363,18 @@ public:
         Q_UNUSED(gainDb);
     }
 
+    // The backend's own automatic receive-gain control, or nullptr when it has
+    // none. See AutoRfGainControl.h for the vocabulary and for why this is a
+    // borrowed interface pointer rather than a capability bool and three verbs.
+    //
+    // BORROWED AND NOT TO BE CACHED: valid only for the duration of the call
+    // that obtained it.
+    //
+    // Default nullptr AND that default is the point: a family with no such
+    // control never learns the concept exists, and shared code does not have to
+    // know which families do.
+    virtual IAutoRfGainControl* autoRfGainControl() { return nullptr; }
+
     // The discrete front-end stages above. `step` indexes the label list the
     // backend published; a backend clamps rather than refuses, exactly as
     // setPanRfGain does.
@@ -310,6 +459,30 @@ public:
     // a single answer.
     virtual void setActiveSlice(int sliceId) { Q_UNUSED(sliceId); }
 
+    // ---- ordinary receive-slice lifecycle ----
+    // panId is backend-owned and opaque; frequencyHz is absolute RF in Hz.
+    // True accepts ownership of a request, not confirmation of a new/removed
+    // slice. Publish confirmed state through sliceChanged / sliceRemoved;
+    // report a later failure through sliceLifecycleFailed. A false return is
+    // final refusal: callers must never fall back to another command plane.
+    // Fixed/paired receiver topologies keep the default refusal. Flex and Sim
+    // retain RadioModel's existing command-plane adapter for these requests.
+    //
+    // A backend must cancel pending work on disconnect/reconnect and discard
+    // completions from retired sessions or receiver instances before emitting
+    // state/failure. Reused slice integers alone cannot identify pending work.
+    virtual bool createSlice(const QString& panId, double frequencyHz)
+    {
+        Q_UNUSED(panId);
+        Q_UNUSED(frequencyHz);
+        return false;
+    }
+    virtual bool removeSlice(int sliceId)
+    {
+        Q_UNUSED(sliceId);
+        return false;
+    }
+
     // ---- panadapter lifecycle ----
     //
     // Bring up / tear down a panadapter (and, on a backend where a pan IS a
@@ -382,7 +555,20 @@ public:
     // backend only translates an already-authorized intent to its mechanism
     // (command verb, in-stream bit, hardware line). A backend whose
     // capabilities().canTransmit is false implements this as a no-op.
-    virtual void setKeying(bool key) = 0;
+    virtual void setKeying(bool key, const AetherSDR::TxCoordinator::Operation& operation, const AetherSDR::TxCoordinator::Completion& completion = {}) = 0;
+    virtual IndependentTxControl independentTxControl() const { return {}; }
+    virtual bool independentTxReady() const { return false; }
+    virtual void stopIndependentTx(const TxCoordinator::Operation& operation,
+                                   const TxCoordinator::StopRequest& request)
+    {
+        Q_UNUSED(operation);
+        Q_UNUSED(request);
+    }
+
+    // Trusted engine composition supplies the admitted operation for backend-
+    // owned producers (e.g. a TUNE tone). Copy it when starting that producer;
+    // workers must never look up whichever operation is current at delivery.
+    void setTransmitContext(const TxCoordinator::Context& context) { m_transmitContext = context; }
 
     // A client-timed CW element. This is deliberately separate from setKeying:
     // setKeying is the transmitter/PTT envelope, while this is the carrier
@@ -390,11 +576,13 @@ public:
     // shaped IQ and may use breakIn to raise/drop PTT around it; a radio-side
     // keyer translates it to its own key-line protocol. Flex keeps using its
     // timestamped NetCW path above this seam, so the default is a no-op.
-    virtual void setCwKeying(bool down, bool breakIn, int breakInDelayMs)
+    virtual void setCwKeying(bool down, bool breakIn, int breakInDelayMs, const AetherSDR::TxCoordinator::Operation& operation, const AetherSDR::TxCoordinator::Completion& completion = {})
     {
         Q_UNUSED(down);
         Q_UNUSED(breakIn);
         Q_UNUSED(breakInDelayMs);
+        Q_UNUSED(operation);
+    Q_UNUSED(completion);
     }
 
     // Let receive audio through WHILE TRANSMITTING.
@@ -433,10 +621,12 @@ public:
     // the RF Power slider. That made TUNE key at FULL power for anyone running
     // RF 100 / Tune 10, which is the opposite of what the control is for.
     // Defaulted so existing implementations stay source-compatible.
-    virtual void setTune(bool on, int tunePowerPercent = -1)
+    virtual void setTune(bool on, int tunePowerPercent, const AetherSDR::TxCoordinator::Operation& operation, const AetherSDR::TxCoordinator::Completion& completion = {})
     {
         Q_UNUSED(on);
         Q_UNUSED(tunePowerPercent);
+        Q_UNUSED(operation);
+    Q_UNUSED(completion);
     }
 
     // Transmit power as a percentage, 0..100.
@@ -466,12 +656,14 @@ public:
     // Empty return means accepted for delivery. A non-empty string is an
     // operator-facing rejection reason; callers must not report success when
     // the backend could not preserve the requested text.
-    virtual QString sendCwText(const QString& text)
+    virtual QString sendCwText(const QString& text, const TxCoordinator::Operation& operation, const AetherSDR::TxCoordinator::Completion& completion = {})
     {
+        Q_UNUSED(operation);
+    Q_UNUSED(completion);
         Q_UNUSED(text);
         return QStringLiteral("radio has no text keyer");
     }
-    virtual void abortCwText() {}
+    virtual void abortCwText(const TxCoordinator::Operation& operation, const AetherSDR::TxCoordinator::Completion& completion = {}) { Q_UNUSED(operation); Q_UNUSED(completion); }
     virtual void setCwSpeed(int wpm) { Q_UNUSED(wpm); }
     virtual void setCwBreakIn(bool on) { Q_UNUSED(on); }
 
@@ -517,7 +709,7 @@ public:
     //
     // KEYS THE TRANSMITTER on a radio with a real ATU, so it sits behind the
     // same TX gate as every other keying intent.
-    virtual void setAtu(bool start) { Q_UNUSED(start); }
+    virtual void setAtu(bool start, const AetherSDR::TxCoordinator::Operation& operation, const AetherSDR::TxCoordinator::Completion& completion = {}) { Q_UNUSED(start); Q_UNUSED(operation); Q_UNUSED(completion); }
 
     // Receive and transmit incremental tuning. Hz relative to the VFO.
     //
@@ -695,18 +887,25 @@ public:
     // the microphone and any future source all reach the air through ONE path,
     // so what the operator monitors is what gets transmitted.
     //
-    // `clientLeveled` is true when the audio came from an external TCI/DAX
-    // client rather than the mic chain or the engine's own generators. The
-    // sender of such audio has already applied its own level control, so a
-    // host-modulating backend must not run makeup gain (ALC) over it (#4796).
+    // `source` says WHERE THE AUDIO CAME FROM, which decides whose level it is.
+    // TxAudioSource.h carries the full contract for the three states and why it
+    // is not the bool it replaced; the short version is that the mic slider
+    // applies to Microphone and ClientLeveled and not to EngineGenerated.
+    //
+    // ORIGIN, NOT TREATMENT. What a backend does with the tag is the backend's
+    // business, and most do nothing: Hl2TxDsp is the only consumer in the tree,
+    // and a radio that modulates on its own side ignores it entirely.
+    //
     // No default argument — defaults on virtuals bind statically, and the
     // override a caller actually reaches would quietly diverge from it.
     virtual void submitTxAudio(const QByteArray& int16Stereo, int sampleRateHz,
-                               bool clientLeveled)
+                               TxAudioSource source,
+                               const TxCoordinator::Context& context)
     {
         Q_UNUSED(int16Stereo);
         Q_UNUSED(sampleRateHz);
-        Q_UNUSED(clientLeveled);
+        Q_UNUSED(source);
+        Q_UNUSED(context);
     }
 
     // Finish a finite processed-audio stream before its caller starts the PTT
@@ -718,7 +917,7 @@ public:
     // whatever the radio buffers before its modulator — so the caller can hold
     // PTT for exactly that long rather than a compile-time worst case. Zero
     // means "nothing is buffered on your behalf; unkey when you like".
-    virtual int finishTxAudio() { return 0; }
+    virtual int finishTxAudio(const TxCoordinator::Context& context) { Q_UNUSED(context); return 0; }
 
     // ---- diagnostics ----
     //
@@ -751,6 +950,29 @@ public:
         [[nodiscard]] bool isEmpty() const { return order.isEmpty(); }
     };
     virtual HealthSnapshot healthSnapshot() const { return {}; }
+
+    // Take a BORROWED pointer to the model's offline health source, if this
+    // backend has any use for one. Default no-op, and that default is the
+    // point: a family with no offline instrument never learns the concept
+    // exists, and the model does not have to know which families do.
+    //
+    // REPLACES A CONCRETE-BACKEND CAST. The model used to reach for
+    // `dynamic_cast<hl2::Hl2Backend*>` to hand the HL2 its telemetry service.
+    // #5554 §2.8 already lists that cast shape as a seam leak to be retired
+    // (`Hl2Backend`'s off-seam `dspSetupProgress` forcing one in `MainWindow`),
+    // and `docs/HERMES.md`'s coding-agent section forbids adding new ones. A
+    // virtual with a no-op default is what the seam is for.
+    //
+    // NOT AN OWNERSHIP TRANSFER. The source outlives every backend — that is
+    // its whole purpose — and nothing tells a backend the source has gone, so
+    // the owner must not destroy it while a backend could still be holding it.
+    // See `RadioModel::releaseOfflineHealth()`, which hands the borrow back
+    // through this same setter before destroying what was lent.
+    //
+    // Declared here rather than on a family interface because the borrow is a
+    // seam event: it happens in `setupBackend()`, for whatever backend was just
+    // built, with no family name in sight.
+    virtual void setOfflineHealthSource(IOfflineHealthSource*) {}
 
     // WHAT THE DSP IS ACTUALLY CONFIGURED WITH, as opposed to what the model
     // says it asked for.
@@ -837,6 +1059,7 @@ public:
                                  quint64 requestId, const QVariant& arg = {}) = 0;
 
 signals:
+    void independentTxStopped(const AetherSDR::TxStopEvidence& evidence);
     // ---- connection state UP ----
     void connected();
     void disconnected();
@@ -889,7 +1112,33 @@ signals:
     // compared a slice count that never fell against maxSlices() and reported
     // "Slice capacity is full" on a radio with one receiver running.
     void sliceRemoved(int sliceId);
+    // Failure of an accepted ordinary lifecycle request. operation is "create"
+    // or "remove"; sliceId is -1 when creation never allocated a published ID.
+    // This is diagnostic, not a state delta or a split/TX completion protocol.
+    void sliceLifecycleFailed(const QString& operation, int sliceId,
+                              const QString& reason);
     void meterUpdate(const QString& meterId, double value);
+
+    // WHAT THE RECEIVE FRONT END IS DOING, for families that can observe their
+    // own converter. A family that cannot never emits this, and the indicator
+    // above the seam never appears -- the same shape as autoRfGainControl()
+    // returning nullptr.
+    //
+    // RFC #5535 made this visibility a CONDITION of shipping an automatic
+    // gain loop, not a nicety: a regulator with 18 dB of room and a 3-5 dB
+    // knee will sometimes be wrong, and wrong-and-invisible is a radio that
+    // behaves strangely. See FrontEndOverload.h.
+    void frontEndOverloadChanged(const AetherSDR::FrontEndOverload& state);
+
+    // AN ARM REQUEST ON autoRfGainControl() HAS SETTLED: `armed` is what the
+    // control is now doing. Emitted after EVERY outcome of setArmed() --
+    // refused (armed stays false; lastArmRefusalReason() says why), armed, and
+    // disarmed -- and not for a request that changed nothing. This is how a
+    // view learns about an arm it did not ask for: the connect-time restore
+    // inside the backend and a bridge `pan autorfgain on` both settle without
+    // passing through any GUI click, and a checkbox that only read isArmed()
+    // back after its own click reported the wrong state on both (#5817).
+    void autoRfGainArmSettled(bool armed);
 
     // Normalized transmit-status delta (aetherd RFC 2.3 — TransmitModel
     // touchpoint). Typed + compiler-checked; the backend populates only the
@@ -994,7 +1243,7 @@ signals:
     // Flex does NOT emit this: its per-slice audio already arrives as DAX
     // channels, which are per-slice by construction. Only a backend that
     // demodulates in this process has to say which slice a buffer belongs to.
-    void sliceAudioFrameReady(int sliceId, const QByteArray& pcm);
+    void sliceAudioFrameReady(int sliceId, const AetherSDR::PcmFrame& pcm);
 
 
     // The pan's front end is WIDE: the hardware band filter cannot serve every
@@ -1108,14 +1357,77 @@ signals:
     // then a backend may relay the existing in-tree frame types.
     void spectrumFrameReady(int panId, const QByteArray& frame);
     void waterfallRowReady(int panId, const QByteArray& row);
-    void audioFrameReady(const QByteArray& pcm);
+    void audioFrameReady(const AetherSDR::PcmFrame& pcm);
+
+protected:
+    TxCoordinator::Context transmitContext() const { return m_transmitContext; }
+    quint64 pcmSession() const { return m_pcmSession; }
+
+    // Compatibility publishers for current 24 kHz backends. Call on the owner
+    // thread, after rejecting obsolete worker deliveries. Native-rate producers
+    // will publish their own PcmFrame without using these fixed-format adapters.
+    void publishLegacyAudio(const QByteArray& pcm)
+    {
+        if (!m_pcmLive || !isConnected()) {
+            warnAudioDropped();
+            return;
+        }
+        if (const auto frame = m_speakerPcm.legacyStereo24(pcm)) {
+            emit audioFrameReady(*frame);
+        }
+    }
+    bool publishLegacySliceAudio(int sliceId, const QByteArray& pcm)
+    {
+        if (!m_pcmLive || !isConnected() || sliceId < 0) {
+            warnAudioDropped();
+            return false;
+        }
+        auto it = m_slicePcm.find(sliceId);
+        if (it == m_slicePcm.end()) {
+            if (m_slicePcm.size() >= PcmFrameGate::kMaxStreams) {
+                return false;
+            }
+            auto producer = std::make_unique<PcmProducer>();
+            producer->start(PcmPurpose::Slice, sliceId, {}, m_pcmSession);
+            const auto frame = producer->legacyStereo24(pcm);
+            if (!frame) {
+                return false;
+            }
+            m_slicePcm.emplace(sliceId, std::move(producer));
+            emit sliceAudioFrameReady(sliceId, *frame);
+            return true;
+        }
+        if (const auto frame = it->second->legacyStereo24(pcm)) {
+            emit sliceAudioFrameReady(sliceId, *frame);
+            return true;
+        }
+        return false;
+    }
+
+private:
+    TxCoordinator::Context m_transmitContext;
+    // One line per session, not per frame: this fires at audio rate.
+    void warnAudioDropped()
+    {
+        if (m_pcmDropWarned == m_pcmSession) {
+            return;
+        }
+        m_pcmDropWarned = m_pcmSession;
+        qWarning() << "IRadioBackend: dropping RX audio in session" << m_pcmSession
+                   << "- no live PCM producer (live =" << m_pcmLive
+                   << ", connected =" << isConnected() << ")";
+    }
+
+    bool m_pcmLive = false;
+    quint64 m_pcmSession = 0;
+    quint64 m_pcmDropWarned = 0;
+    PcmProducer m_speakerPcm;
+    std::map<int, std::unique_ptr<PcmProducer>> m_slicePcm;
 };
 
 }  // namespace AetherSDR
 
-// linkStatsUpdated is direct-connected today (Hl2Backend's cadence timer lives
-// on the same thread as its consumer), but a backend whose socket owner emits
-// it from a worker thread would need the queued path — which silently drops the
-// signal unless the type is registered. Declared here so that stays a
-// non-event.
+// Contract rule 4: every seam payload is declared here and registered in
+// RadioModel's constructor, so a queued or QMetaMethod-based connection of
+// linkStatsUpdated delivers rather than silently dropping.
 Q_DECLARE_METATYPE(AetherSDR::IRadioBackend::LinkStats)

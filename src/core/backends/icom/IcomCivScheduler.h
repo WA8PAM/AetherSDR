@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "core/backends/icom/CivCodec.h"
+#include "core/TxCoordinator.h"
 
 namespace AetherSDR::icom {
 
@@ -51,6 +52,7 @@ public:
         // Reads and repeated slider writes collapse to the newest queued item.
         bool coalesce = true;
         std::int64_t notBeforeMs = 0;
+        std::optional<TxCoordinator::Command> txCommand;
     };
 
     struct Dispatch {
@@ -59,6 +61,7 @@ public:
         Priority priority = Priority::Control;
         std::uint64_t generation = 0;
         bool supersedes = false;
+        std::optional<TxCoordinator::Command> txCommand;
     };
 
     enum class Observation : std::uint8_t {
@@ -85,6 +88,7 @@ public:
     };
 
     struct TransactionEvent {
+        std::uint64_t eventId = 0; // Lifetime-unique, including after reset/history clear.
         std::string key;
         Priority priority = Priority::Control;
         std::uint64_t generation = 0;
@@ -109,6 +113,10 @@ public:
         std::int64_t maxResponseMs = -1;
         std::int64_t lastResponseAtMs = 0;
         std::string lastCompletedKey;
+        // Command byte of the frame that lastCompletedKey retired. The key is
+        // semantic and deliberately coarse (a frequency READ and WRITE share
+        // "frequency"); a consumer that must tell them apart reads this.
+        std::uint8_t lastCompletedCmd = 0;
         std::string lastTimeoutKey;
         std::size_t queueDepth = 0;
         bool readInFlight = false;
@@ -224,6 +232,7 @@ private:
     // meters stays a delay rather than an indefinite hold.
     std::int64_t m_lastBackgroundDispatchMs = 0;
     Stats m_stats;
+    std::uint64_t m_transactionEventId = 0;
     std::deque<TransactionEvent> m_recentTransactions;
 };
 

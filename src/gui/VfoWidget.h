@@ -54,6 +54,9 @@ class VfoWidget : public QWidget {
 public:
     explicit VfoWidget(QWidget* parent = nullptr);
     ~VfoWidget() override;
+#ifdef HAVE_DEEPFIST
+    void refreshCwDecoderControls();
+#endif
 
     void setSlice(SliceModel* slice);
     void setAntennaList(const QStringList& ants);
@@ -212,6 +215,22 @@ public:
             return 1;
         }
         return 1000 + std::max(sliceId, 0);
+    }
+
+    // Locked flag side for one member of an attached diversity pair, keyed by
+    // its position after diversityPairOrderKey ordering. Order index 0 is the
+    // parent / master slice — the one DIV was enabled on, which SmartSDR tags
+    // "DIV" — whenever the radio reports diversity_parent or diversity_index;
+    // with neither field present the key falls back to slice ID and index 0 is
+    // simply the lower-numbered slice. In the reported case index 0 locks RIGHT
+    // to match SmartSDR's layout, so a cross-client operator finds the DIV flag
+    // where muscle memory reaches for it; in the fallback case the swap still
+    // yields stable opposite sides, which is all the pre-metadata path promised.
+    // index 1 locks LEFT. Both are Lock* (not Force*) so the pair holds opposite
+    // sides through a pan edge instead of collapsing together (#2663, #3880).
+    static FlagDir diversityPairFlagDir(int orderIndex)
+    {
+        return orderIndex == 0 ? LockRight : LockLeft;
     }
 
     static FlagPlacement placementForMarker(int markerX,
@@ -624,8 +643,12 @@ public:
     // markerWidth: 0 = off, 1 = 1 px, 3 = 3 px.
     int  markerWidth() const { return m_markerWidth; }
     bool filterEdgesHidden() const { return m_filterEdgesHidden; }
-    void setMarkerWidth(int widthPx);
-    void setFilterEdgesHidden(bool hide);
+    static int defaultMarkerWidth();
+    static bool defaultFilterEdgesHidden();
+    static void setDefaultMarkerWidth(int widthPx);
+    static void setDefaultFilterEdgesHidden(bool hide);
+    void setMarkerWidth(int widthPx, bool persist = true);
+    void setFilterEdgesHidden(bool hide, bool persist = true);
 private:
     int  m_markerWidth{1};
     bool m_filterEdgesHidden{false};
@@ -636,7 +659,8 @@ private:
     // unchecked = edges hidden.
     class QPushButton* m_edgesBtn{nullptr};
     void loadDisplayPrefs();
-    void saveDisplayPrefs();
+    void saveMarkerWidthPref();
+    void saveFilterEdgesPref();
     // Adaptive RX filter controls (SSB-only, rebuilt with the Mode tab) — RFC #3878
     // Reusable adaptive-RX-filter control group (shared with the RX applet);
     // recreated on each SSB grid rebuild, bound to the slice as source of truth.

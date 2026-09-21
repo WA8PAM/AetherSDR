@@ -1,4 +1,6 @@
 #include "WaveformWidget.h"
+#include "SpectrumRhiFailureState.h"
+#include "core/LogManager.h"
 
 #include "InteractionSettings.h"
 #include "NativeWidgetTopology.h"
@@ -68,8 +70,11 @@ QColor waveformColor()
 
 float waveformLineWidth()
 {
-    const float w = AppSettings::instance().value("DisplayFftLineWidth", "2.0").toFloat();
-    return std::clamp(w, 1.0f, 3.0f);
+    // Shares the panadapter's key, so it must accept every width the FFT Line
+    // slider can set: the floor is the slider's lowest non-Off step (RFC
+    // #5561 §E). The 3.0 ceiling is the scope's own.
+    const float w = AppSettings::instance().value("DisplayFftLineWidth", "1.0").toFloat();
+    return std::clamp(w, 0.5f, 3.0f);
 }
 
 bool showGrid()
@@ -104,6 +109,24 @@ WaveformWidget::WaveformWidget(Profile profile, QWidget* parent)
     setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Fixed);
     setAttribute(Qt::WA_OpaquePaintEvent);
     setAutoFillBackground(false);
+#ifdef AETHER_GPU_SPECTRUM
+    // Say so when the GPU path does not come up. The panadapter has reported
+    // this since it was written; this widget did not, so a scope that had
+    // silently fallen back to drawing nothing was indistinguishable from a
+    // scope with no signal in it — the failure mode looks exactly like an
+    // idle radio.
+    connect(this, &QRhiWidget::renderFailed, this, [this]() {
+        if (!m_rhiFailure.report(
+                tr("Qt could not create or present the waveform renderer."))) {
+            return;
+        }
+        qCWarning(lcGui).noquote()
+            << "WaveformWidget: QRhi failure:" << m_rhiFailure.reason()
+            << "— the scope will not draw. Try AETHER_NO_GPU=1 for the "
+               "software OpenGL rasterizer, or rebuild with "
+               "-DAETHER_GPU_SPECTRUM=OFF for the QPainter path.";
+    });
+#endif
 #if defined(AETHER_GPU_SPECTRUM) && defined(Q_OS_MAC)
     // Unlike the panadapter, every waveform scope lives inside a QScrollArea.
     // Making that child a native NSView while deliberately keeping its

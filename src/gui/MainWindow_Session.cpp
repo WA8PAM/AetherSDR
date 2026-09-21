@@ -37,7 +37,7 @@
 #include "core/backends/sim/SimBackend.h"   // demo owns its audio — see wirePanStreamRxAudioSinks
 #include "core/CwSidetoneGenerator.h"
 #include "core/CwTrace.h"
-#include "gui/CwDecodeSettings.h"   // rxEnabled() gate for the RX-audio CW feed
+#include "models/CwDecodeSettings.h"   // rxEnabled() gate for the RX-audio CW feed
 #include "core/CwxLocalKeyer.h"
 #include "core/IambicKeyer.h"
 #include "core/PerfTelemetry.h"
@@ -217,15 +217,15 @@ void MainWindow::wireDiscovery()
     // Qt::UniqueConnection cannot catch it: these are two DIFFERENT signals
     // arriving at the same slot, so nothing looks duplicate to Qt.
     connect(&m_radioModel, &RadioModel::backendAudioFrameReady,
-            m_audio, [this](const QByteArray& pcm) {
+            m_audio, [this](const PcmFrame& pcm) {
         if (backendFeedsEngineDirectly()) return;   // demo feeds the engine directly
         // Playback mute. The Flex path mutes by disconnecting the stream's
-        // audioDataReady from feedAudioData; against a null PanadapterStream
+        // pcmFrameReady from feedPcmFrame; against a null PanadapterStream
         // that disconnect is a silent no-op, so a seam backend would keep
         // feeding live receive UNDER the playback. Reachable in practice only
         // now that the recorder captures RX on such a radio at all. (#4537.)
         if (m_rxMutedForPlayback) return;
-        m_audio->feedAudioData(pcm);
+        m_audio->feedPcmFrame(pcm);
     });
 
     connect(&m_hl2Discovery, &hl2::Hl2Discovery::radioDiscovered,
@@ -384,17 +384,7 @@ void MainWindow::wireDiscovery()
     connect(&m_discovery, &RadioDiscovery::radioDiscovered,
             this, &MainWindow::maybeAutoConnectToDiscoveredRadio);
     connect(m_connPanel, &ConnectionPanel::disconnectRequested,
-            this, [this]{
-        m_userDisconnected = true;
-        m_wanReconnectTimer.stop();
-        m_wanReconnectAttemptInProgress = false;
-        setPanadapterConnectionAnimation(false);
-        auto& s = AppSettings::instance();
-        s.remove("LastConnectedRadioSerial");
-        s.remove("LastRoutedRadioIp");
-        s.save();
-        m_radioModel.disconnectFromRadio();
-    });
+            this, &MainWindow::disconnectFromRadioByUser);
 
     // ── SmartLink ──────────────────────────────────────────────────────────
     m_connPanel->setSmartLinkClient(&m_smartLink);
@@ -507,6 +497,19 @@ void MainWindow::wireDiscovery()
             setPanadapterConnectionAnimation(false);
     });
 
+}
+
+void MainWindow::disconnectFromRadioByUser()
+{
+    m_userDisconnected = true;
+    m_wanReconnectTimer.stop();
+    m_wanReconnectAttemptInProgress = false;
+    setPanadapterConnectionAnimation(false);
+    auto& s = AppSettings::instance();
+    s.remove("LastConnectedRadioSerial");
+    s.remove("LastRoutedRadioIp");
+    s.save();
+    m_radioModel.disconnectFromRadio();
 }
 
 void MainWindow::maybeAutoConnectToDiscoveredRadio(const RadioInfo& info)
@@ -704,6 +707,11 @@ void MainWindow::updateExperimentalRadioSupport(bool connected)
 void MainWindow::wireRadioModel()
 {
     // ── Wire up radio model ────────────────────────────────────────────────
+    connect(&m_radioModel, &RadioModel::connectionStateChanged, this, [this](bool connected) {
+        if (!connected) {
+            m_pendingDisplayWrites.flush();
+        }
+    });
     connect(&m_radioModel, &RadioModel::connectionStateChanged,
             this, &MainWindow::onConnectionStateChanged);
 
@@ -723,19 +731,13 @@ void MainWindow::wireRadioModel()
     // surface cannot spam the bar while still never failing silently.
     connect(&m_radioModel, &RadioModel::connectionStateChanged,
             this, [this](bool connected) {
-        if (connected)
+        if (connected) {
             m_commandDroppedNoticeShown = false;
+            m_sliceLifecycleNoticesShown.clear();
+        }
     });
     connect(&m_radioModel, &RadioModel::commandDropped,
-            this, [this](const QString&) {
-        if (m_commandDroppedNoticeShown)
-            return;
-        m_commandDroppedNoticeShown = true;
-        statusBar()->showMessage(
-            tr("This radio doesn't support that control — nothing was sent to "
-               "the radio. Further unsupported controls are logged."),
-            8000);
-    });
+            this, [this](const QString&) { showUnsupportedControlNotice(); });
     // Slice Link: disconnect teardown never emits sliceRemoved (stale slices
     // are staged for reconnect reclaim), so dissolve the link explicitly.
     // Both transitions dissolve — a link never crosses a session boundary
@@ -931,6 +933,20 @@ void MainWindow::wireRadioModel()
             QString("%1 supports a maximum of %2 panadapters")
                 .arg(model).arg(limit), 4000);
     });
+    // Same shape as the commandDropped notice above: RadioModel's qCWarning
+    // carries every occurrence; the operator sees each distinct refusal once
+    // per connect session.
+    connect(&m_radioModel, &RadioModel::sliceLifecycleFailed, this,
+            [this](const QString& operation, int, const QString& reason) {
+        const QString key = operation + QLatin1Char('\n') + reason;
+        if (m_sliceLifecycleNoticesShown.contains(key))
+            return;
+        m_sliceLifecycleNoticesShown.insert(key);
+        const QString what = operation == QLatin1String("remove")
+            ? tr("Cannot remove slice: %1").arg(reason)
+            : tr("Cannot create slice: %1").arg(reason);
+        statusBar()->showMessage(what, 6000);
+    });
     connect(&m_radioModel, &RadioModel::sliceCreateFailed,
             this, [this](int limit, const QString& model) {
         statusBar()->showMessage(
@@ -1059,8 +1075,9 @@ void MainWindow::wireRadioModel()
     // operator's gain TWICE, in series, which is not what a slider labelled once
     // can mean. The modulator's is the one to keep: setPcMicGain only ever
     // attenuates (0..100 maps to 0.0..1.0, and AudioEngine skips it entirely at
-    // unity), while the ALC behind the modulator needs the mic pushed UP past
-    // its hold threshold — see Hl2Backend::setMicGain.
+    // unity), while the modulator's slider reaches +40 dB and is now the only
+    // thing that lifts a quiet mic at all — the ALC behind it only reduces.
+    // See Hl2Backend::setMicGain.
     //
     // This gate is also why the control was dead rather than doubled before now:
     // micSelection() is "MIC" until a radio reports otherwise, and an HL2 has no
@@ -1210,12 +1227,12 @@ void MainWindow::wireRadioModel()
                     << " down=" << down
                     << " schedMs=" << cwTraceMsAt(when);
             }
-            QMetaObject::invokeMethod(this, [this, down, when]() {
-                const quint64 traceId = m_lastCwPaddleTraceId.load(std::memory_order_relaxed);
-                const quint64 sourceMs = m_lastCwPaddleSourceMs.load(std::memory_order_relaxed);
-                m_radioModel.sendCwKeyEdge(down, QStringLiteral("cw:iambic-keyer"),
-                                           traceId, sourceMs, when);
-            }, Qt::QueuedConnection);
+        });
+        m_iambicKeyer->setOnRoutedKeyDownChange([this](bool down,
+                std::chrono::steady_clock::time_point when, const TxCoordinator::Request& input) {
+            m_radioModel.queueProducerCwKeyEdge(input, down, QStringLiteral("cw:iambic-keyer"),
+                m_lastCwPaddleTraceId.load(std::memory_order_relaxed),
+                m_lastCwPaddleSourceMs.load(std::memory_order_relaxed), when);
         });
         m_iambicKeyer->setOnPaddleEvent([this](bool dit, bool dah) {
             // The radio's break-in setting decides whether key edges produce
@@ -1245,6 +1262,28 @@ void MainWindow::wireRadioModel()
     }
 
     // TX/RX transition → audio source switching
+    connect(&m_radioModel.transmitModel(), &TransmitModel::pttReleaseCancelled,
+            this, [this] {
+#ifdef HAVE_RADE
+        ++m_radeEooRequestId;
+        if (m_radeFallbackReleaseFence) {
+            m_radeFallbackReleaseFence->store(false, std::memory_order_release);
+        }
+        m_radePttRelease = {};
+        m_radeEooPending = false;
+        m_radeTxActive = false;
+        if (m_radeEngine) {
+            QMetaObject::invokeMethod(m_radeEngine, [engine = m_radeEngine] {
+                engine->resetTx();
+            }, Qt::QueuedConnection);
+        }
+#endif
+        // Cancellation must not wait for EOO, even when optimistic MOX was
+        // already false and neither of the state-edge handlers below fires.
+        if (m_audio) {
+            m_audio->setTransmitting(false);
+        }
+    });
     connect(&m_radioModel.transmitModel(), &TransmitModel::moxChanged,
             this, [this](bool tx) {
         // Keep TX audio source strictly aligned with the local MOX edge for all
@@ -1285,7 +1324,8 @@ void MainWindow::wireRadioModel()
                 // when this fires (RadioModel emits it synchronously with moxChanged).
                 // Suppress now; eooFinished posts setTransmitting(false) to the
                 // AudioEngine queue after the EOO packets.
-                if (m_radeSliceId >= 0 && m_radeEngine && m_radeEngine->isActive()) {
+                if (m_radeSliceId >= 0 && m_radeEngine && m_radeEngine->isActive()
+                    && m_radeEooPending && m_radePttRelease.current()) {
                     qCDebug(lcRade) << "MainWindow: txAudioGateChanged(false) suppressed — RADE EOO pending";
                 } else {
                     m_audio->setTransmitting(false);
@@ -1338,6 +1378,10 @@ void MainWindow::wireRadioModel()
         if (!tx) {
             m_appletPanel->phoneCwApplet()->updateCompression(0.0f);
             m_appletPanel->phoneCwApplet()->resetAlc();
+            // Same reason as resetAlc: the last gain the ALC applied describes
+            // a transmission that has ended, and left on the face it reads as
+            // the gain being applied now.
+            m_appletPanel->phoneCwApplet()->resetAlcGain();
         }
         if (tx) {
             AetherSDR::ThemeManager::instance().applyStyleSheet(m_txIndicator, "QLabel { color: white; background: {{color.accent.danger}}; font-weight: bold; "
@@ -2198,41 +2242,13 @@ void MainWindow::wireCatPorts()
     tciServer()->wireSpotModel();
 
     // Wire RX audio from PanadapterStream → TCI server for audio streaming.
-    // TCI audio feeds exclusively from DAX (not audioDataReady) so that
+    // TCI audio feeds exclusively from DAX (not pcmFrameReady) so that
     // audio_mute doesn't kill TCI audio (#1331). Stream-bound, so it goes through
     // the shared helper the post-swap rebind also calls (#4448).
     wirePanStreamTciSinks();
 
-    // RX audio for a backend that demodulates in-process (HL2). That backend has
-    // no PanadapterStream, so wirePanStreamTciSinks() above binds nothing and TCI
-    // clients heard silence — WSJT-X connected, tracked frequency and mode, and
-    // never decoded a single signal.
-    //
-    // The payload is already what onDaxAudioReady expects: float32 interleaved
-    // stereo at 24 kHz (Hl2RxDsp::Config::audioSampleRateHz).
-    //
-    // PER SLICE, and this used to be hardcoded to channel 1.
-    //
-    // That was correct while such a radio ran ONE receiver: with no slice
-    // claiming a DAX channel, onDaxAudioReady's fallback maps channel N to
-    // trx N-1, so 1 → trx 0, the only receiver advertised in trx_count. With
-    // two receivers it is the bug — nothing ever fed channel 2, so a second TCI
-    // client bound to RX2 got full CAT control and total silence. Worse, the
-    // signal it was fed carries the MIXED speaker audio, so even routed to
-    // channel 2 it would have been the sum of every receiver rather than slice B.
-    //
-    // sliceId + 1 continues the same fallback: slice 0 → channel 1 → trx 0,
-    // slice 1 → channel 2 → trx 1. Single-receiver behaviour is unchanged.
-    //
-    // Bound to m_radioModel, not the backend, so it survives a family swap. Flex
-    // never emits this signal — its per-slice audio arrives as real DAX channels
-    // through wirePanStreamTciSinks() above — so there is no double-feed and no
-    // change to the Flex path.
-    connect(&m_radioModel, &RadioModel::backendSliceAudioFrameReady,
-            this, [this](int sliceId, const QByteArray& pcm) {
-        if (tciServer())
-            tciServer()->onDaxAudioReady(sliceId + 1, pcm);
-    });
+    // TciServer owns the typed RadioModel per-slice subscription. It resolves
+    // live stable slice identities without a GUI relay or speaker-mix feed.
 
     // TCI client count changes no longer auto-create/remove the audio stream.
     // Control-only TCI clients (StreamDeck) don't need audio, and auto-creating
@@ -2245,11 +2261,11 @@ void MainWindow::wireCatPorts()
 
 }
 
-// The RX-audio sinks fed by PanadapterStream::audioDataReady, in one place so
+// The RX-audio sinks fed by PanadapterStream::pcmFrameReady, in one place so
 // buildUI() and rewirePanStreamAfterBackendSwap() bind an identical set. The
 // stream is owned by the Flex backend and is destroyed/rebuilt on a family
 // swap (RadioModel::teardownBackend/setupBackend), which drops these — and Flex
-// RX audio itself rides audioDataReady, so a missed one is silence, not a
+// RX audio itself rides pcmFrameReady, so a missed one is silence, not a
 // degraded feature. Keeping the list here (not open-coded in two places) is why
 // a new sink added to buildUI cannot silently go un-rebound after a swap.
 // Deliberately NOT IRadioBackend::ownsRxAudio(), despite the near-identical
@@ -2298,8 +2314,8 @@ void MainWindow::wirePanStreamRxAudioSinks()
     // The backend's own audio wins; the stream's other RX taps below stay wired.
     // Primary RX audio → QAudioSink (skipped when the backend owns its audio).
     if (!backendFeedsEngineDirectly()) {
-        connect(ps, &PanadapterStream::audioDataReady,
-                m_audio, &AudioEngine::feedAudioData,
+        connect(ps, &PanadapterStream::pcmFrameReady,
+                m_audio, &AudioEngine::feedPcmFrame,
                 Qt::UniqueConnection);
     }
 
@@ -2330,20 +2346,20 @@ void MainWindow::wireRxDemodAudioSinks()
 {
     if (m_qsoRecorder) {
         connect(&m_radioModel, &RadioModel::rxDemodAudioReady,
-                m_qsoRecorder, &QsoRecorder::feedRxAudio);
+                m_qsoRecorder, &QsoRecorder::feedRxFrame);
     }
 
     // CW decoder RX feed — gated live on the toggle (#2417).
     connect(&m_radioModel, &RadioModel::rxDemodAudioReady,
-            &m_cwDecoder, [this](const QByteArray& pcm) {
-                if (CwDecodeSettings::rxEnabled())
-                    m_cwDecoder.feedAudio(pcm);
+            &m_cwDecoder, [this](const PcmFrame& frame) {
+                if (CwDecodeSettings::rxEnabled()) { m_cwDecoder.feed(frame); }
             });
 
     // RTTY decoder RX feed — gated on the decoder being running.
     connect(&m_radioModel, &RadioModel::rxDemodAudioReady,
-            &m_rttyDecoder, [this](const QByteArray& pcm) {
-                if (m_rttyDecoder.isRunning())
+            &m_rttyDecoder, [this](const PcmFrame& frame) {
+                const QByteArray pcm = frame.legacyStereo24();
+                if (!pcm.isEmpty() && m_rttyDecoder.isRunning())
                     m_rttyDecoder.feedAudio(pcm);
             });
 }
@@ -2351,12 +2367,31 @@ void MainWindow::wireRxDemodAudioSinks()
 // TX VITA-49 packets → the registered PanadapterStream socket. Flex-only (the
 // socket lives on the stream); a non-Flex/RX-only backend has none. Shared by
 // wireRadioModel() and the post-swap rebind.
+void MainWindow::wireTxAudioAuthority()
+{
+    // The continuous Flex microphone contract supports VOX/met_in_rx. Host-
+    // routed PCM has no such RX transport contract: stamp it at PTT admission.
+    const TxCoordinator::Producer producer = m_radioModel.registerTxProducer(m_audio);
+    connect(&m_radioModel, &RadioModel::localTransmitEngaged, this, [this, producer] {
+        const TxCoordinator::Context context = m_radioModel.captureTxMedia(producer);
+        QMetaObject::invokeMethod(m_audio, [audio = m_audio, context] {
+            audio->setHostMicrophoneContext(context);
+        }, Qt::QueuedConnection);
+    });
+}
+
 void MainWindow::wirePanStreamTxSink()
 {
     auto* ps = m_radioModel.panStream();
     if (!ps || !m_audio)
         return;
-    connect(m_audio, &AudioEngine::txPacketReady, ps, &PanadapterStream::sendToRadio);
+    connect(m_audio, &AudioEngine::txPacketReady, ps,
+            [ps](const QByteArray& packet, const TxCoordinator::Context& context) {
+        const TxCoordinator::Dispatch dispatch = context.beginDispatch(TxCoordinator::monotonicMs());
+        if (dispatch) {
+            ps->sendToRadio(packet);
+        }
+    });
 }
 
 // TCI audio/IQ/waterfall feeds from PanadapterStream. Shared by the TCI wiring
@@ -2367,8 +2402,8 @@ void MainWindow::wirePanStreamTciSinks()
     auto* ps = m_radioModel.panStream();
     if (!ps || !tciServer())
         return;
-    connect(ps, &PanadapterStream::daxAudioReady,
-            tciServer(), &TciServer::onDaxAudioReady);
+    connect(ps, &PanadapterStream::daxPcmReady,
+            tciServer(), &TciServer::onDaxPcmReady, Qt::UniqueConnection);
     connect(ps, &PanadapterStream::iqDataReady,
             tciServer(), &TciServer::onIqDataReady);
     connect(ps, &PanadapterStream::waterfallRowReady,
@@ -2541,8 +2576,9 @@ QJsonObject MainWindow::automationActivateMemory(int memoryIndex,
 
 bool MainWindow::startAutomationBridge(const QString& sockName)
 {
-    if (m_automation && m_automation->isRunning())
-        return true;  // idempotent
+    if (m_automation) {
+        return true;  // already listening or waiting for the same async token read
+    }
 
     // AETHER_AUTOMATION_SOCKET (or the caller's sockName) pins an explicit
     // endpoint; otherwise the default is PID-suffixed so two instances don't
@@ -2555,8 +2591,9 @@ bool MainWindow::startAutomationBridge(const QString& sockName)
                    : QStringLiteral("aethersdr-automation-%1")
                          .arg(QCoreApplication::applicationPid());
 
-    if (!m_automation)
-        m_automation = std::make_unique<AutomationServer>();
+    // Provably null here: the early return above covers every live server,
+    // listening or still waiting for its token.
+    m_automation = std::make_unique<AutomationServer>();
 
     // dumpTree reports the status-bar message (#4864) by reading a generic
     // dynamic property — core/ must not know the QStatusBar type
@@ -2585,8 +2622,18 @@ bool MainWindow::startAutomationBridge(const QString& sockName)
     m_automation->setSliceReceiveSourceHandler(
         [this](const QString& arg) { return automationSetSliceReceiveSource(arg); });
     m_automation->setModemAutomationHandler(
-        [this](const QString& verb, const QString& action, const QString& value) {
-            return automationModemCommand(verb, action, value);
+        [this](const QString& verb, const QString& action, const QString& value,
+               const std::shared_ptr<TxController>& controller, const TxController::Input& input) {
+            return automationModemCommand(verb, action, value, controller, input);
+        });
+    m_automation->setShortcutAutomationHandler(
+        [this](const QString& id, bool allowTx, const std::shared_ptr<TxController>& controller) {
+            return fireShortcutAction(id, allowTx, controller);
+        });
+    m_automation->setKeyEventAutomationHandler(
+        [this](const QString& spec, bool press, bool allowTx,
+               const std::shared_ptr<TxController>& controller) {
+            return injectKeyEventForAutomation(spec, press, allowTx, controller);
         });
     m_automation->setSliceCenterLockHandler(
         [this](int sliceId, bool enabled) { return automationSetCenterLock(sliceId, enabled); });
@@ -2728,9 +2775,17 @@ bool MainWindow::startAutomationBridge(const QString& sockName)
     QPointer<AutomationServer> guard(m_automation.get());
     const QString startName = name;
     AutomationBridgeSettings::loadToken(this, [this, guard, startName](const QString& tok) {
-        if (!guard || m_automation.get() != guard)
+        if (!guard || m_automation.get() != guard) {
             return;  // toggled off or restarted before the token arrived
-        guard->setAuthToken(tok);
+        }
+        // A token pushed while this read was pending (Rotate, or the dialog's
+        // auto-mint on enable) is newer than whatever the keychain returns —
+        // keep it, or a stale/empty read would bind the bridge with the
+        // wrong token while the Network tab shows the new one. A fresh server
+        // holds no token, so "empty" means nothing was pushed.
+        if (guard->authToken().isEmpty()) {
+            guard->setAuthToken(tok);
+        }
         if (tok.isEmpty()) {
             qWarning().noquote()
                 << "Automation bridge starting UNAUTHENTICATED — any same-user "
@@ -2740,6 +2795,24 @@ bool MainWindow::startAutomationBridge(const QString& sockName)
         if (!guard->start(startName)) {
             qWarning() << "Automation bridge failed to start (socket in use?)";
             m_automation.reset();
+            // Nothing is listening, so the persisted opt-in must not survive —
+            // otherwise every launch silently re-attempts the doomed start and
+            // the operator is never told (#4181). The env-var force-enable is
+            // not an opt-in we own; recordStartOutcome() leaves it alone then.
+            const bool forced = AutomationBridgeSettings::envForced();
+            AutomationBridgeSettings::recordStartOutcome(false, forced);
+            // On the launch path no Radio Setup dialog exists, so the result
+            // signal below can have no receiver. The status bar is the one
+            // surface always present to say why the toggle is off next time
+            // the operator looks; the server already logged errorString().
+            if (!forced) {
+                statusBar()->showMessage(
+                    QStringLiteral("Agent automation bridge could not bind its "
+                                   "socket (see the log) — the Radio Setup toggle "
+                                   "is now off."),
+                    15000);
+            }
+            emit automationBridgeStartResult(false);
             return;
         }
         // TX-automation gate — set AFTER start(), which reads
@@ -2758,8 +2831,19 @@ bool MainWindow::startAutomationBridge(const QString& sockName)
         guard->setReadOnly(
             qEnvironmentVariableIsSet("AETHER_AUTOMATION_READONLY")
             || AutomationBridgeSettings::readOnly());
+        // Persist at the owner that observed the successful bind. The modeless
+        // Radio Setup dialog may have closed while the token read was pending.
+        // An environment-forced start must not change the operator's opt-in.
+        AutomationBridgeSettings::recordStartOutcome(
+            true, AutomationBridgeSettings::envForced());
+        emit automationBridgeStartResult(true);
     });
-    return true;  // start initiated; the socket begins listening once the token resolves
+    // Normally the bridge is NOT listening yet — the socket binds inside the
+    // callback above, and callers wanting the outcome must watch
+    // automationBridgeStartResult. On the synchronous token paths (AETHER_MCP_TOKEN,
+    // legacy token, no keychain) the callback has already run, so a failed bind
+    // has already reset m_automation: report that rather than a stale "initiated".
+    return m_automation != nullptr;
 }
 
 void MainWindow::stopAutomationBridge()
@@ -2824,13 +2908,49 @@ void MainWindow::applyTxAudioCapabilities(bool connected, const RadioCapabilitie
     // Repeated capabilities must not enqueue duplicate capture starts.
     AudioEngine* audio = m_audio;
     const QHostAddress address = m_radioModel.radioAddress();
-    QMetaObject::invokeMethod(audio, [audio, connected, caps, pcAudioEnabled, address] {
+    if (!m_microphoneTxProducer.valid()) {
+        m_microphoneTxProducer = m_radioModel.registerTxProducer(audio, true);
+    }
+    const TxCoordinator::Context microphone = connected
+        ? m_radioModel.captureTxMedia(m_microphoneTxProducer) : TxCoordinator::Context{};
+    QMetaObject::invokeMethod(audio, [audio, connected, caps, pcAudioEnabled, address, microphone] {
+        audio->setMicrophoneContext(microphone);
         audio->applyBackendAudioCapabilities(connected, caps, pcAudioEnabled, address);
     });
     if (connected) {
         // Observation only: never restore a client setting into DATA OFF MOD.
         m_radioModel.notePcAudioEnabled(pcAudioEnabled);
     }
+}
+
+// One notice per connect session, latch reset on the connect edge (M0, #5263).
+//
+// Held here rather than inline in the commandDropped lambda because a
+// capability gate REFUSES BEFORE THE SEND: `sendCmd` is never reached, so
+// `commandDropped` never fires, and a control converted from "drops silently"
+// to "refuses" would otherwise have taken the operator's only feedback away
+// with it. #5266 landed its four gates on 2026-08-26 and #5265 made the drop
+// loud on 2026-08-27, so that trade was invisible at the time; it is not
+// invisible now. A gate calls this so a refused control says exactly what a
+// dropped one says.
+//
+// The latch is now SHARED between two producers: this helper's gate callers and
+// the commandDropped path. One refusal per connect session therefore consumes
+// the notice for both, so an operator who trips a capability gate first sees
+// nothing for a genuinely dropped command later in the same session. That is
+// the pre-existing one-shot semantics extended to a second producer rather than
+// a new rule, and the message is deliberately generic enough to stand for
+// either cause — but it is a real consequence and is recorded here rather than
+// left to be rediscovered.
+void MainWindow::showUnsupportedControlNotice()
+{
+    if (m_commandDroppedNoticeShown)
+        return;
+    m_commandDroppedNoticeShown = true;
+    statusBar()->showMessage(
+        tr("This radio doesn't support that control — nothing was sent to "
+           "the radio. Further unsupported controls are logged."),
+        8000);
 }
 
 } // namespace AetherSDR

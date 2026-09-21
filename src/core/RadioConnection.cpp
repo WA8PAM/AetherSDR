@@ -1,7 +1,9 @@
 #include "RadioConnection.h"
+#include "backends/flex/FlexPttWireSession.h"
 #include "LogManager.h"
 #include "core/backends/sim/SimBackend.h"
 
+#include <algorithm>
 #include <QEventLoop>
 #include <QNetworkProxy>
 #include <QTimer>
@@ -74,6 +76,15 @@ RadioConnection::~RadioConnection()
 
 void RadioConnection::init()
 {
+    m_independentPtt = std::make_unique<FlexPttWireSession>(
+        [this](quint32 seq, const QString& command) { return writeSocketCommand(seq, command); },
+        [this](const TxStopEvidence& evidence) { emit independentPttStopped(evidence); });
+    m_independentPttTimer = new QTimer(this);
+    m_independentPttTimer->setInterval(25);
+    connect(m_independentPttTimer, &QTimer::timeout, this, [this] {
+        m_independentPtt->poll(TxCoordinator::monotonicMs());
+        updateIndependentPttTimer();
+    });
     m_socket = new QTcpSocket(this);
     // LAN radio uses a proprietary CAT/VITA stream on port 4992; an OS or
     // application HTTP/SOCKS proxy can never tunnel it sensibly.  SmartSDR
@@ -117,14 +128,22 @@ bool RadioConnection::isDemoTarget(const RadioInfo& info)
 
 void RadioConnection::startSyntheticDemoConnect()
 {
+    resetSessionState();
+    // Pin this session. m_syntheticDemo alone cannot distinguish "still the
+    // demo session I queued from" from "a NEW demo session started after mine
+    // was torn down" -- a fast disconnect/reconnect sets the flag back to true
+    // and the old timers then replay a stale version/connected/status burst
+    // into the new session. (#5653 review)
+    const quint64 generation = m_sessionGeneration;
     m_syntheticDemo = true;
     setState(ConnectionState::Connecting);
     // Drive the connect sequence asynchronously (like a real socket connect),
     // so callers that expect connectToRadio() to return before `connected`
     // fires behave identically. Mirrors the real V-line then H-line order:
     // versionReceived, then a nonzero handle + connected().
-    QTimer::singleShot(0, this, [this]() {
-        if (!m_syntheticDemo) return;   // disconnected before we ran
+    QTimer::singleShot(0, this, [this, generation]() {
+        if (!m_syntheticDemo || generation != m_sessionGeneration)
+            return;   // disconnected, or a newer demo session took over
         emit versionReceived(QStringLiteral("1.4.0.0"));
         m_handle = 0xDE30'0001u;        // stable, nonzero synthetic client handle
         setState(ConnectionState::Connected);
@@ -149,8 +168,9 @@ void RadioConnection::startSyntheticDemoConnect()
         // waiting for this slice status — so it must land inside that window with
         // margin. 50ms lets connected()/onConnected() run first without racing the
         // defer. (RFC #4288 — the VFO=0 fix.)
-        QTimer::singleShot(50, this, [this]() {
-            if (!m_syntheticDemo) return;
+        QTimer::singleShot(50, this, [this, generation]() {
+            if (!m_syntheticDemo || generation != m_sessionGeneration)
+                return;   // disconnected, or a newer demo session took over
             emitSyntheticStatus(QStringLiteral(
                 // 8 kHz span — this MUST equal SimBackend's spectrum span
                 // (kAudioSpanHz), because the demo's spectrum row IS the ±4 kHz
@@ -228,6 +248,7 @@ void RadioConnection::connectToHost(const QHostAddress& address,
     m_localAddr = QHostAddress();
     m_localPort = 0;
     m_socket->abort();
+    resetSessionState();
 
     const QHostAddress preferredBindAddr =
         (bindMode == RadioBindMode::Explicit) ? explicitBindAddr : sessionBindAddr;
@@ -272,13 +293,43 @@ void RadioConnection::connectToHost(const QHostAddress& address,
     m_socket->connectToHost(address, port);
 }
 
+void RadioConnection::resetSessionState()
+{
+    m_pttProtocol.store(PttProtocol::Unknown);
+    if (m_independentPtt) {
+        m_independentPtt->disconnect();
+        updateIndependentPttTimer();
+    }
+    // Partial lines and ping replies belong to exactly one TCP session.
+    //
+    // FlexLib does this explicitly too, and for the same reason: its
+    // TcpCommandCommunication keeps the line-assembly buffer as a member of a
+    // long-lived object and clears it under _tcpReadSyncObj in Disconnect()
+    // (reference/FlexLib_API_v4.1.5.39794/FlexLib/TcpCommandCommunication.cs:249).
+    // It is not per-session by lifetime. We also reset at the connect edge,
+    // which covers a hard kill that never reaches a disconnect path. (#5649)
+    m_readBuffer.clear();
+    m_handle = 0;
+    m_lastPingSeq = 0;
+    m_pingStopwatch.invalidate();
+    // Every session edge invalidates work queued by the previous session --
+    // see the synthetic-demo handshake timers. (#5653 review)
+    ++m_sessionGeneration;
+}
+
 void RadioConnection::disconnectFromRadio()
 {
+    // Reset twice, deliberately. Here, so the synthetic-demo branch below --
+    // which returns early -- is covered; and again at the end, because
+    // waitForDisconnected(2000) pumps the event loop and can deliver readyRead,
+    // refilling m_readBuffer and m_handle after this first pass. Neither call
+    // is redundant; do not collapse them. (#5653 review)
+    resetSessionState();
     if (m_heartbeat) m_heartbeat->stop();
     if (m_syntheticDemo) {
         // Demo teardown: no socket to close — just drop state and notify.
+        // (m_handle was already zeroed by resetSessionState() above.)
         m_syntheticDemo = false;
-        m_handle = 0;
         setState(ConnectionState::Disconnected);
         emit disconnected();
         return;
@@ -289,7 +340,7 @@ void RadioConnection::disconnectFromRadio()
         if (m_socket->state() != QAbstractSocket::UnconnectedState)
             m_socket->waitForDisconnected(2000);
     }
-    m_handle = 0;
+    resetSessionState();
 }
 
 void RadioConnection::gracefulDisconnect(quint32 handle,
@@ -338,6 +389,10 @@ void RadioConnection::gracefulDisconnect(quint32 handle,
 
 void RadioConnection::writeCommand(quint32 seq, const QString& command)
 {
+    if (m_commandSinkForTest) {
+        m_commandSinkForTest(seq, command);
+        return;
+    }
     if (m_syntheticDemo) {
         if (!isConnected()) return;
         // Keepalive: RadioModel pings the radio and force-disconnects after 5
@@ -463,7 +518,59 @@ void RadioConnection::writeCommand(quint32 seq, const QString& command)
         emit commandResponse(seq, 0, QString());
         return;
     }
-    if (!isConnected() || !m_socket) return;
+    if (m_independentPtt) {
+        m_independentPtt->otherCommand(command, TxCoordinator::monotonicMs());
+    }
+    (void)writeSocketCommand(seq, command);
+}
+
+bool RadioConnection::independentPttSupported() const
+{
+    return isConnected() && !isSyntheticDemo()
+        && m_pttProtocol.load() == PttProtocol::Supported;
+}
+
+bool RadioConnection::independentPttReady() const
+{
+    return independentPttSupported() && m_independentPtt && m_independentPtt->ready();
+}
+
+void RadioConnection::writeIndependentPtt(quint32 seq, const TxCoordinator::Command& command)
+{
+    if (independentPttSupported() && m_independentPtt) {
+        m_independentPtt->key(seq, command, TxCoordinator::monotonicMs());
+        updateIndependentPttTimer();
+    } else {
+        command.completion.finish();
+    }
+}
+
+void RadioConnection::stopIndependentPtt(quint32 seq, const TxCoordinator::Operation& operation,
+                                         const TxCoordinator::StopRequest& request)
+{
+    if (isConnected() && !isSyntheticDemo() && m_independentPtt) {
+        m_independentPtt->stop(seq, operation, request, TxCoordinator::monotonicMs());
+        updateIndependentPttTimer();
+    }
+}
+
+void RadioConnection::updateIndependentPttTimer()
+{
+    if (!m_independentPttTimer || !m_independentPtt) {
+        return;
+    }
+    if (!m_independentPtt->needsPolling()) {
+        m_independentPttTimer->stop();
+    } else if (!m_independentPttTimer->isActive()) {
+        m_independentPttTimer->start();
+    }
+}
+
+bool RadioConnection::writeSocketCommand(quint32 seq, const QString& command)
+{
+    if (!isConnected() || !m_socket || isSyntheticDemo()) {
+        return false;
+    }
 
     const QByteArray data = CommandParser::buildCommand(seq, command);
     if (command.startsWith("ping")) {
@@ -472,8 +579,9 @@ void RadioConnection::writeCommand(quint32 seq, const QString& command)
     } else {
         qCDebug(lcConnection) << "TX:" << data.trimmed();
     }
-    m_socket->write(data);
+    const bool written = m_socket->write(data) == data.size();
     m_socket->flush();   // force immediate kernel send for keepalive reliability
+    return written;
 }
 
 void RadioConnection::onSocketConnected()
@@ -490,6 +598,7 @@ void RadioConnection::onSocketConnected()
 
 void RadioConnection::onSocketDisconnected()
 {
+    resetSessionState();
     qCDebug(lcConnection) << "RadioConnection: TCP disconnected";
     if (m_heartbeat) m_heartbeat->stop();
     m_localAddr = QHostAddress();
@@ -505,8 +614,10 @@ void RadioConnection::onSocketError(QAbstractSocket::SocketError)
     qCWarning(lcConnection) << "RadioConnection: socket error:" << msg;
     setState(ConnectionState::Error);
     emit errorOccurred(msg);
-    if (m_socket->state() == QAbstractSocket::UnconnectedState)
+    if (m_socket->state() == QAbstractSocket::UnconnectedState) {
+        resetSessionState();
         setState(ConnectionState::Disconnected);
+    }
 }
 
 void RadioConnection::onReadyRead()
@@ -522,10 +633,16 @@ void RadioConnection::onReadyRead()
     }
     int newlinePos;
     while ((newlinePos = m_readBuffer.indexOf('\n')) >= 0) {
-        const QString line = QString::fromUtf8(m_readBuffer.left(newlinePos)).trimmed();
+        // Strip the line terminator only. The evidence path must see malformed
+        // whitespace; CommandParser separately trims for legacy presentation.
+        QString line = QString::fromUtf8(m_readBuffer.left(newlinePos));
+        if (line.endsWith(u'\r')) {
+            line.chop(1);
+        }
         m_readBuffer.remove(0, newlinePos + 1);
-        if (!line.isEmpty())
+        if (!QStringView(line).trimmed().isEmpty()) {
             processLine(line);
+        }
     }
 }
 
@@ -535,6 +652,10 @@ void RadioConnection::onHeartbeat()
 
 void RadioConnection::processLine(const QString& line)
 {
+    if (m_independentPtt && !isSyntheticDemo()) {
+        m_independentPtt->observe(line, TxCoordinator::monotonicMs());
+        updateIndependentPttTimer();
+    }
     // GPS coordinates are never useful in a support log. Drop the raw status
     // at the source; AsyncLogWriter also scrubs coordinate-shaped fields as a
     // defense against future logging paths.
@@ -558,16 +679,47 @@ void RadioConnection::processLine(const QString& line)
     emit messageReceived(msg);
 
     switch (msg.type) {
-    case MessageType::Version:
+    case MessageType::Version: {
+        // Inspect the raw prologue, not the tolerant presentation parser's
+        // trimmed value. A duplicate/late V cannot renegotiate TX authority.
+        const bool supported = m_pttProtocol.load() == PttProtocol::Unknown
+            && !isConnected() && clientHandle() == 0 && line.startsWith(u'V')
+            && FlexPttWireSession::supportsProtocol(QStringView(line).mid(1));
+        m_pttProtocol.store(supported ? PttProtocol::Supported : PttProtocol::Rejected);
+        if (!supported && m_independentPtt) {
+            m_independentPtt->rejectProtocol();
+        }
         emit versionReceived(msg.object);
         break;
-    case MessageType::Handle:
+    }
+    case MessageType::Handle: {
+        const bool firstHandle = clientHandle() == 0;
         m_handle = msg.handle;
+        if (m_independentPtt && !isSyntheticDemo()) {
+            // The evidence parser must not accept the presentation parser's
+            // default-zero or partially parsed identity.
+            bool ok = false;
+            const quint32 handle = line.mid(1).toUInt(&ok, 16);
+            const QStringView digits = QStringView(line).mid(1);
+            const bool hexOnly = digits.size() == 8 && std::all_of(digits.begin(), digits.end(), [](QChar ch) {
+                return (ch >= u'0' && ch <= u'9') || (ch >= u'a' && ch <= u'f')
+                    || (ch >= u'A' && ch <= u'F');
+            });
+            if (m_pttProtocol.load() == PttProtocol::Supported && firstHandle
+                && ok && line.size() == 9 && line.startsWith(u'H')
+                && hexOnly && handle != 0 && clientHandle() == handle) {
+                m_independentPtt->reset(m_sessionGeneration, handle);
+            } else {
+                m_pttProtocol.store(PttProtocol::Rejected);
+                m_independentPtt->rejectProtocol();
+            }
+        }
         qCDebug(lcConnection) << "RadioConnection: assigned handle" << QString::number(m_handle, 16);
         setState(ConnectionState::Connected);
         if (m_heartbeat) m_heartbeat->start();
         emit connected();
         break;
+    }
     case MessageType::Response:
         emit commandResponse(msg.sequence, msg.resultCode, msg.object);
         break;

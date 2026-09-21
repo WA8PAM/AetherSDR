@@ -2,6 +2,7 @@
 
 #include "CommandParser.h"
 #include "RadioDiscovery.h"
+#include "backends/IndependentTxControl.h"
 
 #include <QObject>
 #include <QTcpSocket>
@@ -15,6 +16,8 @@
 
 namespace AetherSDR {
 
+class FlexPttWireSession;
+
 enum class ConnectionState {
     Disconnected,
     Connecting,
@@ -26,6 +29,9 @@ enum class ConnectionState {
 // Call init() after moveToThread() to create the socket and timer.
 class RadioConnection : public QObject {
     Q_OBJECT
+    friend class TxOperationIntegrationTestAccess;
+    friend class RadioConnectionSessionTestAccess;
+    std::function<void(quint32, const QString&)> m_commandSinkForTest;
 
 public:
     explicit RadioConnection(QObject* parent = nullptr);
@@ -35,6 +41,8 @@ public:
     quint32 clientHandle() const        { return m_handle; }
     bool isSyntheticDemo() const        { return m_syntheticDemo; }  // RFC #4288
     bool isConnected() const            { return m_state.load() == ConnectionState::Connected; }
+    bool independentPttSupported() const;
+    bool independentPttReady() const;
     QHostAddress radioAddress() const   { return m_radioAddr; }
     QHostAddress localAddress() const   { return m_localAddr; }
     quint16      localTcpPort() const   { return m_localPort; }
@@ -60,6 +68,9 @@ public slots:
     // Write a pre-sequenced command to the socket. Called from RadioModel
     // via QMetaObject::invokeMethod (auto-queued to worker thread). (#502)
     void writeCommand(quint32 seq, const QString& command);
+    void writeIndependentPtt(quint32 seq, const TxCoordinator::Command& command);
+    void stopIndependentPtt(quint32 seq, const TxCoordinator::Operation& operation,
+                            const TxCoordinator::StopRequest& request);
 
     // Demo fault harness (RFC #4288 #4): push a raw synthetic status line into
     // the normal receive path (parse → statusReceived), exactly as the connect
@@ -69,6 +80,7 @@ public slots:
     void injectFaultStatus(const QString& line);
 
 signals:
+    void independentPttStopped(const AetherSDR::TxStopEvidence& evidence);
     void stateChanged(ConnectionState state);
     void connected();
     void disconnected();
@@ -100,8 +112,13 @@ private slots:
     void onHeartbeat();
 
 private:
+    void resetSessionState();
     void processLine(const QString& line);
     void setState(ConnectionState s);
+    bool writeSocketCommand(quint32 seq, const QString& command);
+    std::unique_ptr<FlexPttWireSession> m_independentPtt;
+    QTimer* m_independentPttTimer{nullptr};
+    void updateIndependentPttTimer();
 
     // Demo mode (RFC #4288, Stage 2): when the connect target is the synthetic
     // demo radio, RadioConnection plays the radio's part locally instead of
@@ -118,10 +135,19 @@ private:
 
     QTcpSocket*  m_socket{nullptr};
     QByteArray   m_readBuffer;
+    // Bumped by resetSessionState() at every session edge. Deferred work
+    // captures it so a timer armed in one session cannot fire into the next
+    // (the synthetic-demo handshake). Connection-thread only, like the
+    // buffer above. (#5653 review)
+    quint64      m_sessionGeneration{0};
     QTimer*      m_heartbeat{nullptr};
 
     std::atomic<ConnectionState> m_state{ConnectionState::Disconnected};
     std::atomic<quint32> m_handle{0};
+    // Current transport's prologue only; never inherited from model/discovery
+    // metadata. Rejected remains terminal until resetSessionState().
+    enum class PttProtocol { Unknown, Supported, Rejected };
+    std::atomic<PttProtocol> m_pttProtocol{PttProtocol::Unknown};
     // Written on the connection thread, read from the GUI and network threads
     // (PanadapterStream::start, isSyntheticDemo callers) — so it needs the same
     // treatment as its m_state/m_handle siblings above, which are atomic for

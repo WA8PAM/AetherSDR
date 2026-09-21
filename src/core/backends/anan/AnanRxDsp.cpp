@@ -1,9 +1,14 @@
 #include "core/backends/anan/AnanRxDsp.h"
 
+#include <QDebug>
+#include <QLoggingCategory>
 #include <QMetaType>
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
+
+Q_LOGGING_CATEGORY(lcAnanRxDsp, "aether.anan.rxdsp")
 
 namespace AetherSDR::anan {
 
@@ -18,7 +23,30 @@ AnanRxDsp::AnanRxDsp(QObject* parent) : QObject(parent)
     qRegisterMetaType<WdspChannel::Mode>("WdspChannel::Mode");
 }
 
-AnanRxDsp::~AnanRxDsp() = default;
+AnanRxDsp::~AnanRxDsp()
+{
+    // Same shape as Hl2RxDsp's destructor, and for the same reason: a channel
+    // destroyed while WDSP still thinks it is running makes
+    // WdspChannel::close() sit out WDSP's full 100 ms stop-and-flush timeout,
+    // because behind the control fence nothing is left calling fexchange* to
+    // satisfy it. Stopping here makes that SetChannelState a no-op.
+    // docs/HERMES.md §13 item 9b.
+    //
+    // No drain: nothing feeds this object after it is destroyed, so WDSP's mute
+    // ramp does not actually run. The saving is the skipped wait.
+    //
+    // CHECKED, not discarded. setRunning() goes through beginControlOperation(),
+    // which REFUSES rather than waits when a processIq() callback is in flight.
+    // It cannot be, here: this object is destroyed on the thread that drives
+    // processIq(). A false therefore reports that that assumption has stopped
+    // holding, which is worth a line in the log rather than a silent 100 ms.
+    if (m_channel && !m_channel->setRunning(false)) {
+        qCWarning(lcAnanRxDsp)
+            << "could not stop the WDSP channel before destroying it: a "
+               "processIq callback was in flight. Teardown will pay WDSP's "
+               "100 ms stop-and-flush timeout.";
+    }
+}
 
 bool AnanRxDsp::configure(const Config& config, std::string* error)
 {
@@ -93,6 +121,7 @@ AnanRxDsp::RebuildResult AnanRxDsp::buildChannel(const Config& config)
     if (!channel)
         return result;
     result.outputBlockSize = channel->outputBlockSize();
+    result.inputSampleRateHz = config.inputSampleRateHz;
     result.spectrum = std::make_unique<AnanSpectrum>(config.fftSize);
     result.channel = std::move(channel);
     return result;
@@ -120,6 +149,13 @@ bool AnanRxDsp::installRebuiltChannel(RebuildResult result)
 
 void AnanRxDsp::installChannel(RebuildResult result)
 {
+    // The only update site for this field outside configure()'s own
+    // synchronous m_config = config -- see RebuildResult::inputSampleRateHz's
+    // comment. Must land before droopTableForRate() is ever consulted again,
+    // which processIqBlock() does on every block once m_channel is swapped
+    // below.
+    m_config.inputSampleRateHz = result.inputSampleRateHz;
+
     m_iqBuffer.clear();
     m_i.assign(static_cast<std::size_t>(m_config.dspBlockSize), 0.0f);
     m_q.assign(static_cast<std::size_t>(m_config.dspBlockSize), 0.0f);
@@ -133,6 +169,16 @@ void AnanRxDsp::installChannel(RebuildResult result)
                                      static_cast<double>(m_config.audioSampleRateHz));
     m_dcBlockL.r = pole;
     m_dcBlockR.r = pole;
+    // PcmFormat accepts 24000/48000 only. AnanBackend hardcodes 24000 today, so
+    // this cannot fail in production — but if that rate ever moves, a silent
+    // refusal here stops ANAN audio dead while the spectrum keeps updating,
+    // which reads as a dead radio rather than a configuration error.
+    if (!m_pcmProducer.start(PcmPurpose::Speaker, -1,
+                             {m_config.audioSampleRateHz, PcmLayout::Stereo})) {
+        qWarning() << "AnanRxDsp: no PCM producer for audio rate"
+                   << m_config.audioSampleRateHz
+                   << "Hz - RX audio will be silent on this channel";
+    }
     m_dcBlockL.reset();
     m_dcBlockR.reset();
     // Fresh smoothing state for the new channel -- see smoothSpectrumBins()'s
@@ -155,6 +201,26 @@ void AnanRxDsp::installChannel(RebuildResult result)
     if (m_shiftHz != 0.0)
         result.channel->setShift(m_shiftHz);
 
+    // Stop the OUTGOING channel before the assignment below destroys it, so
+    // close() finds the state already 0 and skips WDSP's 100 ms stop-and-flush
+    // timeout. This runs on this object's own thread, which is also the thread
+    // that calls processIq(), so no block reaches the old channel between here
+    // and its destruction: the down-slew does NOT complete and this buys the
+    // skipped wait, nothing more.
+    //
+    // NOT moved up into beginRebuild(), where a stop WOULD drain — the old
+    // channel keeps processing for the whole background build, so samples are
+    // genuinely still flowing there. Stopping that early would trade the
+    // receive audio that the asynchronous rebuild exists to preserve for
+    // 100 ms of teardown, which is the wrong way round.
+    //
+    // Checked for the same reason as the destructor's — see there.
+    if (m_channel && !m_channel->setRunning(false)) {
+        qCWarning(lcAnanRxDsp)
+            << "could not stop the outgoing WDSP channel before the swap: a "
+               "processIq callback was in flight. The rebuild will pay WDSP's "
+               "100 ms stop-and-flush timeout.";
+    }
     m_channel = std::move(result.channel);
     m_spectrum = std::move(result.spectrum);
 }
@@ -199,6 +265,42 @@ void AnanRxDsp::setSpectrumRateFps(int fps)
     // grant an immediate extra one.
 }
 
+void AnanRxDsp::setDroopCorrectionTable(int rateKsps, const std::vector<float>& table)
+{
+    if (table.size() != kDroopCorrectionFftSize)
+        return;
+    bool valid = false;
+    for (const int r : kDdc0RatesKsps)
+        valid |= (r == rateKsps);
+    if (!valid)
+        return;
+    DroopCorrectionTable t;
+    std::copy(table.begin(), table.end(), t.begin());
+    m_droopTables[rateKsps] = t;
+}
+
+void AnanRxDsp::setDroopCorrectionBypassed(bool bypassed)
+{
+    m_droopBypassed = bypassed;
+}
+
+void AnanRxDsp::clearDroopCorrectionTables()
+{
+    m_droopTables.clear();
+}
+
+const DroopCorrectionTable& AnanRxDsp::droopTableForRate(int rateKsps) const noexcept
+{
+    // Returning the kDroopCorrectionZero OBJECT (not a zero-valued copy) is
+    // what also suppresses the edge fade in processIqBlock(), which tests
+    // identity against exactly this address -- see
+    // setDroopCorrectionBypassed()'s comment.
+    if (m_droopBypassed)
+        return kDroopCorrectionZero;
+    const auto it = m_droopTables.constFind(rateKsps);
+    return it != m_droopTables.constEnd() ? it.value() : kDroopCorrectionZero;
+}
+
 void AnanRxDsp::setShift(double shiftHz)
 {
     m_shiftHz = shiftHz;
@@ -231,6 +333,20 @@ void AnanRxDsp::smoothSpectrumBins(std::vector<float>& binsDbfs)
             + (1.0f - kSpectrumSmoothAlpha) * binsDbfs[i];
     }
     binsDbfs = m_smoothedBins;
+}
+
+void AnanRxDsp::onSequenceGap()
+{
+    if (!m_spectrum) {
+        return;   // between rebuilds; the new spectrum starts empty
+    }
+    // Counted only when something was actually in flight -- see
+    // Hl2RxDsp::onSequenceGap() for why a boundary-aligned gap must not be
+    // counted, and why neither the frame-rate clock nor the audio path is
+    // touched here.
+    if (m_spectrum->reset() > 0) {
+        m_spectrumGapDiscards.fetch_add(1, std::memory_order_relaxed);
+    }
 }
 
 void AnanRxDsp::processIqBlock(const std::vector<std::complex<float>>& iq)
@@ -277,6 +393,34 @@ void AnanRxDsp::processIqBlock(const std::vector<std::complex<float>>& iq)
     // displayed frame.
     if (spectrumFrameDue()) {
         if (m_spectrum->process(m_conjugated, m_bins) > 0) {
+            // Real DDC0 roll-off -- the anti-alias FIR's transition band,
+            // not CIC sin(x)/x (see AnanDroopCorrection.h). Corrected on the
+            // actual FFT magnitude BEFORE the EMA below so the emitted trace
+            // reflects the corrected value at every step -- see
+            // AnanDroopCorrection.h. inputSampleRateHz is always an exact
+            // multiple of 1000 for the six valid DDC0 rates.
+            const DroopCorrectionTable& droopTable =
+                droopTableForRate(m_config.inputSampleRateHz / 1000);
+            applyDroopCorrectionDb(m_bins, droopTable);
+            // Cosmetic fade for the true edge. See applyEdgeFade()'s own
+            // comment for why this exists instead of a larger capDb.
+            //
+            // This identity test is NOT live logic on a G2 any more, and the
+            // comment that used to claim otherwise was wrong. connectRadio()
+            // seeds the derived defaults for all six DDC0 rates, so
+            // droopTableForRate() never hands back kDroopCorrectionZero for a
+            // rate this backend can actually run -- the fade is effectively
+            // unconditional, by design: there is always a real correction to
+            // fade FROM, and the outermost bins are clamped at +90 dB, which
+            // only stays off screen because this overwrites them.
+            //
+            // What the test still does is suppress the fade while the
+            // calibrator's bypass is on, which is the one case that must not
+            // see a synthetic edge -- setDroopCorrectionBypassed() returns the
+            // kDroopCorrectionZero OBJECT for exactly this identity check, so
+            // a sweep measures the radio and not our own raised cosine.
+            if (&droopTable != &kDroopCorrectionZero)
+                applyEdgeFade(m_bins);
             smoothSpectrumBins(m_bins);
             emit spectrumReady(m_bins);
             m_lastSpectrumMs = m_spectrumClock.elapsed();
@@ -302,17 +446,62 @@ void AnanRxDsp::processIqBlock(const std::vector<std::complex<float>>& iq)
         consumed += block;
 
         const auto res = m_channel->processIq(m_i, m_q, m_left, m_right);
-        if (res != WdspChannel::ProcessResult::Ok)
+        // Count every outcome, Ok included -- the Ok count is the denominator
+        // a fault total has to be read against. Same rule, same words and the
+        // same bounded log schedule as Hl2RxDsp::processIqBlock: these two
+        // stages are copies of each other and the counting rule is the part
+        // that must not drift, which is why it lives in WdspProcessTally.h
+        // rather than twice here.
+        const std::uint64_t seen = m_processTally.record(res);
+        if (res != WdspChannel::ProcessResult::Ok) {
+            // Underrun excluded from the log and NOT from the count: it is
+            // normal while the asynchronous output side fills, and logging it
+            // would drown the four outcomes that are not normal.
+            //
+            // After processIq() returns, never inside it -- qCWarning
+            // allocates, and allocating between WdspChannel's two reads of
+            // wdspPortAllocationSequence() would manufacture the very
+            // AllocationViolation being reported.
+            if (res != WdspChannel::ProcessResult::Underrun
+                && WdspProcessTally::shouldLog(seen)) {
+                qCWarning(lcAnanRxDsp)
+                    << "WDSP processIq failed:" << WdspProcessTally::name(res)
+                    << "- occurrence" << seen
+                    << "on WDSP channel" << m_channel->channelId()
+                    << "- this block produces no audio";
+            }
             continue;   // underrun while the pipeline fills, etc. -- no output yet
+        }
 
         const std::size_t outN = m_left.size();
         for (std::size_t k = 0; k < outN; ++k) {
             m_stereo[2 * k] = m_dcBlockL.process(m_left[k]);
             m_stereo[2 * k + 1] = m_dcBlockR.process(m_right[k]);
         }
-        emit audioReady(m_stereo);
+        QVector<float> samples(m_stereo.begin(), m_stereo.end());
+        if (const auto frame = m_pcmProducer.produce(std::move(samples))) {
+            emit pcmReady(*frame);
+            emit audioReady(m_stereo);
+        }
+        // AVERAGE, NOT PEAK. WDSP's xmeter keeps both from the same
+        // smag = I*I + Q*Q: `avg` is an EMA of power, `peak` is a peak-hold
+        // that DECAYS across blocks rather than resetting per block. Both take
+        // the log after averaging, so the domain is right either way -- the tap
+        // is the whole difference.
+        //
+        // On a steady carrier the two agree exactly, because I*I + Q*Q is
+        // constant for a complex exponential. They diverge only on noise and on
+        // modulation, so every check against a test tone passes and the error
+        // appears precisely where an operator judges a receiver: the band noise
+        // floor, which a peak-hold reads roughly 11-14 dB high.
+        //
+        // That also makes the peak tap wrong for a dBm-labelled axis. S9 is
+        // defined as -73 dBm of sine, i.e. an RMS quantity, and `avg` is the
+        // mean-square -- so the average tap is what the calibration means.
+        // Meter ballistics are not lost: the backend already applies its own
+        // attack/decay EMA to the dBm value before publishing.
         emit meterUpdate(static_cast<float>(
-            m_channel->meter(WdspChannel::Meter::SignalPeak)));
+            m_channel->meter(WdspChannel::Meter::SignalAverage)));
     }
 
     if (consumed > 0)

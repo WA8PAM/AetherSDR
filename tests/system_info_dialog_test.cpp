@@ -13,8 +13,10 @@
 #include "core/AppSettings.h"
 #include "core/LogManager.h"
 #include "core/ThreadCpuRing.h"
+#include "core/ThemeManager.h"
 #include "gui/SparklineDelegate.h"
 #include "gui/SystemInfoDialog.h"
+#include "gui/TimeSeriesGraphWidget.h"
 
 #include <QApplication>
 #include <QCheckBox>
@@ -27,6 +29,7 @@
 #include <QFile>
 #include <QLocale>
 #include <QScrollBar>
+#include <QScrollArea>
 #include <QStyledItemDelegate>
 #include <QTemporaryDir>
 #include <QPainter>
@@ -64,10 +67,11 @@ int main(int argc, char** argv)
     auto* tabs = dialog.findChild<QTabWidget*>();
     report("it has a tab widget", tabs != nullptr);
     if (tabs != nullptr) {
-        report("it has exactly three tabs", tabs->count() == 3);
-        report("first tab is Threads", tabs->tabText(0) == QLatin1String("Threads"));
-        report("second tab is Memory", tabs->tabText(1) == QLatin1String("Memory"));
-        report("third tab is Logs", tabs->tabText(2) == QLatin1String("Logs"));
+        report("it has exactly four tabs", tabs->count() == 4);
+        report("first tab is Overview", tabs->tabText(0) == QLatin1String("Overview"));
+        report("second tab is Threads", tabs->tabText(1) == QLatin1String("Threads"));
+        report("third tab is Memory", tabs->tabText(2) == QLatin1String("Memory"));
+        report("fourth tab is Logs", tabs->tabText(3) == QLatin1String("Logs"));
     }
 
     auto* table = dialog.findChild<QTableWidget*>();
@@ -482,6 +486,85 @@ int main(int argc, char** argv)
         LogManager::instance().shutdownLogging();
     }
 
+    // One selector must update every chart, including a non-current page and
+    // an empty history. Compare the painted range captions with a reference
+    // chart; this exercises the production slots without exposing private data.
+    {
+        SystemInfoDialog shared;
+        auto* range = shared.findChild<QComboBox*>(QStringLiteral("systemInfoTimeframe"));
+        auto* tabs = shared.findChild<QTabWidget*>();
+        report("one shared timeframe exists outside the tab pages",
+               range != nullptr && tabs != nullptr
+                   && shared.findChildren<QComboBox*>().size() == 1
+                   && !tabs->isAncestorOf(range));
+        if (range != nullptr && tabs != nullptr) {
+            QLabel* rangeLabel = nullptr;
+            for (QLabel* label : shared.findChildren<QLabel*>()) {
+                if (label->buddy() == range) {
+                    rangeLabel = label;
+                }
+            }
+            report("the timeframe label is associated with its control", rangeLabel != nullptr);
+            const auto caption = [](QWidget* graph) {
+                const QPixmap pixels = graph->grab();
+                const qreal scale = pixels.devicePixelRatio();
+                return pixels.toImage().copy(pixels.width() - qRound(180 * scale),
+                                             qRound(6 * scale), qRound(166 * scale), qRound(18 * scale))
+                    .convertToFormat(QImage::Format_RGB32);
+            };
+            const char* graphNames[] = {
+                "systemInfoMemoryGraph", "systemInfoOverviewCpuGraph",
+                "systemInfoOverviewMemoryGraph", "systemInfoOverviewThreadsGraph",
+                "systemInfoOverviewTickGraph"};
+            const auto checkCharts = [&] {
+                for (const char* name : graphNames) {
+                    QWidget* graph = shared.findChild<QWidget*>(QLatin1String(name));
+                    report("shared chart exists", graph != nullptr);
+                    if (graph != nullptr) {
+                        const QImage actual = caption(graph);
+                        TimeSeriesGraphWidget reference{QString(), QString()};
+                        reference.setFont(graph->font());
+                        reference.resize(graph->size());
+                        reference.setSeries({}, range->currentData().toInt());
+                        report(name, actual == caption(&reference));
+                    }
+                }
+            };
+            range->setCurrentIndex(3);
+            checkCharts();  // no collector or sample has run yet
+            MemorySample sample;
+            sample.wallMs = 1'700'000'000'000LL;
+            sample.valid = true;
+            sample.residentBytes = 200ull * 1024 * 1024;
+            report("shared chart receives a memory sample",
+                   QMetaObject::invokeMethod(&shared, "applyMemorySample", Qt::DirectConnection,
+                                            Q_ARG(AetherSDR::MemorySample, sample)));
+            for (int index : {0, 2, 1, 3}) {
+                range->setCurrentIndex(index);
+                checkCharts();
+            }
+
+            shared.show();
+            QCoreApplication::processEvents();
+            const int tabY = tabs->y();
+            for (int index = 0; index < tabs->count(); ++index) {
+                tabs->setCurrentIndex(index);
+                QCoreApplication::processEvents();
+                const QString title = tabs->tabText(index);
+                const bool charted = title == QLatin1String("Overview") || title == QLatin1String("Memory");
+                report("timeframe visibility follows the charted page", range->isVisible() == charted);
+                report("timeframe label visibility follows its control",
+                       rangeLabel != nullptr && rangeLabel->isVisible() == charted);
+                report("hiding the timeframe does not move the tab strip", tabs->y() == tabY);
+                if (charted) {
+                    range->setCurrentIndex(index == 0 ? 0 : 3);
+                    checkCharts();
+                }
+            }
+            shared.hide();
+        }
+    }
+
     // ── Memory tab (#2554 acceptance criterion 4) ──────────────────────────
     // applyMemorySample is a slot so the tab can be driven without a collector
     // or a worker thread. Bytes are CONSTRUCTED (routing and formatting only).
@@ -489,8 +572,10 @@ int main(int argc, char** argv)
         qRegisterMetaType<AetherSDR::MemorySample>("AetherSDR::MemorySample");
         SystemInfoDialog memoryDialog;
 
+        // The selector is the dialog's, in the window header (#5496); the
+        // lookup on the dialog finds it there as it did on the Memory tab.
         auto* range = memoryDialog.findChild<QComboBox*>(QStringLiteral("systemInfoTimeframe"));
-        report("the Memory tab has a timeframe selector", range != nullptr);
+        report("the dialog has a timeframe selector", range != nullptr);
         if (range != nullptr) {
             report("it offers the issue's four timeframes", range->count() == 4);
             report("it defaults to 5 minutes", range->currentData().toInt() == 5 * 60);
@@ -594,6 +679,170 @@ int main(int argc, char** argv)
                    && priv->text() == QStringLiteral("\u2014") && virt->text() == QStringLiteral("\u2014"));
         report("an invalid sample's summary names no metric",
                summary != nullptr && summary->text() == QStringLiteral("Process memory: not available on this platform"));
+    }
+
+    // Reproduce #5427 with populated, disambiguated thread labels. Five
+    // wrapped legend rows used to consume the entire 150 px graph, hiding
+    // both the data and the legend at an otherwise valid dialog size.
+    {
+        CpuHistoryRing ring;
+        for (int i = 0; i < 10; ++i) {
+            CpuHistoryRing::Record record;
+            record.wallMs = 1'700'000'000'000LL + i * 1500;
+            record.valid = true;
+            record.busiestValid = true;
+            record.coreCount = 8;
+            record.processPercentOfCapacity = 10.0;
+            record.busiestPercentOfCore = 60.0;
+            for (int j = 0; j < CpuHistoryRing::kTopThreads; ++j) {
+                record.threads.push_back({quint64(100000 + j),
+                    QStringLiteral("PanadapterStream"), double(60 - 10 * j + i)});
+            }
+            ring.push(record);
+        }
+        SystemInfoDialog populated(nullptr, &ring);
+        populated.show();
+        populated.resize(750, 480);
+        app.processEvents();
+        auto* graph = populated.findChild<QWidget*>(QStringLiteral("systemInfoOverviewThreadsGraph"));
+        auto* scroll = populated.findChild<QScrollArea*>(QStringLiteral("systemInfoOverviewScroll"));
+        report("populated overview still fits below the 600 px default", populated.height() < 600);
+        report("small overview can scroll to the lower charts",
+               scroll != nullptr && scroll->verticalScrollBar()->maximum() > 0);
+        if (graph != nullptr) {
+            if (scroll != nullptr) {
+                scroll->ensureWidgetVisible(graph);
+            }
+            const QImage pixels = graph->grab().toImage().convertToFormat(QImage::Format_RGB32);
+            const char* tokens[] = {"color.accent", "color.accent.success", "color.accent.warning",
+                                    "color.accent.bright", "color.accent.danger"};
+            for (const char* token : tokens) {
+                const QRgb color = ThemeManager::instance().color(token).rgb();
+                int count = 0;
+                for (int y = 0; y < pixels.height(); ++y) {
+                    for (int x = 0; x < pixels.width(); ++x) {
+                        if (pixels.pixel(x, y) == color) {
+                            ++count;
+                        }
+                    }
+                }
+                report("each populated thread series is painted at the small dialog size", count > 0);
+            }
+        } else {
+            report("the populated thread graph exists", false);
+        }
+        populated.hide();
+    }
+
+    // ── Overview tab (#2554: cards + charts; acceptance criterion 3's colour) ──
+    // applyCpuSample is a slot so the cards can be driven without a collector,
+    // a worker thread, or a machine busy enough to reach a band. Every number
+    // here is CONSTRUCTED (routing, formatting and the band arithmetic only).
+    {
+        qRegisterMetaType<AetherSDR::CpuSample>("AetherSDR::CpuSample");
+        SystemInfoDialog ov;
+        report("the Overview tab has no timeframe selector of its own (#5496)",
+               ov.findChild<QComboBox*>(QStringLiteral("systemInfoOverviewTimeframe")) == nullptr);
+        auto* cpuCard = ov.findChild<QLabel*>(QStringLiteral("systemInfoCardCpu"));
+        auto* maxCard = ov.findChild<QLabel*>(QStringLiteral("systemInfoCardMaxThread"));
+        auto* memCard = ov.findChild<QLabel*>(QStringLiteral("systemInfoCardMemory"));
+        auto* lagCard = ov.findChild<QLabel*>(QStringLiteral("systemInfoCardTickLag"));
+        report("the four cards exist",
+               cpuCard != nullptr && maxCard != nullptr && memCard != nullptr && lagCard != nullptr);
+        // The 2 × 2 grid must not raise the dialog's minimum above its own
+        // 900 × 600 default, or the default and any saved geometry never
+        // apply (#5427 review: 696 px with the graphs at their 220 px floor).
+        const int minimumHeight = ov.minimumSizeHint().height();
+        std::printf("  Overview dialog minimum height: %d px\n", minimumHeight);
+        report("the Overview tab leaves the dialog's minimum height under its 600 px default",
+               minimumHeight < 600);
+        report("cards start as a dash, not zero",
+               cpuCard != nullptr && cpuCard->text() == QStringLiteral("\u2014")
+                   && cpuCard->property("level").toString() == QLatin1String("normal"));
+
+        const auto driveCpu = [&ov](const CpuSample& sample) {
+            return QMetaObject::invokeMethod(&ov, "applyCpuSample", Qt::DirectConnection,
+                                             Q_ARG(AetherSDR::CpuSample, sample));
+        };
+        CpuSample s;
+        s.wallMs = 1'700'000'000'000;
+        s.coreCount = 8;
+        s.processPercentOfCapacity = 12.34;
+        s.hasBusiest = true;
+        s.busiestTid = 7;
+        s.busiestName = QStringLiteral("AudioEngine");
+        s.busiestPercentOfCore = 42.0;
+        ThreadCpuSample busy;
+        busy.tid = 7;
+        busy.name = s.busiestName;
+        busy.cpuPercentOfCore = 42.0;
+        s.busyThreads.push_back(busy);
+        report("a CPU sample can be driven into the dialog", driveCpu(s));
+        if (cpuCard != nullptr && maxCard != nullptr && lagCard != nullptr) {
+            report("CPU Total reads the process percent with one decimal",
+                   cpuCard->text() == QStringLiteral("12.3 %")
+                       && cpuCard->property("level").toString() == QLatin1String("normal"));
+            report("Max Thread reads the busiest thread's percent of one core",
+                   maxCard->text() == QStringLiteral("42.0 %"));
+            report("the tick-lag card reads a dash when the meter was never ticked",
+                   lagCard->text() == QStringLiteral("\u2014"));
+            report("a card announces its value (docs/a11y.md live-value rule)",
+                   cpuCard->accessibleName() == QStringLiteral("CPU total 12.3 %"));
+        }
+        // Bands: the issue's own numbers, inclusive at the line. 50 / 80 for
+        // CPU Total; 70 / 90 for Max Thread.
+        const auto level = [&](QLabel* card) { return card == nullptr ? QString() : card->property("level").toString(); };
+        s.wallMs += 1500; s.processPercentOfCapacity = 50.0; s.busiestPercentOfCore = 70.0; driveCpu(s);
+        report("CPU Total at 50 % is the warning band", level(cpuCard) == QLatin1String("warning"));
+        report("Max Thread at 70 % is the warning band", level(maxCard) == QLatin1String("warning"));
+        s.wallMs += 1500; s.processPercentOfCapacity = 80.0; s.busiestPercentOfCore = 90.0; driveCpu(s);
+        report("CPU Total at 80 % is the danger band", level(cpuCard) == QLatin1String("danger"));
+        report("Max Thread at 90 % is the danger band", level(maxCard) == QLatin1String("danger"));
+        s.wallMs += 1500; s.processPercentOfCapacity = 49.9; s.busiestPercentOfCore = 69.9; driveCpu(s);
+        report("just under the lines is normal again",
+               level(cpuCard) == QLatin1String("normal") && level(maxCard) == QLatin1String("normal"));
+
+        // The Memory card reads the memory ring: 1 GB is the warning line.
+        MemorySample m;
+        m.wallMs = s.wallMs;
+        m.valid = true;
+        m.residentMetric = QStringLiteral("vmRss");
+        m.residentBytes = 1024ull * 1024 * 1024;
+        m.peakResidentBytes = m.residentBytes;
+        QMetaObject::invokeMethod(&ov, "applyMemorySample", Qt::DirectConnection,
+                                  Q_ARG(AetherSDR::MemorySample, m));
+        report("the Memory card reads the resident set and bands at 1 GB",
+               memCard != nullptr && memCard->text() == QStringLiteral("1024.0 MB")
+                   && level(memCard) == QLatin1String("warning"));
+        m.wallMs += 1500; m.residentBytes = 2048ull * 1024 * 1024;
+        QMetaObject::invokeMethod(&ov, "applyMemorySample", Qt::DirectConnection,
+                                  Q_ARG(AetherSDR::MemorySample, m));
+        report("2 GB is the danger band", level(memCard) == QLatin1String("danger"));
+    }
+
+    // The tick-lag card reads the meter MainWindow injects, at the instant the
+    // CPU sample lands. Timestamps CONSTRUCTED through the meter's clock seam.
+    {
+        UiTickLagMeter meter;
+        meter.tickAt(0);
+        meter.tickAt(70 * 1'000'000);   // 20 ms late
+        meter.tickAt(120 * 1'000'000);  // on time
+        SystemInfoDialog ov(nullptr, nullptr, &meter);
+        auto* lagCard = ov.findChild<QLabel*>(QStringLiteral("systemInfoCardTickLag"));
+        auto* maxCard = ov.findChild<QLabel*>(QStringLiteral("systemInfoCardMaxThread"));
+        CpuSample s;
+        s.wallMs = 1'700'000'000'000;
+        s.coreCount = 8;
+        QMetaObject::invokeMethod(&ov, "applyCpuSample", Qt::DirectConnection,
+                                  Q_ARG(AetherSDR::CpuSample, s));
+        report("the tick-lag card reads the worst lag since the meter was last read",
+               lagCard != nullptr && lagCard->text() == QStringLiteral("20.0 ms"));
+        // This sample carries no per-thread reading (hasBusiest false): the
+        // Max Thread card must say so with the dash, not "(unnamed)" at 0.0 %
+        // (#5427 review).
+        report("a sample with no busiest thread leaves the Max Thread card at the dash",
+               maxCard != nullptr && maxCard->text() == QStringLiteral("\u2014"));
+        report("reading the meter resets it", meter.take().tickCount == 0);
     }
 
     // The history outlives the dialog when MainWindow hands one in: the

@@ -8,6 +8,8 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QLocalSocket>
+#include <QLockFile>
+#include "core/control/LocalCredentialHandshake.h"
 #include <QProcess>
 #include <QThread>
 #include <QTextStream>
@@ -109,6 +111,53 @@ bool contains(const QJsonArray& values, const QString& expected)
         }
     }
     return false;
+}
+
+bool runCredentialBindingTest()
+{
+    using namespace AetherSDR::control;
+    const QString authority = QUuid::createUuid().toString(QUuid::Id128);
+    auto reservation = LocalControlServer::reserveCredentialAuthority(authority);
+    if (!check(reservation && !LocalControlServer::reserveCredentialAuthority(authority)
+                   && !LocalControlServer::reserveCredentialAuthority(QStringLiteral("invalid/path")),
+               "one authority reservation must exclude other endpoints/provisioners")) { return false; }
+    reservation.reset();
+    reservation = LocalControlServer::reserveCredentialAuthority(authority);
+    if (!check(bool(reservation), "releasing an authority reservation must permit explicit restart")) { return false; }
+    ControlCredentials credentials;
+    const auto record = ControlCredentials::generate(ControlCredentials::Role::GrantAdmin);
+    LocalControlServer server;
+    if (!check(credentials.replace({record})
+                   && server.listen(uniqueName(QStringLiteral("aetherd-credential-")), LocalControlServer::ListenMode::ReserveEndpoint)
+                   && server.bindCredentials(&credentials) && server.startServing()
+                   && !server.bindCredentials(&credentials),
+               "credential binding must finish while endpoint is reserved, never after serving")) { return false; }
+    QLocalSocket client;
+    if (!connectSocket(&client, server)) { return false; }
+    const QJsonObject auth{{QStringLiteral("scheme"), QStringLiteral("bearer")},
+                          {QStringLiteral("token"), QString::fromLatin1(record.secret.toHex())}};
+    const auto verifiedHello = exchangeCredentialHello(record.secret,
+        [&client] { return localServerIsCurrentUser(client.socketDescriptor()); },
+        [&client](const QJsonObject& request) { return exchange(&client, request); });
+    if (!check(verifiedHello.has_value(), "real local socket must verify its current-user server before sending credentials")) {
+        return false;
+    }
+    const QJsonObject welcome = *verifiedHello;
+    if (!check(errorCode(welcome).isEmpty()
+                   && welcome.value(QStringLiteral("result")).toObject().value(QStringLiteral("grants")).toArray()
+                       == QJsonArray{QStringLiteral("observe")}
+                   && !QJsonDocument(welcome).toJson().contains(record.secret.toHex()),
+               "verified admin hello over real local transport must remain non-TX and redact secrets")) { return false; }
+    if (!check(credentials.revoke(record.id)
+                   && waitUntil([&] { return client.state() == QLocalSocket::UnconnectedState; }),
+               "credential retirement must abort its real local transport")) { return false; }
+    QLocalSocket rejected;
+    if (!connectSocket(&rejected, server)) { return false; }
+    if (!check(errorCode(exchange(&rejected, helloRequest({{QStringLiteral("auth"), auth}}))) == QStringLiteral("auth.invalid"),
+               "retired credential cannot fall back to implicit observer on reconnect")) { return false; }
+    QLocalSocket observer;
+    return check(connectSocket(&observer, server) && errorCode(exchange(&observer, helloRequest())).isEmpty(),
+                 "credential revocation must preserve unrelated anonymous local observation");
 }
 
 bool runProtocolTest()
@@ -533,6 +582,60 @@ bool runCrashRecoveryTest()
                  "server must recover the stale lock and endpoint left by a crash");
 }
 
+bool runReserveEndpointTest()
+{
+    // Startup ordering: aetherd reserves its endpoint before settings/model
+    // construction (which can pump nested event loops) and serves only after
+    // every target is bound. An early client must be closed without a session
+    // or a reply, must not stop a later client from negotiating, and serving
+    // must begin exactly once per listen.
+    const QString name = uniqueName(QStringLiteral("aetherd-reserve-"));
+    LocalControlServer server;
+    if (!check(server.listen(name, LocalControlServer::ListenMode::ReserveEndpoint),
+               "reserved endpoint must listen")) {
+        return false;
+    }
+    QLocalSocket early;
+    if (!check(connectSocket(&early, server), "early client must reach the reserved endpoint")) {
+        return false;
+    }
+    QByteArray request = QJsonDocument(helloRequest()).toJson(QJsonDocument::Compact);
+    request.append('\n');
+    early.write(request);
+    early.flush();
+    if (!check(waitUntil([&early] {
+            return early.state() == QLocalSocket::UnconnectedState;
+        }), "early client must be closed while the endpoint is only reserved")
+        || !check(!early.canReadLine() && early.bytesAvailable() == 0,
+                  "a reserved endpoint must not answer hello or create a session")) {
+        return false;
+    }
+    if (!check(server.startServing(), "serving must begin once targets are bound")
+        || !check(!server.startServing(), "serving cannot begin twice")) {
+        return false;
+    }
+    QLocalSocket retry;
+    if (!check(connectSocket(&retry, server), "retrying client must connect once serving")) {
+        return false;
+    }
+    const QJsonObject welcome = exchange(&retry, helloRequest());
+    if (!check(!welcome.value(QStringLiteral("result")).toObject()
+                    .value(QStringLiteral("sessionId")).toString().isEmpty(),
+               "retrying client must negotiate after startServing")) {
+        return false;
+    }
+    server.close();
+    if (!check(!server.startServing(), "a closed server cannot serve")
+        || !check(server.listen(name), "the default listen mode must serve immediately")) {
+        return false;
+    }
+    QLocalSocket immediate;
+    return check(connectSocket(&immediate, server), "client must connect after relisten")
+        && check(!exchange(&immediate, helloRequest()).value(QStringLiteral("result")).toObject()
+                      .value(QStringLiteral("sessionId")).toString().isEmpty(),
+                 "default listen mode must admit sessions without a separate startServing");
+}
+
 bool runEndpointValidationTest()
 {
     LocalControlServer server;
@@ -555,6 +658,7 @@ int main(int argc, char* argv[])
         return app.exec();
     }
     return runProtocolTest()
+        && runCredentialBindingTest()
         && runHelloValidationTest()
         && runMalformedInputTest()
         && runHandshakeTimeoutTest()
@@ -564,5 +668,6 @@ int main(int argc, char* argv[])
         && runBackpressureTest()
         && runStaleEndpointTest()
         && runCrashRecoveryTest()
+        && runReserveEndpointTest()
         && runEndpointValidationTest() ? 0 : 1;
 }

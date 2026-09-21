@@ -1,16 +1,24 @@
 #pragma once
 
+#include "core/PcmFrame.h"
+
 #include <QElapsedTimer>
 #include <QObject>
 
+#include <atomic>
 #include <cmath>
 #include <complex>
 #include <memory>
 #include <numbers>
 #include <vector>
 
+#include "core/backends/anan/AnanDroopCorrection.h"
+#include "core/backends/anan/P2Protocol.h"   // kDdc0RatesKsps
 #include "core/backends/anan/AnanSpectrum.h"
 #include "core/dsp/WdspChannel.h"
+#include "core/dsp/WdspProcessTally.h"
+
+#include <QMap>
 
 namespace AetherSDR::anan {
 
@@ -89,6 +97,14 @@ public:
         std::unique_ptr<WdspChannel> channel;
         std::unique_ptr<AnanSpectrum> spectrum;
         std::size_t outputBlockSize = 0;
+        // The DDC0 rate buildChannel() actually built this channel for.
+        // installChannel() copies it into m_config.inputSampleRateHz on
+        // swap -- the only place that field is updated for a live rate
+        // change, since buildChannel() runs off this object's own thread and
+        // cannot touch m_config directly. Without this, droopTableForRate()
+        // keeps reading the connect-time rate forever after the first zoom,
+        // applying one rate's correction curve to a different rate's data.
+        int inputSampleRateHz = 0;
         std::string error;   // set iff channel == nullptr
     };
 
@@ -152,12 +168,78 @@ public:
     // not anything ANAN-specific, and transfers unchanged.
     Q_INVOKABLE void setSpectrumRateFps(int fps);
 
+    // Installs the measured per-bin dB correction for ONE DDC0 rate (see
+    // AnanDroopCorrection.h). Ignored -- no change, no crash -- if `table`
+    // is not exactly kDroopCorrectionFftSize long or rateKsps is not one of
+    // the six valid ANAN-G2 DDC0 rates: a caller passing a stale or
+    // malformed table must never silently misalign bin k against the wrong
+    // correction. Callers: AnanBackend seeds this from persisted per-radio
+    // settings at connect, and AnanDroopCalibrator pushes freshly measured
+    // tables live once a sweep completes. std::vector<float>, not
+    // DroopCorrectionTable, because qRegisterMetaType<std::vector<float>>
+    // is already registered (constructor, for spectrumReady/audioReady) --
+    // reusing it avoids adding a second metatype for the same threading
+    // need.
+    Q_INVOKABLE void setDroopCorrectionTable(int rateKsps, const std::vector<float>& table);
+
+    // Suspends droop correction WITHOUT discarding the measured tables, so
+    // AnanDroopCalibrator can measure the radio instead of measuring its own
+    // output. The sweep taps the same spectrumReady bins the panadapter
+    // paints; with correction live, the second sweep an operator runs sees an
+    // already-flattened curve, computes a near-zero table from it, and Apply
+    // persists that over the good one.
+    //
+    // A bypass FLAG rather than "push kDroopCorrectionZero for each rate":
+    // pushing a zero-valued table through setDroopCorrectionTable() stores a
+    // COPY, so droopTableForRate() no longer returns the kDroopCorrectionZero
+    // object itself and processIqBlock()'s `&droopTable != &kDroopCorrectionZero`
+    // identity test still reads true -- the synthetic 12 dB edge fade would
+    // stay on and be measured as if it were hardware droop. Routing the
+    // bypass through droopTableForRate() keeps both suppressions on the one
+    // switch they were always meant to share. It is also non-destructive: an
+    // abort, a disconnect, or a crash mid-sweep cannot lose a calibration
+    // that was only ever hidden, never overwritten.
+    Q_INVOKABLE void setDroopCorrectionBypassed(bool bypassed);
+    [[nodiscard]] bool droopCorrectionBypassed() const noexcept { return m_droopBypassed; }
+
+    // Forgets every measured table. This object is constructed ONCE and
+    // survives disconnect/reconnect, while the tables are per-RADIO -- so
+    // without this, calibrated G2 #1 -> disconnect -> G2 #2 renders #2's
+    // spectrum through #1's per-bin corrections (plus the edge fade on top),
+    // with the Droop tab showing nothing, since it reads the calibrator's
+    // measuredTables() and those are empty. AnanBackend calls this on
+    // disconnect and again before seeding a fresh connect's tables.
+    Q_INVOKABLE void clearDroopCorrectionTables();
+
     // Exposes the active channel for testing installChannel()'s reapply
     // behaviour (mode/filter/AGC/shift surviving a rebuild swap) without a
     // live radio -- matches WdspChannel's own *ForTest accessor convention.
     // Not part of the operator-facing seam; nullptr before the first
     // configure()/installRebuiltChannel().
     [[nodiscard]] const WdspChannel* channelForTest() const noexcept { return m_channel.get(); }
+
+    // Every outcome m_channel->processIq() returned, counted, since this
+    // object was constructed. IDENTICAL to Hl2RxDsp::processTally() and
+    // deliberately so: this class and Hl2RxDsp collapsed all five non-`Ok`
+    // results into the same unannotated `continue`, and a fix applied to one
+    // copy and not the other is worse than none — a reader who finds the
+    // counter on the HL2 will assume the ANAN has it too.
+    //
+    // `Underrun` is counted separately from the four faults because it is
+    // normal while the asynchronous output side fills; see WdspProcessTally.h.
+    //
+    // MONOTONIC ACROSS A REBUILD, which matters more here than on the HL2:
+    // this class rebuilds its channel OFF-THREAD (buildChannel /
+    // installRebuiltChannel) and swaps it in under a running stream, so a
+    // rebuild is the likeliest moment for a `Busy` or a geometry fault, and
+    // clearing the count at exactly that moment would erase the evidence.
+    //
+    // Safe to call from another thread: relaxed atomics, like every other
+    // cross-thread readback on this class.
+    [[nodiscard]] WdspProcessTally::Counts processTally() const noexcept
+    {
+        return m_processTally.snapshot();
+    }
 
     // Mute the DEMODULATOR while transmitting. Suppressing audio further
     // downstream is not enough -- this pipeline keeps demodulating our own
@@ -208,12 +290,37 @@ public:
             std::exp(-2.0 * std::numbers::pi * cornerHz / sampleRateHz));
     }
 
+    // ── Panadapter integrity across a transport gap ───────────────────────
+    //
+    // Partial FFT windows discarded at DDC0 discontinuities, including
+    // accepted rewinds and duplicates. Same lifetime/empty-window semantics
+    // as Hl2RxDsp::spectrumGapDiscards(). AnanBackend does not expose health
+    // rows yet; this counter is currently available only at the DSP stage.
+    [[nodiscard]] quint64 spectrumGapDiscards() const noexcept
+    {
+        return m_spectrumGapDiscards.load(std::memory_order_relaxed);
+    }
+
 public slots:
     // Feed one IQ block (normalized complex<float>). Emits spectrumReady per
     // FFT frame and audioReady/meterUpdate per completed WdspChannel block.
     void processIqBlock(const std::vector<std::complex<float>>& iq);
 
+    // A DDC0 sequence gap preceded the NEXT block this stage will be handed.
+    // AnanBackend routes P2Client::ddcSequenceGap here by DirectConnection on
+    // the I/O thread this object already lives on -- the same thread and the
+    // same call chain that then delivers the block, so this is a plain call and
+    // introduces no cross-thread edge.
+    //
+    // Discards the partial panadapter frame; see Hl2RxDsp::onSequenceGap() for
+    // the full reasoning, including why the AUDIO path is deliberately left
+    // alone, and why the per-bin smoother below is too -- smoothSpectrumBins()
+    // blends MAGNITUDES between frames and stays meaningful across a gap, while
+    // the FFT the gap corrupts is phase-coherent within one frame.
+    void onSequenceGap();
+
 signals:
+    void pcmReady(const AetherSDR::PcmFrame& frame);
     void audioReady(const std::vector<float>& stereoPcm);   // interleaved L,R
     void spectrumReady(const std::vector<float>& binsDbfs); // DC-centred dBFS
     // WDSP's own signal-strength meter (SignalPeak), NOT the RMS of the
@@ -222,6 +329,7 @@ signals:
     void meterUpdate(float dbfs);
 
 private:
+    PcmProducer m_pcmProducer;
     bool spectrumFrameDue();
 
     // Shared install step for a successful RebuildResult -- resizes scratch
@@ -247,6 +355,9 @@ private:
     // the client-side one.
     void smoothSpectrumBins(std::vector<float>& binsDbfs);
     std::vector<float> m_smoothedBins;   // persists across frames; see smoothSpectrumBins()
+    // See spectrumGapDiscards(). Written on the I/O thread by onSequenceGap(),
+    // read by whatever polls it; relaxed for the same reasons Hl2RxDsp gives.
+    std::atomic<quint64> m_spectrumGapDiscards {0};
     // Weight on the NEW frame each call (1 - this on the running average).
     // Lighter than SpectrumWidget's client-side SMOOTH_ALPHA (0.35): the
     // trace already gets THAT smoothing on top of this one, so a second,
@@ -262,6 +373,10 @@ private:
     // See beginRebuild()/installRebuiltChannel()'s own comments.
     bool m_rebuildInFlight = false;
 
+    // Per-outcome counters for m_channel->processIq(); see processTally().
+    // Written on the DSP thread in processIqBlock(), read from elsewhere.
+    WdspProcessTally m_processTally;
+
     bool m_audioMuted = false;
     int m_spectrumIntervalMs = 0;   // 0 = uncapped
     QElapsedTimer m_spectrumClock;
@@ -275,6 +390,18 @@ private:
     DcBlocker m_dcBlockL, m_dcBlockR;
     std::vector<float> m_stereo;                    // interleaved audio out
     std::vector<float> m_bins;                      // spectrum scratch
+
+    // Live droop-correction tables, keyed by DDC0 rate in ksps -- see
+    // setDroopCorrectionTable(). Survives a rate-change rebuild untouched:
+    // installRebuiltChannel() swaps m_channel/m_spectrum, not this object,
+    // and the correction is applied to m_bins after the FFT, independent of
+    // which WdspChannel produced the IQ that fed it.
+    QMap<int, DroopCorrectionTable> m_droopTables;
+    // See setDroopCorrectionBypassed(). Deliberately NOT cleared by
+    // clearDroopCorrectionTables(): "am I mid-sweep" is a property of the
+    // sweep, not of which tables happen to be loaded.
+    bool m_droopBypassed = false;
+    [[nodiscard]] const DroopCorrectionTable& droopTableForRate(int rateKsps) const noexcept;
 };
 
 }  // namespace AetherSDR::anan
