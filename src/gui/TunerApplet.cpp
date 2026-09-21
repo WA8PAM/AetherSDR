@@ -550,9 +550,11 @@ void TunerApplet::buildExpandedUI(QVBoxLayout* vbox)
     connect(m_stbyBtn, &QPushButton::clicked, this, [this]() {
         if (!m_model) return;
         if (!m_model->isOperate()) {
-            // Already in standby — return to operate. Bypass is always clear in
-            // standby, so only one command is needed; setOperate handles it.
+	    // Return to operate. Clear bypass defensively in case the radio
+            // delivered standby with bypass still set (invariant not guaranteed).
+            m_model->setBypass(false);
             m_model->setOperate(true);
+           
         } else if (m_model->isBypass()) {
             // BYPASS → STANDBY: two commands (bypass=0, operate=0). Use the
             // combined method to hold both fields against intermediate echoes —
@@ -1229,8 +1231,9 @@ void TunerApplet::cycleOperateState()
         // for the second field and briefly flash OPERATE in the UI.
         m_model->setOperateAndBypass(false, false);
     } else {
-        // Currently STANDBY → go to OPERATE. Bypass is always 0 in standby,
-        // so one command suffices (bypass guard is satisfied by invariant).
+       // Currently STANDBY → go to OPERATE. Clear bypass defensively in case
+        // the radio delivered standby with bypass still set.
+        m_model->setBypass(false);
         m_model->setOperate(true);
     }
 }
