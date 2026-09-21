@@ -917,10 +917,7 @@ void TunerApplet::setAlertText(const QString& text)
     }
 }
 
-void TunerApplet::latchPttSeen(bool& flag)
-{
-    flag = true;
-}
+
 
 void TunerApplet::updatePortRows()
 {
@@ -931,10 +928,8 @@ void TunerApplet::updatePortRows()
     // where the client can only report the one radio it happens to be
     // connected to.
     if (m_model && m_model->hasDirectConnection() && m_model->hasPortInfo()) {
-        if (m_model->portA().ptt) latchPttSeen(m_pttSeenA);
-        if (m_model->portB().ptt) latchPttSeen(m_pttSeenB);
-        applyPortInfo(m_portA, m_model->portA(), m_pttSeenA);
-        applyPortInfo(m_portB, m_model->portB(), m_pttSeenB);
+        applyPortInfo(m_portA, m_model->portA());
+        applyPortInfo(m_portB, m_model->portB());
         updateActivePort();
         return;
     }
@@ -946,9 +941,7 @@ void TunerApplet::updatePortRows()
     // Port B: trigger mode is unknown; leave the label hidden rather than
     // guess "RF SENSE" and mislead PTT-mode users.
     const QString modelName = m_radioModelName.trimmed();
-    if (m_model && m_model->pttA()) persistPttSeen(m_pttSeenA, QStringLiteral("pttSeenPortA"));
-    if (m_model && m_model->pttB()) persistPttSeen(m_pttSeenB, QStringLiteral("pttSeenPortB"));
-    const bool showA = !m_pttSeenA && m_radioConnected && !modelName.isEmpty();
+    const bool showA = m_radioConnected && !modelName.isEmpty();
     m_portA->setSourceVisible(showA);
     if (showA)
         m_portA->setSourceText(modelName);
@@ -968,17 +961,13 @@ void TunerApplet::updatePortRows()
     updateActivePort();
 }
 
-void TunerApplet::applyPortInfo(AccessoryPortRow* row, const TunerPortInfo& info,
-                                bool pttSeen)
+    void TunerApplet::applyPortInfo(AccessoryPortRow* row, const TunerPortInfo& info)
 {
     // Source label: shown only when we have positive evidence of what is on
-    // the port (live reading, no PTT latch). Hidden otherwise — "RF SENSE" was
-    // an assumption about trigger mode the protocol never confirms, so showing
-    // nothing is more honest than guessing. Once PTT fires on a port the latch
-    // keeps the label hidden for the session; on the next connection the label
-    // starts hidden (default) and stays hidden until a live non-PTT read.
-    const bool showSource = !pttSeen
-                            && info.live
+    // the port (live reading). Hidden otherwise — "RF SENSE" was an assumption
+    // about trigger mode the protocol never confirms, so showing nothing is
+    // more honest than guessing.
+    const bool showSource = info.live
                             && !info.source.trimmed().isEmpty();
     row->setSourceVisible(showSource);
     if (showSource)
