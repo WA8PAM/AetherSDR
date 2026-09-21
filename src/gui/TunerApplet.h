@@ -209,15 +209,13 @@ private:
     QWidget*     m_portLiveBox{nullptr};   // the two strips + the bypass overlay
     AccessoryPortRow* m_portA{nullptr};
     AccessoryPortRow* m_portB{nullptr};
-    // Once PTT is sensed on a port the source label stays hidden — the hardware
-    // displays the same behaviour, treating it as a permanent indicator that the
-    // port is in PTT trigger mode rather than RF sense mode. Persisted across
-    // restarts via AppSettings so the label never reappears on a PTT-mode port.
+     // Once PTT is sensed on a port the source label stays hidden for the
+    // remainder of the session. In-memory only; resets on app restart.
     bool m_pttSeenA{false};
     bool m_pttSeenB{false};
-    // Set the latch for the given port and persist it immediately so that the
-    // source label stays hidden even after an app restart.
-    void persistPttSeen(bool& flag, const QString& settingsKey);
+    // Set the in-memory latch for the given port; source label stays hidden
+    // for the remainder of the session.
+       void latchPttSeen(bool& flag);
     // Bypass is one device-wide field, so it is shown once across both strips
     // rather than repeated in each — repeating it reads as though a port could
     // be bypassed on its own.

@@ -113,7 +113,7 @@ constexpr const char* kBypassActiveStyle =
 TunerApplet::TunerApplet(QWidget* parent)
     : QWidget(parent)
 {
-theme::setContainer(this, QStringLiteral("applet/tuner"));
+        theme::setContainer(this, QStringLiteral("applet/tuner"));
     hide();   // hidden by default until toggled on
     setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Fixed);
 
@@ -550,10 +550,10 @@ void TunerApplet::buildExpandedUI(QVBoxLayout* vbox)
     connect(m_stbyBtn, &QPushButton::clicked, this, [this]() {
         if (!m_model) return;
         if (!m_model->isOperate()) {
-	    // Return to operate. Clear bypass defensively in case the radio
-            // delivered standby with bypass still set (invariant not guaranteed).
-            m_model->setBypass(false);
-            m_model->setOperate(true);
+	    // Return to operate. A standby can carry bypass=1 (FlexLib derives
+            // Standby from operate=0 alone, Tuner.cs:210); clear it on the way
+            // out as FlexLib's AutoTune does (Tuner.cs:355-356).
+            m_model->setOperateAndBypass(true, false);
            
         } else if (m_model->isBypass()) {
             // BYPASS → STANDBY: two commands (bypass=0, operate=0). Use the
@@ -917,9 +917,9 @@ void TunerApplet::setAlertText(const QString& text)
     }
 }
 
-void TunerApplet::persistPttSeen(bool& flag, const QString& /*settingsKey*/)
+void TunerApplet::latchPttSeen(bool& flag)
 {
-    flag = true;  // in-memory latch only; source label hides for the session
+    flag = true;
 }
 
 void TunerApplet::updatePortRows()
@@ -931,8 +931,8 @@ void TunerApplet::updatePortRows()
     // where the client can only report the one radio it happens to be
     // connected to.
     if (m_model && m_model->hasDirectConnection() && m_model->hasPortInfo()) {
-        if (m_model->portA().ptt) persistPttSeen(m_pttSeenA, QStringLiteral("pttSeenPortA"));
-        if (m_model->portB().ptt) persistPttSeen(m_pttSeenB, QStringLiteral("pttSeenPortB"));
+        if (m_model->portA().ptt) latchPttSeen(m_pttSeenA);
+        if (m_model->portB().ptt) latchPttSeen(m_pttSeenB);
         applyPortInfo(m_portA, m_model->portA(), m_pttSeenA);
         applyPortInfo(m_portB, m_model->portB(), m_pttSeenB);
         updateActivePort();
@@ -1231,10 +1231,10 @@ void TunerApplet::cycleOperateState()
         // for the second field and briefly flash OPERATE in the UI.
         m_model->setOperateAndBypass(false, false);
     } else {
-       // Currently STANDBY → go to OPERATE. Clear bypass defensively in case
-        // the radio delivered standby with bypass still set.
-        m_model->setBypass(false);
-        m_model->setOperate(true);
+       // Currently STANDBY → go to OPERATE. A standby can still carry
+        // bypass=1 (FlexLib derives Standby from operate=0 alone, Tuner.cs:210),
+        // so clear it on the way out as FlexLib's AutoTune does.
+        m_model->setOperateAndBypass(true, false);
     }
 }
 
