@@ -1072,14 +1072,7 @@ void TunerApplet::setTunerModel(TunerModel* model)
     connect(m_model, &TunerModel::pttChanged, this, [this](bool a, bool b) {
         m_portA->setPtt(a);
         m_portB->setPtt(b);
-        // Latch the PTT-seen flag and hide the source label for that port.
-        // On the direct path, portsChanged -> updatePortRows -> applyPortInfo
-        // owns the label; on the relay path we update it here.
-        // Either way: once PTT fires the label stays hidden for the session.
-        if (a) persistPttSeen(m_pttSeenA, QStringLiteral("pttSeenPortA"));
-        if (b) persistPttSeen(m_pttSeenB, QStringLiteral("pttSeenPortB"));
-        if (m_portA && m_pttSeenA) m_portA->setSourceVisible(false);
-        if (m_portB && m_pttSeenB) m_portB->setSourceVisible(false);
+              
     });
 
     connect(m_model, &TunerModel::directConnectionChanged, this, updateAntVisible);
