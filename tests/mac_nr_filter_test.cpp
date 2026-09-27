@@ -2,12 +2,15 @@
 // CMake target: mac_nr_filter_test (macOS only).
 
 #include "core/MacNRFilter.h"
+#include "nr_stereo_independence.h"
 
 #include <QByteArray>
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <initializer_list>
+#include <memory>
 #include <numbers>
 #include <vector>
 
@@ -49,9 +52,10 @@ private:
     uint32_t m_state;
 };
 
-std::vector<float> runFilter(const std::vector<float>& input, float strength)
+std::vector<float> runFilter(const std::vector<float>& input, float strength,
+                              int sampleRate = kRate)
 {
-    AetherSDR::MacNRFilter filter;
+    AetherSDR::MacNRFilter filter(sampleRate);
     if (!filter.isValid()) {
         return {};
     }
@@ -59,8 +63,9 @@ std::vector<float> runFilter(const std::vector<float>& input, float strength)
 
     std::vector<float> output;
     output.reserve(input.size());
-    for (int frame = 0; frame < static_cast<int>(input.size() / 2); frame += kBlockFrames) {
-        const int count = std::min(kBlockFrames,
+    const int blockFrames = sampleRate / 100;
+    for (int frame = 0; frame < static_cast<int>(input.size() / 2); frame += blockFrames) {
+        const int count = std::min(blockFrames,
                                    static_cast<int>(input.size() / 2) - frame);
         QByteArray block(count * 2 * static_cast<int>(sizeof(float)), Qt::Uninitialized);
         std::copy_n(input.data() + 2 * frame, 2 * count,
@@ -74,6 +79,61 @@ std::vector<float> runFilter(const std::vector<float>& input, float strength)
                       values + processed.size() / static_cast<int>(sizeof(float)));
     }
     return output;
+}
+
+void test_native48_full_bandwidth_and_reset()
+{
+    constexpr int rate = 48000;
+    constexpr int total = rate * 3;
+    std::vector<float> input(2 * total);
+    for (int frame = 0; frame < total; ++frame) {
+        input[2 * frame] = 0.2f * std::sin(kTwoPi * 16000.0f * frame / rate);
+        input[2 * frame + 1] = 0.2f * std::cos(kTwoPi * 17000.0f * frame / rate);
+    }
+    const std::vector<float> output = runFilter(input, 0.0f, rate);
+    double error = 0.0;
+    if (output.size() == input.size()) {
+        // At native48 the FFT/hop doubles, retaining the existing elapsed
+        // processing delay (1024 samples; 512 samples at legacy24).
+        for (int frame = rate; frame < total; ++frame) {
+            for (int channel = 0; channel < 2; ++channel) {
+                error = std::max(error, std::abs(static_cast<double>(
+                    output[2 * frame + channel] - input[2 * (frame - 1024) + channel])));
+            }
+        }
+    } else {
+        error = 1.0;
+    }
+    char detail[128]{};
+    std::snprintf(detail, sizeof(detail), "max independent16/17k error=%.6f", error);
+    report("native48 retains independent stereo above12k", error < 1.0e-5, detail);
+
+    AetherSDR::MacNRFilter invalid(44100);
+    report("unsupported MNR domain fails initialization", !invalid.isValid(), "44100 Hz");
+    AetherSDR::MacNRFilter filter(rate);
+    filter.setStrength(0.6f);
+    const QByteArray block(reinterpret_cast<const char*>(input.data()), 4096 * sizeof(float));
+    const QByteArray first = filter.process(block);
+    filter.process(block);
+    filter.reset();
+    report("native48 reset discards all processing history",
+           filter.sampleRate() == rate && first == filter.process(block), "replayed initial block");
+
+    NoiseSource noise(0x52a7u);
+    for (int frame = 0; frame < total; ++frame) {
+        input[2 * frame] = input[2 * frame + 1] = 0.05f * noise.gaussian();
+    }
+    const std::vector<float> suppressed = runFilter(input, 1.0f, rate);
+    double inPower = 0.0;
+    double outPower = 0.0;
+    for (int frame = rate; frame < total && suppressed.size() == input.size(); ++frame) {
+        inPower += input[2 * frame] * input[2 * frame];
+        outPower += suppressed[2 * frame] * suppressed[2 * frame];
+    }
+    const double attenuation = 10.0 * std::log10(outPower / std::max(inPower, 1e-12));
+    std::snprintf(detail, sizeof(detail), "native48 white noise attenuation=%.2f dB", attenuation);
+    report("native48 executes enabled noise reduction", std::isfinite(attenuation)
+           && attenuation < -10.0 && attenuation > -30.0, detail);
 }
 
 double rms(const std::vector<float>& samples, int firstFrame, int lastFrame, int channel)
@@ -139,31 +199,54 @@ void test_white_noise_attenuation_and_scale_invariance()
     report("white-noise attenuation stays scale-invariant within 1 dB", scaleInvariant, detail);
 }
 
+// Power of one channel inside +/-halfWidthHz of each tone, summed. The wanted
+// signal is three amplitude-modulated tones whose 2 Hz envelope keeps every
+// sideband within 8 Hz of its carrier, so this band holds the whole of it and
+// only a sliver of the broadband noise. Evaluated on the exact N-point DFT
+// bins, where Parseval holds; only the bins inside the bands are computed.
+double toneBandPower(const std::vector<float>& samples, int firstFrame, int lastFrame,
+                     int channel, std::initializer_list<float> tonesHz, float halfWidthHz)
+{
+    const int count = lastFrame - firstFrame;
+    const double binHz = static_cast<double>(kRate) / count;
+    double power = 0.0;
+    for (const float toneHz : tonesHz) {
+        const int firstBin = static_cast<int>(std::ceil((toneHz - halfWidthHz) / binHz));
+        const int lastBin = static_cast<int>(std::floor((toneHz + halfWidthHz) / binHz));
+        for (int bin = firstBin; bin <= lastBin; ++bin) {
+            const double w = 2.0 * std::numbers::pi * bin / count;
+            double re = 0.0;
+            double im = 0.0;
+            for (int n = 0; n < count; ++n) {
+                const double value = samples[2 * (firstFrame + n) + channel];
+                re += value * std::cos(w * n);
+                im -= value * std::sin(w * n);
+            }
+            // Parseval for a real signal: each positive-frequency bin carries
+            // 2|X|^2 / N^2 of the mean-square power.
+            power += 2.0 * (re * re + im * im) / (static_cast<double>(count) * count);
+        }
+    }
+    return power;
+}
+
 void test_speech_like_snr_improvement()
 {
     NoiseSource noise(0x1a2b3c4du);
     std::vector<float> noisy(2 * kTotalFrames);
-    std::vector<float> desired(kTotalFrames);
-    std::vector<float> background(kTotalFrames);
     for (int frame = 0; frame < kTotalFrames; ++frame) {
         const float t = static_cast<float>(frame) / kRate;
         // A varying voiced envelope with three formant-like components. The
         // envelope is deliberately nonstationary; MNR is not expected to
         // preserve a continuous unmodulated tone.
         const float envelope = 0.02f + 0.98f * std::pow(0.5f + 0.5f * std::sin(kTwoPi * 2.0f * t), 4.0f);
-        desired[frame] = 0.15f * envelope * (
+        const float desired = 0.15f * envelope * (
             0.72f * std::sin(kTwoPi * 430.0f * t)
           + 0.48f * std::sin(kTwoPi * 970.0f * t + 0.7f)
           + 0.32f * std::sin(kTwoPi * 1740.0f * t + 1.4f));
-        background[frame] = 0.035f * noise.gaussian();
-
-        // The shared MNR mask is synthesized independently into L/R.  Put
-        // desired+noise on L and the identical noise on R so L-R isolates
-        // the wanted component after the exact same adaptive mask.  Unlike
-        // subtracting two independently adapted filter runs, this is a valid
-        // decomposition for a nonlinear, stateful suppressor.
-        noisy[2 * frame] = desired[frame] + background[frame];
-        noisy[2 * frame + 1] = background[frame];
+        const float value = desired + 0.035f * noise.gaussian();
+        noisy[2 * frame] = value;
+        noisy[2 * frame + 1] = value;
     }
 
     const std::vector<float> noisyOut = runFilter(noisy, 1.0f);
@@ -171,27 +254,24 @@ void test_speech_like_snr_improvement()
         report("speech-like test filter construction", false, "vDSP FFT setup failed");
         return;
     }
+
+    // Each channel has its own mask, so the wanted signal and the noise cannot
+    // be separated by running them through different channels of one filter.
+    // Split them in frequency instead, identically before and after: the tone
+    // bands are the wanted signal, everything else is noise.
+    constexpr float kHalfWidthHz = 12.0f;
+    const auto snr = [](const std::vector<float>& samples, double& desiredPower) {
+        const double total = std::pow(rms(samples, kWarmupFrames, kTotalFrames, 0), 2.0);
+        desiredPower = toneBandPower(samples, kWarmupFrames, kTotalFrames, 0,
+                                     {430.0f, 970.0f, 1740.0f}, kHalfWidthHz);
+        return 10.0 * std::log10(desiredPower / std::max(total - desiredPower, 1e-24));
+    };
     double desiredInputPower = 0.0;
-    double noiseInputPower = 0.0;
     double desiredOutputPower = 0.0;
-    double noiseOutputPower = 0.0;
-    for (int frame = kWarmupFrames; frame < kTotalFrames; ++frame) {
-        desiredInputPower += static_cast<double>(desired[frame]) * desired[frame];
-        noiseInputPower += static_cast<double>(background[frame]) * background[frame];
-        const double outputDesired = noisyOut[2 * frame] - noisyOut[2 * frame + 1];
-        const double outputNoise = noisyOut[2 * frame + 1];
-        desiredOutputPower += outputDesired * outputDesired;
-        noiseOutputPower += outputNoise * outputNoise;
-    }
-    const double measuredFrames = kTotalFrames - kWarmupFrames;
-    const double desiredIn = std::sqrt(desiredInputPower / measuredFrames);
-    const double inputNoise = std::sqrt(noiseInputPower / measuredFrames);
-    const double desiredOut = std::sqrt(desiredOutputPower / measuredFrames);
-    const double outputNoise = std::sqrt(noiseOutputPower / measuredFrames);
-    const double inputSnr = dbRatio(desiredIn, inputNoise);
-    const double outputSnr = dbRatio(desiredOut, outputNoise);
+    const double inputSnr = snr(noisy, desiredInputPower);
+    const double outputSnr = snr(noisyOut, desiredOutputPower);
     const double improvement = outputSnr - inputSnr;
-    const double desiredLoss = dbRatio(desiredOut, desiredIn);
+    const double desiredLoss = 10.0 * std::log10(desiredOutputPower / desiredInputPower);
     char detail[192]{};
     std::snprintf(detail, sizeof(detail), "in=%.2f dB out=%.2f dB improvement=%.2f dB", inputSnr, outputSnr, improvement);
     report("speech-like multitone SNR improves by at least 6 dB", improvement >= 6.0, detail);
@@ -249,7 +329,7 @@ void test_strength_zero_reconstruction_and_stereo_balance()
     const double ratio = rms(stereoOut, kWarmupFrames, kTotalFrames, 0)
                        / rms(stereoOut, kWarmupFrames, kTotalFrames, 1);
     std::snprintf(detail, sizeof(detail), "output L/R RMS ratio=%.4f", ratio);
-    report("shared MNR mask preserves a 4:1 stereo ratio", std::abs(ratio - 4.0) <= 0.05, detail);
+    report("per-channel MNR preserves a 4:1 stereo ratio", std::abs(ratio - 4.0) <= 0.05, detail);
 }
 
 void test_zero_prefill_and_reset_do_not_poison_noise_history()
@@ -433,6 +513,29 @@ void test_enable_during_speech_avoids_deep_ducking()
            desiredLoss >= -1.75, detail);
 }
 
+void test_channels_are_independent()
+{
+    // Each channel has its own noise estimator, as RN2 runs one RNNoise state
+    // per channel: the sides of a diversity pair are different antennas.
+    for (const int rate : {24000, 48000}) {
+        const NrStereoIndependence::MakeProcess make = [rate]() {
+            auto filter = std::make_shared<AetherSDR::MacNRFilter>(rate);
+            return NrStereoIndependence::Process(
+                [filter](const QByteArray& pcm) { return filter->process(pcm); });
+        };
+        char detail[64]{};
+        std::snprintf(detail, sizeof(detail), "%d Hz", rate);
+        report("left output ignores right input",
+               NrStereoIndependence::leftIgnoresRight(make, rate), detail);
+        report("right output ignores left input",
+               NrStereoIndependence::rightIgnoresLeft(make, rate), detail);
+        report("hard pan step settles within 300 ms",
+               NrStereoIndependence::panStepSettles(make, rate), detail);
+        report("both channels attenuate noise",
+               NrStereoIndependence::attenuatesNoise(make, rate), detail);
+    }
+}
+
 } // namespace
 
 int main()
@@ -444,6 +547,8 @@ int main()
     test_silence_gap_preserves_learned_noise_floor();
     test_near_silence_does_not_seed_noise_floor();
     test_enable_during_speech_avoids_deep_ducking();
+    test_native48_full_bandwidth_and_reset();
+    test_channels_are_independent();
     std::printf(g_failed == 0 ? "\nPASSED\n" : "\nFAILED (%d)\n", g_failed);
     return g_failed == 0 ? 0 : 1;
 }

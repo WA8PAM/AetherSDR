@@ -1,4 +1,6 @@
 #include "LocalControlServer.h"
+#include "ControlInputPump.h"
+#include "ControlCredentialVault.h"
 
 #include <QCryptographicHash>
 #include <QDir>
@@ -9,7 +11,9 @@
 #include <QLockFile>
 #include <QLocalSocket>
 #include <QRegularExpression>
+#include <QScopeGuard>
 #include <QStandardPaths>
+#include <QThread>
 #include <QTimer>
 
 #ifdef Q_OS_UNIX
@@ -31,15 +35,16 @@ QJsonObject serverValue(const QString& localTransport)
 } // namespace
 
 struct LocalControlServer::Client {
-    Client(ControlResourceStore* resources, qint64 maxQueuedOutputBytes)
+    Client(ControlResourceStore* resources, qint64 maxQueuedOutputBytes,
+           SessionAuthorization authorization)
         // Only created for sockets accepted by the current-user endpoint.
         : session(std::make_unique<ControlSession>(
-              resources, maxQueuedOutputBytes, SessionAuthorization::Observer))
+              resources, maxQueuedOutputBytes, authorization))
     {
     }
 
-    QByteArray input;
     std::unique_ptr<ControlSession> session;
+    std::unique_ptr<ControlInputPump> input;
     QTimer handshakeTimer;
 };
 
@@ -48,8 +53,15 @@ LocalControlServer::LocalControlServer(QObject* parent)
 {
 }
 
-LocalControlServer::LocalControlServer(QObject* parent, Limits limits)
-    : QObject(parent), m_resources(), m_service(&m_resources), m_limits(limits)
+LocalControlServer::LocalControlServer(QObject* parent, Limits limits,
+                                     RadioConnectionTarget* connectionTarget,
+                                     bool allowLocalControl)
+    // Mirror bindConnectionTarget(): a target is only installed when local
+    // control is granted, so an observer-only server never carries one.
+    : QObject(parent), m_resources(),
+      m_service(&m_resources, allowLocalControl ? connectionTarget : nullptr), m_limits(limits),
+      m_localAuthorization(allowLocalControl ? SessionAuthorization::ObserverController
+                                            : SessionAuthorization::Observer)
 {
     m_resources.upsert(
         {QStringLiteral("server"), {}, {}},
@@ -64,7 +76,54 @@ LocalControlServer::~LocalControlServer()
     close();
 }
 
-bool LocalControlServer::listen(const QString& name)
+bool LocalControlServer::bindConnectionTarget(RadioConnectionTarget* target)
+{
+    return thread() == QThread::currentThread() && m_clients.empty()
+        && m_localAuthorization == SessionAuthorization::ObserverController
+        && m_service.bindConnectionTarget(target);
+}
+
+bool LocalControlServer::bindFrequencyTarget(SliceFrequencyTarget* target)
+{
+    return thread() == QThread::currentThread() && m_clients.empty()
+        && m_localAuthorization == SessionAuthorization::ObserverController
+        && m_service.bindFrequencyTarget(target);
+}
+
+bool LocalControlServer::bindReceiveTarget(ReceiveControlTarget* target)
+{
+    return thread() == QThread::currentThread() && m_clients.empty()
+        && m_localAuthorization == SessionAuthorization::ObserverController
+        && m_service.bindReceiveTarget(target);
+}
+
+bool LocalControlServer::bindCredentials(ControlCredentials* credentials)
+{
+    return thread() == QThread::currentThread() && !m_serving && m_clients.empty()
+        && m_service.bindCredentials(credentials);
+}
+
+bool LocalControlServer::bindTransmitTarget(TransmitControlTarget* target)
+{
+    return thread() == QThread::currentThread() && !m_serving && m_clients.empty()
+        && m_service.bindTransmitTarget(target);
+}
+
+std::unique_ptr<QLockFile> LocalControlServer::reserveCredentialAuthority(const QString& authorityId)
+{
+    if (!ControlCredentialVault::validAuthorityId(authorityId)) { return {}; }
+    QString unusedEndpoint;
+    QString lockPath;
+    if (!resolveEndpoint(QStringLiteral("credential-authority-") + authorityId, &unusedEndpoint, &lockPath)) {
+        return {};
+    }
+    auto lock = std::make_unique<QLockFile>(lockPath);
+    lock->setStaleLockTime(0);
+    if (!lock->tryLock()) { return {}; }
+    return lock;
+}
+
+bool LocalControlServer::listen(const QString& name, ListenMode mode)
 {
     if (m_server.isListening() || m_lock || m_limits.maxClients < 1
         || m_limits.handshakeTimeoutMs < 1 || m_limits.maxQueuedOutputBytes < 1) {
@@ -104,11 +163,32 @@ bool LocalControlServer::listen(const QString& name)
     m_resources.upsert(
         {QStringLiteral("server"), {}, {}},
         serverValue(QStringLiteral("listening")));
+    return mode == ListenMode::ReserveEndpoint || startServing();
+}
+
+QString LocalControlServer::clientEndpoint(const QString& logicalName)
+{
+    QString endpoint;
+    QString lock;
+    return resolveEndpoint(logicalName, &endpoint, &lock) ? endpoint : QString{};
+}
+
+bool LocalControlServer::startServing()
+{
+    if (thread() != QThread::currentThread() || !m_server.isListening() || m_serving) {
+        return false;
+    }
+    m_serving = true;
+    acceptConnections();
     return true;
 }
 
 void LocalControlServer::close()
 {
+    if (m_closing) { return; }
+    m_closing = true;
+    const auto restore = qScopeGuard([this] { m_closing = false; });
+    m_serving = false;
     const bool wasListening = m_server.isListening();
     m_server.close();
     QList<QLocalSocket*> sockets;
@@ -118,6 +198,10 @@ void LocalControlServer::close()
         sockets.append(socket);
     }
     for (QLocalSocket* socket : sockets) {
+        const auto client = m_clients.find(socket);
+        if (client != m_clients.end()) {
+            client->second->input->finish();
+        }
         socket->disconnectFromServer();
         dropClient(socket);
     }
@@ -136,6 +220,14 @@ void LocalControlServer::acceptConnections()
         if (!socket) {
             continue;
         }
+        if (!m_serving) {
+            // Settings/model construction can pump a nested event loop. Do
+            // not create a session or dispatch into partially initialized
+            // targets. The endpoint remains claimed; clients may retry.
+            socket->abort();
+            socket->deleteLater();
+            continue;
+        }
         if (m_clients.size() >= static_cast<std::size_t>(m_limits.maxClients)) {
             connect(socket, &QLocalSocket::disconnected,
                     socket, &QLocalSocket::deleteLater);
@@ -148,14 +240,32 @@ void LocalControlServer::acceptConnections()
         }
 
         std::unique_ptr<Client> ownedClient =
-            std::make_unique<Client>(&m_resources, m_limits.maxQueuedOutputBytes);
+            std::make_unique<Client>(&m_resources, m_limits.maxQueuedOutputBytes,
+                                     m_localAuthorization);
         Client* client = ownedClient.get();
         client->handshakeTimer.setSingleShot(true);
         client->handshakeTimer.setInterval(m_limits.handshakeTimeoutMs);
         socket->setReadBufferSize(ProtocolLimits::kMaxMessageBytes + 1);
         m_clients.emplace(socket, std::move(ownedClient));
+        client->input = std::make_unique<ControlInputPump>(m_service, *client->session,
+            [socket](qint64 maximum) { return socket->read(maximum); },
+            [this, socket](const QJsonObject& message) {
+                const auto current = m_clients.find(socket);
+                if (current == m_clients.end()) { return false; }
+                if (current->second->session->isNegotiated()) {
+                    current->second->handshakeTimer.stop();
+                }
+                return send(socket, message);
+            },
+            [socket](bool abort) {
+                if (abort) { socket->abort(); }
+                else { socket->disconnectFromServer(); }
+            });
 
         connect(&client->handshakeTimer, &QTimer::timeout, socket, [this, socket] {
+            const auto current = m_clients.find(socket);
+            if (current == m_clients.end()) { return; }
+            current->second->input->finish();
             const ProtocolError timeout{QStringLiteral("engine.timeout"),
                                         QStringLiteral("hello handshake timed out"), {}, false};
             if (!send(socket, ControlProtocolCodec::errorResponse({}, timeout))) {
@@ -170,6 +280,11 @@ void LocalControlServer::acceptConnections()
             [socket] { socket->abort(); });
         connect(socket, &QLocalSocket::disconnected,
                 this, [this, socket] {
+                    const auto current = m_clients.find(socket);
+                    if (current != m_clients.end()) {
+                        current->second->handshakeTimer.stop();
+                        current->second->input->finish();
+                    }
                     // QLocalSocket::abort() may emit disconnected synchronously
                     // from send(). Defer Client destruction so neither a
                     // readyRead handler nor the handshake timer can lose the
@@ -180,55 +295,31 @@ void LocalControlServer::acceptConnections()
                     socket->deleteLater();
                 });
         client->handshakeTimer.start();
+        // Data can precede our readyRead connection when acceptance was
+        // delayed by startup or another event callback.
+        if (socket->bytesAvailable() > 0) {
+            readClient(socket);
+        }
     }
 }
 
 void LocalControlServer::readClient(QLocalSocket* socket)
 {
+    if (!m_serving) { return; }
     const auto clientIt = m_clients.find(socket);
     if (clientIt == m_clients.end()) {
         return;
     }
-    Client* client = clientIt->second.get();
-    client->input.append(socket->readAll());
-
-    while (true) {
-        const qsizetype newline = client->input.indexOf('\n');
-        if (newline < 0) {
-            if (client->input.size() > ProtocolLimits::kMaxMessageBytes) {
-                const ProtocolError limit{
-                    QStringLiteral("transport.limit_exceeded"),
-                    QStringLiteral("input frame exceeds maxMessageBytes"), {}, false};
-                if (!send(socket, ControlProtocolCodec::errorResponse({}, limit))) {
-                    return;
-                }
-                socket->disconnectFromServer();
-            }
-            return;
-        }
-        QByteArray frame = client->input.left(newline);
-        client->input.remove(0, newline + 1);
-        if (frame.endsWith('\r')) {
-            frame.chop(1);
-        }
-
-        const ServiceReply reply = m_service.handle(frame, client->session.get());
-        if (client->session->isNegotiated()) {
-            client->handshakeTimer.stop();
-        }
-        if (!send(socket, reply.message)) {
-            return;
-        }
-        if (reply.closeAfterWrite) {
-            socket->disconnectFromServer();
-            return;
-        }
-    }
+    clientIt->second->input->readAvailable();
 }
 
 void LocalControlServer::dropClient(QLocalSocket* socket)
 {
-    m_clients.erase(socket);
+    const auto current = m_clients.find(socket);
+    if (current == m_clients.end()) { return; }
+    // Remove from the registry before destruction can call engine cleanup.
+    const std::unique_ptr<Client> retired = std::move(current->second);
+    m_clients.erase(current);
 }
 
 bool LocalControlServer::send(QLocalSocket* socket, const QJsonObject& message)
@@ -241,13 +332,19 @@ bool LocalControlServer::send(QLocalSocket* socket, const QJsonObject& message)
 bool LocalControlServer::sendFrame(QLocalSocket* socket, const QByteArray& frame)
 {
     if (!socket || socket->state() == QLocalSocket::UnconnectedState) {
+        const auto current = m_clients.find(socket);
+        if (current != m_clients.end()) { current->second->input->finish(); }
         return false;
     }
     if (socket->bytesToWrite() + frame.size() > m_limits.maxQueuedOutputBytes) {
+        const auto current = m_clients.find(socket);
+        if (current != m_clients.end()) { current->second->input->finish(); }
         socket->abort();
         return false;
     }
     if (socket->write(frame) != frame.size()) {
+        const auto current = m_clients.find(socket);
+        if (current != m_clients.end()) { current->second->input->finish(); }
         socket->abort();
         return false;
     }

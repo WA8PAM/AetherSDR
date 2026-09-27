@@ -1,4 +1,7 @@
 #include "PskReporterMapDialog.h"
+#include "GuardedSlider.h"
+#include "PskBeaconLevelPolicy.h"
+#include "ComboStyle.h"
 
 #include "core/AppSettings.h"
 #include "core/AudioEngine.h"
@@ -7,15 +10,20 @@
 #include "core/MaidenheadLocator.h"
 #include "core/PropForecastClient.h"
 #include "core/PskReporterClient.h"
+#include "core/RadioSettingsScope.h"
 #include "core/TxKeyingMarker.h"
 #include "core/WsprBeacon.h"
+#include "map/CityLightsShading.h"
 #include "map/MapDisplayWidget.h"
+#include "map/WeatherRadarFrameTime.h"
 #include "models/EqualizerModel.h"
 #include "models/RadioModel.h"
 #include "models/SliceModel.h"
 #include "models/TransmitModel.h"
 
+#include <algorithm>
 #include <cmath>
+#include <utility>
 
 #include <QCheckBox>
 #include <QComboBox>
@@ -23,6 +31,13 @@
 #include <QDateTime>
 #include <QDoubleSpinBox>
 #include <QFrame>
+#include <QFormLayout>
+#include <QScrollArea>
+#include <QScopeGuard>
+#include <QScrollBar>
+#include <QCoreApplication>
+#include <QWheelEvent>
+#include <QSplitter>
 #include <QGroupBox>
 #include <QHash>
 #include <QLineEdit>
@@ -35,20 +50,73 @@
 #include <QJsonObject>
 #include <QJsonValue>
 #include <QToolTip>
+#include <QToolButton>
 #include <QtMath>
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QVBoxLayout>
 
 #include <limits>
+#include <optional>
 
 namespace AetherSDR {
 
 namespace {
 
+// In the sidebar, wheel gestures navigate even when a value control has
+// focus. Values remain editable with clicks, dragging, and the keyboard.
+class SidebarValueWheelGuard final : public QObject {
+public:
+    explicit SidebarValueWheelGuard(QScrollArea* sidebar)
+        : QObject(sidebar), m_sidebar(sidebar) {}
+
+    void guard(QWidget* control)
+    {
+        control->installEventFilter(this);
+        for (QWidget* child : control->findChildren<QWidget*>()) {
+            child->installEventFilter(this);
+        }
+    }
+
+protected:
+    bool eventFilter(QObject* watched, QEvent* event) override
+    {
+        if (event->type() != QEvent::Wheel) {
+            return QObject::eventFilter(watched, event);
+        }
+        auto* wheel = static_cast<QWheelEvent*>(event);
+        QScrollBar* bar = m_sidebar->verticalScrollBar();
+        QWheelEvent forwarded(bar->mapFromGlobal(wheel->globalPosition().toPoint()),
+                              wheel->globalPosition(), wheel->pixelDelta(),
+                              wheel->angleDelta(), wheel->buttons(), wheel->modifiers(),
+                              wheel->phase(), wheel->inverted(), wheel->source(),
+                              wheel->pointingDevice());
+        QCoreApplication::sendEvent(bar, &forwarded);
+        wheel->accept();
+        return true;
+    }
+
+private:
+    QScrollArea* m_sidebar;
+};
+
 // PSK Reporter map settings live in one nested-JSON AppSettings blob under a
 // single root key (Constitution Principle V) rather than separate flat keys.
+//
+// Map and reporting preferences are properties of the INSTALLATION and belong
+// here. The WSPR beacon's generated level is not: it is a property of the
+// transmit chain the audio is about to enter, so it lives in the radio-scoped
+// document below instead.
 constexpr const char* kSettingsKey = "PskReporter";
+
+// The WSPR beacon's radio-scoped feature document (AGENTS.md, "Radio-Scoped
+// Feature Documents"). One versioned JSON document per radio, keyed by
+// RadioModel::settingsScope().
+const QString kBeaconFeature = QStringLiteral("WsprBeacon");
+constexpr int kBeaconSchemaVersion = 1;
+
+using psk::beaconLevelToApplyDbFs;
+using psk::legacyBeaconLevelAppliesTo;
 
 QJsonObject pskSettings()
 {
@@ -247,18 +315,10 @@ PskReporterMapDialog::PskReporterMapDialog(AudioEngine* audioEngine,
     root->setSpacing(6);
 
     auto* reportsBox = new QGroupBox(tr("Reports"), bodyWidget());
-    reportsBox->setAccessibleName(tr("PSK Reporter filters and map layers"));
-    auto* reportsLayout = new QVBoxLayout(reportsBox);
-    reportsLayout->setContentsMargins(6, 4, 6, 4);
-    reportsLayout->setSpacing(4);
+    reportsBox->setAccessibleName(tr("PSK Reporter filters"));
 
-    auto* filtersBar = new QHBoxLayout();
-    filtersBar->setSpacing(6);
-
-    filtersBar->addWidget(new QLabel(tr("Call:"), reportsBox));
     m_queryCallsign = new QLineEdit(reportsBox);
     m_queryCallsign->setMaxLength(32);
-    m_queryCallsign->setFixedWidth(100);
     m_queryCallsign->setObjectName(QStringLiteral("pskReporterCallsign"));
     m_queryCallsign->setAccessibleName(tr("PSK Reporter map callsign"));
     m_queryCallsign->setAccessibleDescription(
@@ -273,7 +333,6 @@ PskReporterMapDialog::PskReporterMapDialog(AudioEngine* audioEngine,
         m_radioModel != nullptr
             ? m_radioModel->callsign().trimmed().toUpper().left(32)
             : QString());
-    filtersBar->addWidget(m_queryCallsign);
 
     m_allCallsignsCheck = new QCheckBox(tr("All Callsigns"), reportsBox);
     m_allCallsignsCheck->setObjectName(
@@ -285,47 +344,31 @@ PskReporterMapDialog::PskReporterMapDialog(AudioEngine* audioEngine,
            "once every five minutes"));
     m_allCallsignsCheck->setChecked(
         pskSettings().value("showAllCallsigns").toBool(false));
-    filtersBar->addWidget(new QLabel(tr("Band:"), reportsBox));
-    m_bandCombo = new QComboBox(reportsBox);
+    m_bandCombo = new GuardedComboBox(reportsBox);
     m_bandCombo->addItem(tr("All"));
     for (const char* b : { "160m", "80m", "60m", "40m", "30m", "20m",
                            "17m", "15m", "12m", "10m", "6m", "VHF+" }) {
         m_bandCombo->addItem(QString::fromLatin1(b));
     }
-    filtersBar->addWidget(m_bandCombo);
 
-    filtersBar->addWidget(new QLabel(tr("Mode:"), reportsBox));
-    m_modeCombo = new QComboBox(reportsBox);
+    m_modeCombo = new GuardedComboBox(reportsBox);
     m_modeCombo->addItem(tr("All"));
     for (const char* m : { "FT8", "FT4", "WSPR", "JS8", "CW", "PSK",
                            "RTTY", "SSB", "Other" }) {
         m_modeCombo->addItem(QString::fromLatin1(m));
     }
-    filtersBar->addWidget(m_modeCombo);
 
-    filtersBar->addWidget(new QLabel(tr("Lookback:"), reportsBox));
-    m_lookbackCombo = new QComboBox(reportsBox);
+    m_lookbackCombo = new GuardedComboBox(reportsBox);
     m_lookbackCombo->addItem(tr("15 min"), 15 * 60);
     m_lookbackCombo->addItem(tr("30 min"), 30 * 60);
     m_lookbackCombo->addItem(tr("1 hour"), 60 * 60);
     m_lookbackCombo->addItem(tr("2 hours"), 2 * 60 * 60);
     m_lookbackCombo->addItem(tr("4 hours"), 4 * 60 * 60);
     m_lookbackCombo->addItem(tr("8 hours"), 8 * 60 * 60);
-    filtersBar->addWidget(m_lookbackCombo);
-    filtersBar->addStretch(1);
 
-    // Persistent reception stats share the filter row and remain pinned to
-    // the panel's top-right corner, matching the report controls they
-    // summarize.
     m_dxLabel = new QLabel(reportsBox);
     m_dxLabel->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
-    filtersBar->addWidget(m_dxLabel);
-    reportsLayout->addLayout(filtersBar);
 
-    auto* topBar = new QHBoxLayout();
-    topBar->setSpacing(6);
-    topBar->addWidget(new QLabel(tr("Data:"), reportsBox));
-    topBar->addWidget(m_allCallsignsCheck);
 
     m_activeMonitorsCheck = new QCheckBox(tr("Active monitors"), reportsBox);
     m_activeMonitorsCheck->setObjectName(
@@ -337,15 +380,7 @@ PskReporterMapDialog::PskReporterMapDialog(AudioEngine* audioEngine,
            "do not contain a transmitting endpoint, so they have no paths"));
     m_activeMonitorsCheck->setChecked(
         pskSettings().value("showActiveMonitors").toBool(true));
-    topBar->addWidget(m_activeMonitorsCheck);
 
-    auto* dataMapDivider = new QFrame(reportsBox);
-    dataMapDivider->setFrameShape(QFrame::VLine);
-    dataMapDivider->setFrameShadow(QFrame::Sunken);
-    topBar->addSpacing(6);
-    topBar->addWidget(dataMapDivider);
-    topBar->addSpacing(6);
-    topBar->addWidget(new QLabel(tr("Map:"), reportsBox));
 
     m_globeCheck = new QCheckBox(tr("Globe"), reportsBox);
     m_globeCheck->setObjectName(QStringLiteral("pskReporterGlobeToggle"));
@@ -354,44 +389,225 @@ PskReporterMapDialog::PskReporterMapDialog(AudioEngine* audioEngine,
         tr("Switch between the flat world map and an interactive globe"));
     m_globeCheck->setChecked(
         pskSettings().value("showGlobe").toBool(false));
-    topBar->addWidget(m_globeCheck);
 
     m_pathsCheck = new QCheckBox(tr("Paths"), reportsBox);
     m_pathsCheck->setObjectName(QStringLiteral("pskReporterPaths"));
     m_pathsCheck->setToolTip(
         tr("Draw great-circle report paths between transmitting and receiving stations"));
     m_pathsCheck->setChecked(pskSettings().value("showPaths").toBool(false));
-    topBar->addWidget(m_pathsCheck);
 
     m_terminatorCheck = new QCheckBox(tr("Day/night"), reportsBox);
     m_terminatorCheck->setToolTip(tr("Show the current night shadow on the map"));
     m_terminatorCheck->setAccessibleName(tr("Show day and night terminator"));
     m_terminatorCheck->setChecked(
         pskSettings().value("showTerminator").toBool(true));
-    topBar->addWidget(m_terminatorCheck);
-    topBar->addStretch(1);
-    reportsLayout->addLayout(topBar);
-    root->addWidget(reportsBox);
+
+    m_cityLightsCheck = new QCheckBox(tr("City lights"), reportsBox);
+    m_cityLightsCheck->setObjectName(QStringLiteral("pskReporterCityLights"));
+    m_cityLightsCheck->setAccessibleName(tr("Show NASA city lights"));
+    m_cityLightsCheck->setAccessibleDescription(tr(
+        "Historical NASA/GSFC night lights from 2016, not current activity. "
+        "With Day/night enabled, lights fade in during twilight. "
+        "Otherwise lights are visible worldwide."));
+    m_cityLightsCheck->setToolTip(m_cityLightsCheck->accessibleDescription());
+    m_cityLightsCheck->setChecked(pskSettings().value("showCityLights").toBool(false));
+
+    m_weatherRadarCheck = new QCheckBox(tr("Weather overlay"), reportsBox);
+    m_weatherRadarCheck->setObjectName(
+        QStringLiteral("pskReporterWeatherRadar"));
+    m_weatherRadarCheck->setAccessibleName(
+        tr("Show weather precipitation overlay"));
+    m_weatherRadarCheck->setAccessibleDescription(tr(
+        "Shows LibreWXR radar and satellite/model precipitation estimates, "
+        "with enabled regional radar backups when unavailable."));
+    m_weatherRadarCheck->setToolTip(tr(
+        "Overlay near-real-time weather radar; disabled "
+        "when this checkbox is off"));
+    m_weatherRadarCheck->setChecked(
+        pskSettings().value("showWeatherRadar").toBool(false));
+
+    const QStringList regionNames{tr("US backup · NOAA"), tr("Canada backup · ECCC"), tr("Europe backup · OPERA"), tr("Global primary · LibreWXR")};
+    const QStringList regionIds{QStringLiteral("pskReporterRadarUS"), QStringLiteral("pskReporterRadarCanada"), QStringLiteral("pskReporterRadarEurope"), QStringLiteral("pskReporterRadarGlobal")};
+    const int savedRegions = pskSettings().value("weatherRadarRegions").toInt(7) & 7;
+    for (int i = 0; i < 4; ++i) {
+        m_radarRegionChecks[i] = new QCheckBox(regionNames[i], reportsBox);
+        m_radarRegionChecks[i]->setObjectName(regionIds[i]);
+        m_radarRegionChecks[i]->setAccessibleName(regionNames[i]);
+        m_radarRegionChecks[i]->setChecked(i == 3 ? pskSettings().value("useLibreWxr").toBool(true) : (savedRegions & (1 << i)) != 0);
+        m_radarRegionChecks[i]->setToolTip(i == 3
+            ? tr("Free global precipitation from LibreWXR. Includes radar, satellite estimates and model data. Disable to use the regional radar feeds directly.")
+            : tr("Use this regional radar feed when LibreWXR is disabled or unavailable."));
+    }
+    m_radarProductLabel = new QLabel(reportsBox);
+    m_radarProductLabel->setObjectName(QStringLiteral("pskReporterRadarProduct"));
+    m_radarProductLabel->setAccessibleName(tr("Radar product and units"));
+    m_radarProductLabel->setWordWrap(true);
+    m_radarCoverageCheck = new QCheckBox(tr("Radar coverage"), reportsBox);
+    m_radarCoverageCheck->setObjectName(QStringLiteral("pskReporterRadarCoverage"));
+    m_radarCoverageCheck->setAccessibleName(tr("Show radar sites and nominal coverage"));
+    m_radarCoverageCheck->setAccessibleDescription(tr(
+        "Faint nominal coverage shading for sites with published ranges. "
+        "Terrain, outages and scanning conditions reduce actual coverage."));
+    m_radarCoverageCheck->setToolTip(m_radarCoverageCheck->accessibleDescription());
+    m_radarCoverageCheck->setChecked(pskSettings().value("showRadarCoverage").toBool(false));
+
+    m_radarLegendCheck = new QCheckBox(tr("Intensity legend"), reportsBox);
+    m_radarLegendCheck->setObjectName(QStringLiteral("pskReporterRadarLegendVisible"));
+    m_radarLegendCheck->setAccessibleName(tr("Show weather intensity legend"));
+    m_radarLegendCheck->setAccessibleDescription(tr(
+        "Show a separate intensity scale and units for each displayed weather source."));
+    m_radarLegendCheck->setToolTip(m_radarLegendCheck->accessibleDescription());
+    m_radarLegendCheck->setChecked(pskSettings().value("showRadarLegend").toBool(true));
+    m_radarLegendTopCheck = new QCheckBox(tr("Position at top"), reportsBox);
+    m_radarLegendTopCheck->setObjectName(QStringLiteral("pskReporterRadarLegendAtTop"));
+    m_radarLegendTopCheck->setAccessibleName(tr("Position weather legend at top"));
+    m_radarLegendTopCheck->setAccessibleDescription(tr(
+        "Checked: top left. Unchecked: bottom left. Applies when the intensity legend is shown."));
+    m_radarLegendTopCheck->setToolTip(m_radarLegendTopCheck->accessibleDescription());
+    m_radarLegendTopCheck->setChecked(pskSettings().value("radarLegendAtTop").toBool(false));
+
+    m_weatherRadarPlayButton = new QToolButton(reportsBox);
+    m_weatherRadarPlayButton->setObjectName(
+        QStringLiteral("pskReporterWeatherRadarPlay"));
+    m_weatherRadarPlayButton->setText(QStringLiteral("▶"));
+    m_weatherRadarPlayButton->setAutoRaise(true);
+    m_weatherRadarPlayButton->setAccessibleName(
+        tr("Play historical weather radar"));
+    m_weatherRadarPlayButton->setToolTip(
+        tr("Loop through published radar images; no generated transitions"));
+    m_weatherRadarPlayButton->setEnabled(
+        m_weatherRadarCheck->isChecked());
+
+    m_weatherRadarHistoryCombo = new GuardedComboBox(reportsBox);
+    m_weatherRadarHistoryCombo->setObjectName(
+        QStringLiteral("pskReporterWeatherRadarHistory"));
+    m_weatherRadarHistoryCombo->setAccessibleName(
+        tr("Weather radar history duration"));
+    m_weatherRadarHistoryCombo->addItem(tr("1 h"), 1);
+    m_weatherRadarHistoryCombo->addItem(tr("2 h"), 2);
+    m_weatherRadarHistoryCombo->addItem(tr("4 h"), 4);
+    const int savedRadarHours = std::clamp(
+        pskSettings().value("weatherRadarHistoryHours").toInt(1), 1, 4);
+    const int savedRadarHoursIndex =
+        m_weatherRadarHistoryCombo->findData(savedRadarHours);
+    m_weatherRadarHistoryCombo->setCurrentIndex(
+        savedRadarHoursIndex >= 0 ? savedRadarHoursIndex : 0);
+    m_weatherRadarHistoryCombo->setEnabled(
+        m_weatherRadarCheck->isChecked());
+
+    auto* radarSpeedLabel = new QLabel(tr("Speed:"), reportsBox);
+    m_weatherRadarSpeedSlider = new GuardedSlider(Qt::Horizontal, reportsBox);
+    m_weatherRadarSpeedSlider->setObjectName(QStringLiteral("pskReporterWeatherRadarSpeed"));
+    m_weatherRadarSpeedSlider->setAccessibleName(tr("Weather radar playback speed"));
+    m_weatherRadarSpeedSlider->setAccessibleDescription(tr(
+        "25 to 500 percent of normal speed (0.25 to 5 times). "
+        "Changes how quickly original radar images loop without reloading them. "
+        "The final image always holds for one second."));
+    m_weatherRadarSpeedSlider->setToolTip(m_weatherRadarSpeedSlider->accessibleDescription());
+    m_weatherRadarSpeedSlider->setRange(25, 500);
+    m_weatherRadarSpeedSlider->setSingleStep(1);
+    m_weatherRadarSpeedSlider->setPageStep(25);
+    m_weatherRadarSpeedSlider->setFocusPolicy(Qt::StrongFocus);
+    m_weatherRadarSpeedSlider->setDragValueFormatter([](int speed) {
+        return QStringLiteral("%1×").arg(speed / 100.0, 0, 'f', 2);
+    });
+    applyPrimarySliderStyle(m_weatherRadarSpeedSlider);
+    const int savedRadarSpeed = weatherRadarPlaybackSpeedPercent(
+        pskSettings().value("weatherRadarSpeedPercent").toInt(100));
+    m_weatherRadarSpeedSlider->setValue(savedRadarSpeed);
+    m_weatherRadarSpeedSlider->setEnabled(m_weatherRadarCheck->isChecked());
+    m_weatherRadarSpeedValue = new QLabel(
+        QStringLiteral("%1×").arg(savedRadarSpeed / 100.0, 0, 'f', 2), reportsBox);
+    m_weatherRadarSpeedValue->setObjectName(QStringLiteral("pskReporterWeatherRadarSpeedValue"));
+    m_weatherRadarSpeedValue->setMinimumWidth(42);
+    radarSpeedLabel->setBuddy(m_weatherRadarSpeedSlider);
+    m_weatherRadarFrameLabel = new QLabel(tr("Age unknown"), reportsBox);
+    m_weatherRadarFrameLabel->setObjectName(
+        QStringLiteral("pskReporterWeatherRadarFrame"));
+    m_weatherRadarFrameLabel->setAccessibleName(
+        tr("Weather radar frame time"));
+    m_weatherRadarFrameLabel->setMinimumWidth(135);
+    m_weatherRadarFrameLabel->setEnabled(
+        m_weatherRadarCheck->isChecked());
+    auto* lightsLabel = new QLabel(tr("Brightness:"), reportsBox);
+    m_cityLightsBrightness = new GuardedSlider(Qt::Horizontal, reportsBox);
+    m_cityLightsBrightness->setObjectName(QStringLiteral("pskReporterCityLightsBrightness"));
+    m_cityLightsBrightness->setAccessibleName(tr("City lights brightness"));
+    m_cityLightsBrightness->setAccessibleDescription(tr("Overlay intensity from 0 to 100 percent."));
+    m_cityLightsBrightness->setToolTip(m_cityLightsBrightness->accessibleDescription());
+    m_cityLightsBrightness->setRange(0, 100);
+    m_cityLightsBrightness->setFocusPolicy(Qt::StrongFocus);
+    m_cityLightsBrightness->setValue(std::clamp(
+        pskSettings().value("cityLightsBrightness").toInt(CityLightsShading::kDefaultBrightness), 0, 100));
+    m_cityLightsBrightness->setDragValueFormatter([](int value) {
+        return QStringLiteral("%1%").arg(value);
+    });
+    applyPrimarySliderStyle(m_cityLightsBrightness);
+    lightsLabel->setBuddy(m_cityLightsBrightness);
+    auto* lightsValue = new QLabel(QStringLiteral("%1%").arg(m_cityLightsBrightness->value()), reportsBox);
+    lightsValue->setMinimumWidth(36);
+    auto* faintLabel = new QLabel(tr("Faint lights:"), reportsBox);
+    m_cityLightsFaintLights = new GuardedSlider(Qt::Horizontal, reportsBox);
+    m_cityLightsFaintLights->setObjectName(QStringLiteral("pskReporterCityLightsFaintLights"));
+    m_cityLightsFaintLights->setAccessibleName(tr("City lights faint lights"));
+    m_cityLightsFaintLights->setAccessibleDescription(tr(
+        "Reveal dim settlements without washing out bright city centers. Zero preserves the original intensity; 100 gives the strongest enhancement."));
+    m_cityLightsFaintLights->setToolTip(m_cityLightsFaintLights->accessibleDescription());
+    m_cityLightsFaintLights->setRange(0, 100);
+    m_cityLightsFaintLights->setFocusPolicy(Qt::StrongFocus);
+    m_cityLightsFaintLights->setValue(std::clamp(
+        pskSettings().value("cityLightsFaintLights").toInt(CityLightsShading::kDefaultFaintLights), 0, 100));
+    m_cityLightsFaintLights->setDragValueFormatter([](int value) {
+        return QStringLiteral("%1%").arg(value);
+    });
+    applyPrimarySliderStyle(m_cityLightsFaintLights);
+    faintLabel->setBuddy(m_cityLightsFaintLights);
+    auto* faintValue = new QLabel(QStringLiteral("%1%").arg(m_cityLightsFaintLights->value()), reportsBox);
+    faintValue->setMinimumWidth(36);
+    connect(m_cityLightsFaintLights, &QSlider::valueChanged, faintValue, [faintValue](int value) {
+        faintValue->setText(QStringLiteral("%1%").arg(value));
+    });
+    auto* warmthLabel = new QLabel(tr("Warmth:"), reportsBox);
+    m_cityLightsWarmth = new GuardedSlider(Qt::Horizontal, reportsBox);
+    m_cityLightsWarmth->setObjectName(QStringLiteral("pskReporterCityLightsWarmth"));
+    m_cityLightsWarmth->setAccessibleName(tr("City lights warmth"));
+    m_cityLightsWarmth->setAccessibleDescription(tr(
+        "Adjust the display tint from original white at 0 to warm golden light at 100. This is a visual preference, not measured lamp color."));
+    m_cityLightsWarmth->setToolTip(m_cityLightsWarmth->accessibleDescription());
+    m_cityLightsWarmth->setRange(0, 100);
+    m_cityLightsWarmth->setFocusPolicy(Qt::StrongFocus);
+    m_cityLightsWarmth->setValue(std::clamp(
+        pskSettings().value("cityLightsWarmth").toInt(CityLightsShading::kDefaultWarmth), 0, 100));
+    m_cityLightsWarmth->setDragValueFormatter([](int value) {
+        return QStringLiteral("%1%").arg(value);
+    });
+    applyPrimarySliderStyle(m_cityLightsWarmth);
+    warmthLabel->setBuddy(m_cityLightsWarmth);
+    auto* warmthValue = new QLabel(QStringLiteral("%1%").arg(m_cityLightsWarmth->value()), reportsBox);
+    warmthValue->setMinimumWidth(36);
+    connect(m_cityLightsWarmth, &QSlider::valueChanged, warmthValue, [warmthValue](int value) {
+        warmthValue->setText(QStringLiteral("%1%").arg(value));
+    });
+    for (QWidget* widget : QList<QWidget*>{lightsLabel, m_cityLightsBrightness,
+                                          lightsValue, faintLabel, m_cityLightsFaintLights, faintValue, warmthLabel, m_cityLightsWarmth, warmthValue}) {
+        widget->setVisible(m_cityLightsCheck->isChecked());
+        connect(m_cityLightsCheck, &QCheckBox::toggled, widget, &QWidget::setVisible);
+    }
+    connect(m_cityLightsBrightness, &QSlider::valueChanged, lightsValue, [lightsValue](int value) {
+        lightsValue->setText(QStringLiteral("%1%").arg(value));
+    });
 
     auto* beaconBox = new QGroupBox(tr("WSPR beacon"), bodyWidget());
     beaconBox->setAccessibleName(tr("WSPR beacon transmitter"));
-    auto* beaconRow = new QHBoxLayout(beaconBox);
-    beaconRow->setContentsMargins(6, 4, 6, 4);
-    beaconRow->setSpacing(6);
 
-    beaconRow->addWidget(new QLabel(tr("TX call:"), beaconBox));
     m_beaconCallsign = new QLineEdit(beaconBox);
     m_beaconCallsign->setMaxLength(6);
-    m_beaconCallsign->setFixedWidth(76);
     m_beaconCallsign->setAccessibleName(tr("WSPR callsign"));
     m_beaconCallsign->setAccessibleDescription(
         tr("Station callsign used for WSPR transmission; changes update the station callsign"));
-    beaconRow->addWidget(m_beaconCallsign);
 
-    beaconRow->addWidget(new QLabel(tr("Grid:"), beaconBox));
     m_beaconGrid = new QLineEdit(beaconBox);
     m_beaconGrid->setMaxLength(4);
-    m_beaconGrid->setFixedWidth(58);
     m_beaconGrid->setAccessibleName(tr("WSPR grid locator"));
     m_beaconGrid->setAccessibleDescription(
         tr("Four-character Maidenhead locator, for example CN85"));
@@ -403,10 +619,8 @@ PskReporterMapDialog::PskReporterMapDialog(AudioEngine* audioEngine,
     // beacon field that was not.
     m_beaconGrid->setText(
         pskSettings().value("beaconGrid").toString().trimmed().toUpper());
-    beaconRow->addWidget(m_beaconGrid);
 
-    beaconRow->addWidget(new QLabel(tr("Band:"), beaconBox));
-    m_beaconBand = new QComboBox(beaconBox);
+    m_beaconBand = new GuardedComboBox(beaconBox);
     struct WsprBand {
         const char* name;
         double dialMhz;
@@ -424,10 +638,8 @@ PskReporterMapDialog::PskReporterMapDialog(AudioEngine* audioEngine,
     m_beaconBand->setAccessibleName(tr("WSPR band"));
     m_beaconBand->setAccessibleDescription(
         tr("Selects the standard WSPR USB dial frequency"));
-    beaconRow->addWidget(m_beaconBand);
 
-    beaconRow->addWidget(new QLabel(tr("Reported:"), beaconBox));
-    m_beaconPower = new QComboBox(beaconBox);
+    m_beaconPower = new GuardedComboBox(beaconBox);
     for (const int dbm : {0, 3, 7, 10, 13, 17, 20, 23, 27, 30,
                           33, 37, 40, 43, 47, 50, 53, 57, 60}) {
         m_beaconPower->addItem(tr("%1 dBm").arg(dbm), dbm);
@@ -440,9 +652,7 @@ PskReporterMapDialog::PskReporterMapDialog(AudioEngine* audioEngine,
         tr("Transmitter power encoded in the WSPR message; this does not change RF power"));
     m_beaconPower->setToolTip(
         tr("Power encoded in the message; this does not change the radio's RF power"));
-    beaconRow->addWidget(m_beaconPower);
 
-    beaconRow->addWidget(new QLabel(tr("Offset:"), beaconBox));
     m_beaconTone = new QDoubleSpinBox(beaconBox);
     m_beaconTone->setRange(1400.0, 1600.0);
     m_beaconTone->setDecimals(1);
@@ -469,27 +679,73 @@ PskReporterMapDialog::PskReporterMapDialog(AudioEngine* audioEngine,
     m_beaconTone->setToolTip(
         tr("Audio offset above the selected USB dial frequency, at the lowest "
            "of the four tones — the same convention as WSJT-X"));
-    beaconRow->addWidget(m_beaconTone);
 
-    beaconRow->addWidget(new QLabel(tr("Level:"), beaconBox));
     m_beaconLevel = new QSpinBox(beaconBox);
     // Hard-coded at -20 dBFS before this. WSJT-X generates at full scale and
     // attenuates digitally through its Pwr slider (SoundOutput::setAttenuation);
     // the equivalent knob here had no UI at all, so an operator who came out
     // underdriven had nothing to reach for. Ceiling of -3 rather than 0 keeps a
     // little headroom ahead of the radio's own TX chain.
+    //
+    // THE DEFAULT IS BACKEND-DEPENDENT, AND SO IS THE STORED VALUE. Both
+    // decisions live in PskBeaconLevelPolicy.h, evaluated rather than copied,
+    // so psk_beacon_level_policy_test pins the expressions this runs.
+    //
+    // While Hl2TxDsp's ALC still has its makeup half, this spinbox is very
+    // nearly inert on the HL2: processAudioBlock() normalises anything from
+    // roughly -45 dBFS up to alcTargetPeak (0.85, -1.412 dBFS) onto that
+    // target, for any audio submitted with clientLeveled=false -- which the
+    // WSPR pump is, since AudioEngine::startWsprPump() reaches
+    // feedDaxTxAudioInternal() with markExternalSource=false. So -20 and -3
+    // go out at the SAME level today, and the knob added for the underdriven
+    // operator cannot help them. Measured: -1.412 dBFS on air from a
+    // -20.000 dBFS stimulus.
+    //
+    // Once the makeup half goes and the ALC becomes reduction-only, the
+    // setting is real -- the level set here is the level transmitted -- and
+    // -20 dBFS becomes 18.577 dB of unattended shortfall, measured against
+    // two binaries differing by that one change with the same stimulus and a
+    // txraw control at 0.000 dB.
+    //
+    // THE LEVEL IS PER RADIO, not per installation. It is a property of the
+    // transmit chain the audio is about to enter, so a station with an HL2 and
+    // a Flex needs two answers and gets them: the value lives in the
+    // radio-scoped WsprBeacon feature document (AGENTS.md, "Radio-Scoped
+    // Feature Documents"), keyed by RadioModel::settingsScope(). It used to be
+    // one app-global key, which meant a level chosen on the Flex silently
+    // became the HL2's unattended beacon level and nothing could correct it.
+    //
+    // RE-EVALUATED ON EVERY CAPABILITY CHANGE, not once at construction. The
+    // dialog is built on first open and cached for the session
+    // (MainWindow_DigitalModes.cpp, a QPointer with no WA_DeleteOnClose), so an
+    // operator who opens PSK Reporter BEFORE connecting would otherwise keep
+    // the disconnected answer for the whole session with nothing on screen to
+    // say so. applyBeaconLevel() therefore rides
+    // RadioModel::connectionStateChanged -- which carries the identity change,
+    // so it re-reads the new radio's stored level -- and
+    // TransmitModel::hostModulationChanged for a capability republish inside a
+    // live session. The second is not enough on its own: it is a change signal,
+    // and connecting a Flex leaves hostModulation() false either side, so it
+    // emits nothing. Caught by driving the demo radio, not by reading it.
+    //
+    // It deliberately does NOT ride RadioModel::callsignChanged, which is what
+    // updateBeaconDefaults() runs on: that signal is emitted only by the
+    // operator editing their own callsign, by the Flex `info` reply, and by a
+    // RadioDelta carrying a callsign. No HL2, sim or ANAN backend ever supplies
+    // one, so connecting an HL2 with this window open fired nothing at all --
+    // reproduced offscreen against the demo radio, where the beacon callsign
+    // field stayed empty on connect while a connect-then-open run filled it
+    // (PR #5651 review).
     m_beaconLevel->setRange(-60, -3);
     m_beaconLevel->setSingleStep(1);
     m_beaconLevel->setSuffix(tr(" dBFS"));
-    m_beaconLevel->setValue(
-        pskSettings().value("beaconLevelDbFs").toInt(-20));
+    applyBeaconLevel();
     m_beaconLevel->setAccessibleName(tr("WSPR transmit audio level"));
     m_beaconLevel->setAccessibleDescription(
         tr("Generated audio level in decibels full scale, from -60 to -3"));
     m_beaconLevel->setToolTip(
         tr("Level of the generated audio into the transmit chain; raise it if "
            "the radio comes out underdriven"));
-    beaconRow->addWidget(m_beaconLevel);
 
     m_beaconButton = new QPushButton(tr("Transmit once"), beaconBox);
     m_beaconButton->setAutoDefault(false);
@@ -497,15 +753,286 @@ PskReporterMapDialog::PskReporterMapDialog(AudioEngine* audioEngine,
     m_beaconButton->setAccessibleName(tr("Transmit one WSPR beacon"));
     m_beaconButton->setAccessibleDescription(
         tr("Arms one transmission for the next even UTC minute"));
-    beaconRow->addWidget(m_beaconButton);
+    registerTxKeyingAction(m_beaconButton, [this](const std::shared_ptr<TxController>& controller,
+            const QString& action, const QString&) -> TxKeyingAction::Prepared {
+        if (action != QLatin1String("click") || !controller->belongsTo(m_radioModel)
+            || m_beaconTransition) {
+            return {};
+        }
+        if (m_beaconArmed || m_beaconTransmitting) {
+            if (!controller->sameController(m_beaconController)) {
+                return {};
+            }
+            const TxCoordinator::Request original = m_beaconRequest;
+            return [this, original] {
+                if (original.sameRequest(m_beaconRequest)) {
+                    stopBeacon(tr("Cancelled"), BeaconStopOutcome::Cancelled);
+                }
+            };
+        }
+        const TxCoordinator::Request input =
+            controller->captureProgram(TxController::Activity::Mox).request();
+        return [this, controller, input] { scheduleBeacon(controller, input); };
+    });
 
-    m_beaconStatus = new QLabel(tr("Idle"), beaconBox);
-    m_beaconStatus->setMinimumWidth(155);
+    m_beaconStatusDot = new QLabel(beaconBox);
+    m_beaconStatusDot->setObjectName(QStringLiteral("pskReporterBeaconStatusDot"));
+    m_beaconStatusDot->setFixedSize(8, 8);
+    m_beaconStatus = new QLabel(beaconBox);
+    m_beaconStatus->setWordWrap(true);
     m_beaconStatus->setAccessibleName(tr("WSPR beacon status"));
-    beaconRow->addWidget(m_beaconStatus, 1);
-    root->addWidget(beaconBox);
+    setBeaconStatus(tr("Idle"), "color.accent.success");
+
+    // A scrollable control column can grow without increasing the window's
+    // minimum height or taking vertical space away from either map renderer.
+    auto* splitter = new QSplitter(Qt::Horizontal, bodyWidget());
+    splitter->setObjectName(QStringLiteral("pskReporterSplitter"));
+    splitter->setChildrenCollapsible(false);
+    auto* sidebar = new QScrollArea(splitter);
+    sidebar->setObjectName(QStringLiteral("pskReporterSidebar"));
+    sidebar->setAccessibleName(tr("PSK Reporter controls"));
+    sidebar->setWidgetResizable(true);
+    sidebar->setFrameShape(QFrame::NoFrame);
+    sidebar->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    sidebar->setMinimumWidth(270);
+    auto* controls = new QWidget(sidebar);
+    auto* sections = new QVBoxLayout(controls);
+    sections->setContentsMargins(0, 0, 6, 0);
+    sections->setSpacing(6);
+
+    const auto formFor = [](QGroupBox* box) {
+        auto* form = new QFormLayout(box);
+        form->setContentsMargins(6, 6, 6, 6);
+        form->setHorizontalSpacing(6);
+        form->setVerticalSpacing(4);
+        form->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
+        form->setRowWrapPolicy(QFormLayout::WrapLongRows);
+        return form;
+    };
+    QFormLayout* beaconForm = formFor(beaconBox);
+    beaconForm->addRow(tr("TX call:"), m_beaconCallsign);
+    beaconForm->addRow(tr("Grid:"), m_beaconGrid);
+    beaconForm->addRow(tr("Band:"), m_beaconBand);
+    beaconForm->addRow(tr("Reported:"), m_beaconPower);
+    beaconForm->addRow(tr("Offset:"), m_beaconTone);
+    beaconForm->addRow(tr("Level:"), m_beaconLevel);
+    auto* beaconActionRow = new QHBoxLayout();
+    beaconActionRow->setSpacing(6);
+    beaconActionRow->addWidget(m_beaconButton);
+    beaconActionRow->addStretch(1);
+    beaconActionRow->addWidget(m_beaconStatusDot, 0, Qt::AlignVCenter);
+    beaconActionRow->addWidget(m_beaconStatus, 1);
+    beaconForm->addRow(beaconActionRow);
+    sections->addWidget(beaconBox);
+
+    QFormLayout* reportsForm = formFor(reportsBox);
+    reportsForm->addRow(tr("Call:"), m_queryCallsign);
+    reportsForm->addRow(tr("Band:"), m_bandCombo);
+    reportsForm->addRow(tr("Mode:"), m_modeCombo);
+    reportsForm->addRow(tr("Lookback:"), m_lookbackCombo);
+    reportsForm->addRow(m_allCallsignsCheck);
+    reportsForm->addRow(m_activeMonitorsCheck);
+    sections->addWidget(reportsBox);
+
+    auto* mapBox = new QGroupBox(tr("Map"), controls);
+    QFormLayout* mapForm = formFor(mapBox);
+    mapForm->addRow(m_globeCheck);
+    mapForm->addRow(m_pathsCheck);
+    mapForm->addRow(m_terminatorCheck);
+    auto* basemapDarkTint = new QCheckBox(tr("Dark map"), mapBox);
+    basemapDarkTint->setObjectName(QStringLiteral("pskReporterBasemapDarkTint"));
+    basemapDarkTint->setAccessibleName(tr("Dark basemap"));
+    basemapDarkTint->setAccessibleDescription(tr(
+        "Remap the map to dark backgrounds and light printed labels. "
+        "City lights, radar, and reports keep their colours."));
+    basemapDarkTint->setToolTip(basemapDarkTint->accessibleDescription());
+    basemapDarkTint->setChecked(
+        pskSettings().value("basemapDarkTintEnabled").toBool(false));
+    mapForm->addRow(basemapDarkTint);
+    auto* basemapBrightness = new GuardedSlider(Qt::Horizontal, mapBox);
+    basemapBrightness->setObjectName(QStringLiteral("pskReporterBasemapBrightness"));
+    basemapBrightness->setAccessibleName(tr("Map brightness"));
+    basemapBrightness->setAccessibleDescription(tr(
+        "Dim the basemap without dimming city lights, radar, or reports. "
+        "This does not change the actual day/night boundary."));
+    basemapBrightness->setToolTip(basemapBrightness->accessibleDescription());
+    basemapBrightness->setRange(20, 100);
+    basemapBrightness->setFocusPolicy(Qt::StrongFocus);
+    basemapBrightness->setValue(std::clamp(
+        pskSettings().value("basemapBrightness").toInt(100), 20, 100));
+    auto* basemapValue = new QLabel(tr("%1%").arg(basemapBrightness->value()), mapBox);
+    auto* basemapRow = new QHBoxLayout();
+    basemapRow->addWidget(basemapBrightness, 1);
+    basemapRow->addWidget(basemapValue);
+    auto* basemapLabel = new QLabel(tr("Map brightness:"), mapBox);
+    basemapLabel->setBuddy(basemapBrightness);
+    mapForm->addRow(basemapLabel, basemapRow);
+    sections->addWidget(mapBox);
+
+    const auto sliderRow = [](QSlider* slider, QLabel* value) {
+        auto* row = new QHBoxLayout();
+        row->setSpacing(4);
+        slider->setMinimumWidth(70);
+        row->addWidget(slider, 1);
+        row->addWidget(value);
+        return row;
+    };
+    auto* lightsBox = new QGroupBox(tr("City lights"), controls);
+    QFormLayout* lightsForm = formFor(lightsBox);
+    lightsForm->addRow(m_cityLightsCheck);
+    lightsForm->addRow(lightsLabel, sliderRow(m_cityLightsBrightness, lightsValue));
+    lightsForm->addRow(faintLabel, sliderRow(m_cityLightsFaintLights, faintValue));
+    lightsForm->addRow(warmthLabel, sliderRow(m_cityLightsWarmth, warmthValue));
+    sections->addWidget(lightsBox);
+
+    auto* radarBox = new QGroupBox(tr("Weather precipitation"), controls);
+    QFormLayout* radarForm = formFor(radarBox);
+    radarForm->addRow(m_weatherRadarCheck);
+    radarForm->addRow(m_radarRegionChecks[3]);
+    for (int i = 0; i < 3; ++i) { radarForm->addRow(m_radarRegionChecks[i]); }
+    auto* radarInfoButton = new QToolButton(radarBox);
+    radarInfoButton->setObjectName(QStringLiteral("pskReporterRadarInfo"));
+    radarInfoButton->setText(tr("Sources && licenses"));
+    radarInfoButton->setAccessibleName(tr("Weather sources, licenses and product details"));
+    radarInfoButton->setCheckable(true);
+    radarInfoButton->setAutoRaise(true);
+    radarInfoButton->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+    radarInfoButton->setArrowType(Qt::RightArrow);
+    auto* radarInfo = new QWidget(radarBox);
+    radarInfo->setObjectName(QStringLiteral("pskReporterRadarInfoPanel"));
+    auto* radarInfoLayout = new QVBoxLayout(radarInfo);
+    radarInfoLayout->setContentsMargins(0, 0, 0, 0);
+    radarInfoLayout->setSpacing(4);
+    auto* radarCredits = new QLabel(tr("Weather data: <a href=\"https://librewxr.net/\">LibreWXR</a> · "
+        "<a href=\"https://creativecommons.org/licenses/by/4.0/\">CC BY 4.0</a>. "
+        "Italian Radar-DPC imagery: <a href=\"https://creativecommons.org/licenses/by-sa/4.0/\">CC BY-SA 4.0</a>. "
+        "Images are reprojected, resized and composited for this map."), radarInfo);
+    radarCredits->setObjectName(QStringLiteral("pskReporterRadarCredits"));
+    radarCredits->setAccessibleName(tr("LibreWXR sources and licenses"));
+    radarCredits->setOpenExternalLinks(true);
+    radarCredits->setWordWrap(true);
+    radarCredits->setToolTip(tr("Weather data via LibreWXR (librewxr.net). Sources: NOAA/NCEP/NESDIS, IEM, "
+        "ECCC, EUMETNET OPERA, Radar-DPC, MARN/SNET, CWA, JMA, MET Malaysia and PAGASA. "
+        "Models: NOAA, ECCC, DMI, DWD, Météo-France, SMN, JMA and ECMWF via Open-Meteo. "
+        "CC BY 4.0; tiles containing Radar-DPC data are CC BY-SA 4.0. See the linked source list."));
+    radarInfoLayout->addWidget(radarCredits);
+    auto* globalCredits = new QLabel(tr(
+        "LibreWXR contributors: NOAA/NCEP/NESDIS; Iowa Environmental Mesonet; ECCC/MSC; "
+        "EUMETNET OPERA; Radar-DPC; MARN/SNET; Central Weather Administration, Taiwan; "
+        "Japan Meteorological Agency; © Jabatan Meteorologi Malaysia / METMalaysia; PAGASA / DOST. "
+        "Precipitation data from NOAA Enterprise Rain Rate (RRQPE). "
+        "Models: NOAA, ECCC, DMI, DWD, Météo-France, SMN Argentina, JMA and ECMWF via Open-Meteo. "
+        "<a href=\"https://librewxr.net/#data-sources\">Full source list and provider licenses</a>."), radarInfo);
+    globalCredits->setObjectName(QStringLiteral("pskReporterGlobalCredits"));
+    globalCredits->setOpenExternalLinks(true);
+    globalCredits->setWordWrap(true);
+    radarInfoLayout->addWidget(globalCredits);
+    auto* regionalCredits = new QLabel(tr(
+        "Regional backups: NOAA/NWS (public domain); "
+        "<a href=\"https://open.canada.ca/en/open-government-licence-canada\">ECCC/MSC (Open Government Licence – Canada)</a>; "
+        "EUMETNET OPERA (<a href=\"https://creativecommons.org/licenses/by/4.0/\">CC BY 4.0</a>)."), radarInfo);
+    regionalCredits->setObjectName(QStringLiteral("pskReporterRegionalCredits"));
+    regionalCredits->setOpenExternalLinks(true);
+    regionalCredits->setWordWrap(true);
+    radarInfoLayout->addWidget(regionalCredits);
+    auto* mapCredits = new QLabel(tr(
+        "Map: © <a href=\"https://www.openstreetmap.org/copyright\">OpenStreetMap contributors (ODbL)</a>. "
+        "City lights: NASA/GSFC, 2016. Radar sites: NOAA/NWS and EUMETNET OPERA; "
+        "shading shows nominal range, not current availability."), radarInfo);
+    mapCredits->setObjectName(QStringLiteral("pskReporterMapCredits"));
+    mapCredits->setOpenExternalLinks(true);
+    mapCredits->setWordWrap(true);
+    radarInfoLayout->addWidget(mapCredits);
+    radarInfoLayout->addWidget(m_radarProductLabel);
+    radarInfo->hide();
+    connect(radarInfoButton, &QToolButton::toggled, radarInfo,
+        [radarInfoButton, radarInfo](bool expanded) {
+            radarInfoButton->setArrowType(expanded ? Qt::DownArrow : Qt::RightArrow);
+            radarInfo->setVisible(expanded);
+        });
+    radarForm->addRow(radarInfoButton);
+    radarForm->addRow(radarInfo);
+    auto* radarStatus = new QLabel(radarBox);
+    radarStatus->setObjectName(QStringLiteral("pskReporterRadarProviderStatus"));
+    radarStatus->setAccessibleName(tr("Weather provider availability"));
+    radarStatus->setWordWrap(true);
+    radarStatus->hide();
+    radarForm->addRow(radarStatus);
+    radarForm->addRow(m_radarCoverageCheck);
+    auto* coverageStatus = new QLabel(radarBox);
+    coverageStatus->setObjectName(QStringLiteral("pskReporterRadarCoverageStatus"));
+    coverageStatus->setAccessibleName(tr("Radar coverage status"));
+    coverageStatus->setWordWrap(true);
+    radarForm->addRow(coverageStatus);
+    auto* legendRow = new QHBoxLayout();
+    legendRow->setSpacing(8);
+    legendRow->addWidget(m_radarLegendCheck);
+    legendRow->addWidget(m_radarLegendTopCheck);
+    radarForm->addRow(legendRow);
+    auto* playbackRow = new QHBoxLayout();
+    playbackRow->setSpacing(4);
+    playbackRow->addWidget(m_weatherRadarPlayButton);
+    playbackRow->addWidget(m_weatherRadarHistoryCombo, 1);
+    radarForm->addRow(tr("History:"), playbackRow);
+    radarForm->addRow(radarSpeedLabel,
+                      sliderRow(m_weatherRadarSpeedSlider, m_weatherRadarSpeedValue));
+    radarForm->addRow(m_weatherRadarFrameLabel);
+    sections->addWidget(radarBox);
+    sections->addStretch(1);
+    sidebar->setWidget(controls);
+
+    auto* wheelGuard = new SidebarValueWheelGuard(sidebar);
+    for (QWidget* control : QList<QWidget*>{m_beaconTone, m_beaconLevel, basemapBrightness,
+             m_cityLightsBrightness, m_cityLightsFaintLights, m_cityLightsWarmth,
+             m_weatherRadarSpeedSlider}) {
+        wheelGuard->guard(control);
+    }
+
+    for (QComboBox* combo : {m_bandCombo, m_modeCombo, m_lookbackCombo,
+                            m_beaconBand, m_beaconPower, m_weatherRadarHistoryCombo}) {
+        applyComboStyle(combo);
+    }
+    // Creation order differs from display order; keep keyboard navigation
+    // following the sidebar from the beacon down through the overlays.
+    const QList<QWidget*> tabOrder = {
+        m_beaconCallsign, m_beaconGrid, m_beaconBand, m_beaconPower,
+        m_beaconTone, m_beaconLevel, m_beaconButton, m_queryCallsign,
+        m_bandCombo, m_modeCombo, m_lookbackCombo, m_allCallsignsCheck,
+        m_activeMonitorsCheck, m_globeCheck, m_pathsCheck, m_terminatorCheck, basemapDarkTint, basemapBrightness,
+        m_cityLightsCheck, m_cityLightsBrightness, m_cityLightsFaintLights,
+        m_cityLightsWarmth, m_weatherRadarCheck, m_radarRegionChecks[3], m_radarRegionChecks[0], m_radarRegionChecks[1], m_radarRegionChecks[2], m_radarCoverageCheck, m_radarLegendCheck, m_radarLegendTopCheck, m_weatherRadarPlayButton,
+        m_weatherRadarHistoryCombo, m_weatherRadarSpeedSlider};
+    for (int i = 1; i < tabOrder.size(); ++i) {
+        QWidget::setTabOrder(tabOrder[i - 1], tabOrder[i]);
+    }
+
+    auto* mapPanel = new QWidget(splitter);
+    mapPanel->setMinimumWidth(320);
+    auto* mapLayout = new QVBoxLayout(mapPanel);
+    mapLayout->setContentsMargins(0, 0, 0, 0);
+    mapLayout->setSpacing(4);
+    m_dxLabel->setWordWrap(true);
+    m_dxLabel->hide();
+    splitter->setStretchFactor(0, 0);
+    splitter->setStretchFactor(1, 1);
+    splitter->setSizes({300, 900});
+    root->addWidget(splitter, 1);
 
     m_mapView = new MapDisplayWidget(bodyWidget());
+    m_mapView->setDetailedAttributionVisible(false);
+    connect(m_mapView, &MapDisplayWidget::radarCoverageStatusChanged, coverageStatus, &QLabel::setText);
+    m_mapView->setBasemapDarkEnabled(basemapDarkTint->isChecked());
+    connect(basemapDarkTint, &QCheckBox::toggled, this, [this](bool enabled) {
+        m_mapView->setBasemapDarkEnabled(enabled);
+        writePskSetting("basemapDarkTintEnabled", enabled);
+    });
+    m_mapView->setBasemapBrightness(basemapBrightness->value());
+    connect(basemapBrightness, &QSlider::valueChanged, this,
+            [this, basemapValue](int value) {
+                basemapValue->setText(tr("%1%").arg(value));
+                m_mapView->setBasemapBrightness(value);
+                writePskSetting("basemapBrightness", value);
+            });
     m_mapView->setObjectName(QStringLiteral("pskReporterMap"));
     m_mapView->setAccessibleName(tr("PSK Reporter map"));
     connect(m_mapView, &MapDisplayWidget::globeAvailabilityChanged,
@@ -525,21 +1052,112 @@ PskReporterMapDialog::PskReporterMapDialog(AudioEngine* audioEngine,
         : MapDisplayWidget::ProjectionMode::Flat);
     m_mapView->setPathsVisible(m_pathsCheck->isChecked());
     m_mapView->setDayNightTerminatorVisible(m_terminatorCheck->isChecked());
-    {
-        QVector<QPair<QString, QColor>> legend;
-        for (const char* m : { "FT8", "FT4", "WSPR", "JS8", "CW", "PSK",
-                               "RTTY", "SSB", "Other" }) {
-            legend.append({ QString::fromLatin1(m),
-                            modeColor(QString::fromLatin1(m)) });
-        }
-        m_mapView->setLegend(legend);
-    }
-    root->addWidget(m_mapView, 1);
+    m_mapView->setCityLightsWarmth(m_cityLightsWarmth->value());
+    connect(m_cityLightsWarmth, &QSlider::valueChanged, this, [this](int percent) {
+        writePskSetting("cityLightsWarmth", percent);
+        m_mapView->setCityLightsWarmth(percent);
+    });
+    m_mapView->setCityLightsFaintLights(m_cityLightsFaintLights->value());
+    connect(m_cityLightsFaintLights, &QSlider::valueChanged, this, [this](int percent) {
+        writePskSetting("cityLightsFaintLights", percent);
+        m_mapView->setCityLightsFaintLights(percent);
+    });
+    m_mapView->setCityLightsBrightness(m_cityLightsBrightness->value());
+    m_mapView->setCityLightsVisible(m_cityLightsCheck->isChecked());
+    connect(m_cityLightsCheck, &QCheckBox::toggled, this, [this](bool on) {
+        writePskSetting("showCityLights", on);
+        m_mapView->setCityLightsVisible(on);
+    });
+    connect(m_cityLightsBrightness, &QSlider::valueChanged, this, [this](int percent) {
+        writePskSetting("cityLightsBrightness", percent);
+        m_mapView->setCityLightsBrightness(percent);
+    });
+    mapLayout->addWidget(m_mapView, 1);
 
     connect(m_pathsCheck, &QCheckBox::toggled, this, [this](bool on) {
         writePskSetting("showPaths", on);
         m_mapView->setPathsVisible(on);
     });
+    auto updateRadarRegions = [this] {
+        int mask = 0;
+        for (int i = 0; i < 4; ++i) { if (m_radarRegionChecks[i]->isChecked()) { mask |= 1 << i; } }
+        m_mapView->setWeatherRadarRegions(mask);
+        m_radarProductLabel->setText(WeatherRadarSource::composite(mask).productDescription());
+        m_weatherRadarPlayButton->setEnabled(mask != 0 && m_weatherRadarCheck->isChecked());
+        writePskSetting("weatherRadarRegions", mask & 7);
+        writePskSetting("useLibreWxr", (mask & 8) != 0);
+    };
+    for (QCheckBox* region : m_radarRegionChecks) {
+        connect(region, &QCheckBox::toggled, this, updateRadarRegions);
+    }
+    updateRadarRegions();
+    connect(m_mapView, &MapDisplayWidget::radarProviderStatusChanged, radarStatus, [radarStatus](const QString& status) {
+        radarStatus->setText(status);
+        radarStatus->setVisible(!status.isEmpty());
+    });
+    m_mapView->setRadarLegendVisible(m_radarLegendCheck->isChecked());
+    m_mapView->setRadarLegendAtTop(m_radarLegendTopCheck->isChecked());
+    connect(m_radarLegendCheck, &QCheckBox::toggled, this, [this](bool on) {
+        writePskSetting("showRadarLegend", on);
+        m_mapView->setRadarLegendVisible(on);
+    });
+    connect(m_radarLegendTopCheck, &QCheckBox::toggled, this, [this](bool atTop) {
+        writePskSetting("radarLegendAtTop", atTop);
+        m_mapView->setRadarLegendAtTop(atTop);
+    });
+    connect(m_radarCoverageCheck, &QCheckBox::toggled, this, [this](bool on) {
+        writePskSetting("showRadarCoverage", on);
+        m_mapView->setRadarCoverageVisible(on && isVisible());
+    });
+    connect(m_weatherRadarCheck, &QCheckBox::toggled, this,
+            [this](bool on) {
+                writePskSetting("showWeatherRadar", on);
+                m_weatherRadarPlayButton->setEnabled(on && (m_radarRegionChecks[0]->isChecked()
+                    || m_radarRegionChecks[1]->isChecked() || m_radarRegionChecks[2]->isChecked() || m_radarRegionChecks[3]->isChecked()));
+                m_weatherRadarHistoryCombo->setEnabled(on);
+                m_weatherRadarSpeedSlider->setEnabled(on);
+                m_weatherRadarFrameLabel->setEnabled(on);
+                if (!on) {
+                    m_weatherRadarTimelineLoading = false;
+                    m_weatherRadarPlayButton->setText(
+                        QStringLiteral("▶"));
+                    const WeatherRadarFramePresentation presentation =
+                        weatherRadarFramePresentation({}, true);
+                    m_weatherRadarFrameLabel->setText(presentation.text);
+                    m_weatherRadarFrameLabel->setToolTip(presentation.tooltip);
+                }
+                if (isVisible()) {
+                    m_mapView->setWeatherRadarVisible(on);
+                }
+            });
+    connect(m_weatherRadarPlayButton, &QToolButton::clicked, this,
+            [this] {
+                if (m_mapView->weatherRadarAnimating()
+                    || m_weatherRadarTimelineLoading) {
+                    m_mapView->stopWeatherRadarAnimation();
+                    return;
+                }
+                m_mapView->startWeatherRadarAnimation(
+                    m_weatherRadarHistoryCombo->currentData().toInt());
+            });
+    connect(m_weatherRadarHistoryCombo,
+            qOverload<int>(&QComboBox::currentIndexChanged), this,
+            [this](int) {
+                const int hours =
+                    m_weatherRadarHistoryCombo->currentData().toInt();
+                writePskSetting("weatherRadarHistoryHours", hours);
+                if (m_mapView->weatherRadarAnimating()
+                    || m_weatherRadarTimelineLoading) {
+                    m_mapView->startWeatherRadarAnimation(hours);
+                }
+            });
+    connect(m_weatherRadarSpeedSlider, &QSlider::valueChanged,
+            this, [this](int speed) {
+                m_weatherRadarSpeedValue->setText(
+                    QStringLiteral("%1×").arg(speed / 100.0, 0, 'f', 2));
+                writePskSetting("weatherRadarSpeedPercent", speed);
+                m_mapView->setWeatherRadarPlaybackSpeed(speed);
+            });
     connect(m_globeCheck, &QCheckBox::toggled, this, [this](bool on) {
         writePskSetting("showGlobe", on);
         m_mapView->setProjectionMode(on
@@ -586,41 +1204,128 @@ PskReporterMapDialog::PskReporterMapDialog(AudioEngine* audioEngine,
                     QToolTip::showText(QCursor::pos(), marker.clickInfo);
                 }
             });
+    connect(m_mapView,
+            &MapDisplayWidget::weatherRadarTimelineLoadingChanged,
+            this, [this](bool loading) {
+                m_weatherRadarTimelineLoading = loading;
+                if (loading) {
+                    m_weatherRadarPlayButton->setText(
+                        QStringLiteral("■"));
+                    m_weatherRadarPlayButton->setAccessibleName(
+                        tr("Cancel loading historical weather radar"));
+                    m_weatherRadarFrameLabel->setText(tr("Loading"));
+                } else {
+                    m_weatherRadarPlayButton->setText(
+                        m_mapView->weatherRadarAnimating()
+                            ? QStringLiteral("❚❚")
+                            : QStringLiteral("▶"));
+                    m_weatherRadarPlayButton->setAccessibleName(
+                        m_mapView->weatherRadarAnimating()
+                            ? tr("Pause historical weather radar")
+                            : tr("Play historical weather radar"));
+                }
+            });
+    connect(m_mapView,
+            &MapDisplayWidget::weatherRadarAnimationStateChanged,
+            this, [this](bool playing) {
+                m_weatherRadarPlayButton->setText(
+                    playing ? QStringLiteral("❚❚")
+                            : QStringLiteral("▶"));
+                m_weatherRadarPlayButton->setAccessibleName(
+                    playing ? tr("Pause historical weather radar")
+                            : tr("Play historical weather radar"));
+            });
+    connect(m_mapView, &MapDisplayWidget::weatherRadarFrameChanged,
+            this, [this](const QDateTime& frameTime, bool live) {
+                const WeatherRadarFramePresentation presentation =
+                    weatherRadarFramePresentation(frameTime, live);
+                m_weatherRadarFrameLabel->setText(presentation.text);
+                m_weatherRadarFrameLabel->setToolTip(presentation.tooltip + (live ? QString{} : tr(
+                    "\nRegional playback uses original observations at or before this clock, up to 10 minutes earlier; missing regions stay transparent.")));
+            });
+    connect(m_mapView, &MapDisplayWidget::weatherRadarAnimationError,
+            this, [this](const QString& message) {
+                m_weatherRadarTimelineLoading = false;
+                m_weatherRadarPlayButton->setText(QStringLiteral("▶"));
+                m_weatherRadarFrameLabel->setText(tr("Unavailable"));
+                m_weatherRadarFrameLabel->setToolTip(message);
+                QToolTip::showText(
+                    m_weatherRadarPlayButton->mapToGlobal(
+                        QPoint(0, m_weatherRadarPlayButton->height())),
+                    message, m_weatherRadarPlayButton);
+            });
 
-    // Bottom row: forecasted HF band conditions justified to the bottom-left
-    // (reusing the propagation-forecast N0NBH/hamqsl day/night ratings), with
-    // the transient update-status text pushed to the bottom-right corner.
+    // Keep one footer within the map pane. Band conditions belong to the
+    // sidebar; attribution remains on the map in both projections.
+    auto* statusBar = new QFrame(mapPanel);
+    statusBar->setObjectName(QStringLiteral("pskReporterStatusBar"));
+    statusBar->setAccessibleName(tr("PSK Reporter status"));
+    ThemeManager::instance().applyStyleSheet(statusBar, QStringLiteral(
+        "QFrame#pskReporterStatusBar { background: {{color.background.1}};"
+        " border-top: 1px solid {{color.border.subtle}}; }"));
+    auto* footerLayout = new QVBoxLayout(statusBar);
+    footerLayout->setContentsMargins(6, 4, 6, 4);
+    footerLayout->setSpacing(3);
     auto* bottomBar = new QHBoxLayout();
     bottomBar->setSpacing(6);
-    // Band-condition pills snap to the bottom-left corner — no leading title
-    // label (it was near-invisible in dark themes and pushed the pills off
-    // the corner); day/night context lives in each pill's tooltip.
+    footerLayout->addLayout(bottomBar);
+    auto* legendLabel = new QLabel(statusBar);
+    legendLabel->setObjectName(QStringLiteral("pskReporterModeLegend"));
+    legendLabel->setAccessibleName(tr("Report mode colours"));
+    legendLabel->setWordWrap(true);
+    QStringList legendEntries;
+    for (const char* mode : { "FT8", "FT4", "WSPR", "JS8", "CW", "PSK",
+                              "RTTY", "SSB", "Other" }) {
+        const QString name = QString::fromLatin1(mode);
+        legendEntries.append(QStringLiteral(
+            "<span style='white-space:nowrap'><span style='color:%1'>●</span>&nbsp;%2</span>")
+            .arg(modeColor(name).name(), name));
+    }
+    legendLabel->setText(legendEntries.join(QStringLiteral("  ")));
+    ThemeManager::instance().applyStyleSheet(legendLabel, QStringLiteral(
+        "QLabel { color: {{color.text.secondary}}; background: transparent; font-size: 10px; }"));
+    bottomBar->addWidget(legendLabel, 1);
+
     if (m_propForecast != nullptr) {
+        auto* conditionsBox = new QGroupBox(tr("Band conditions"), controls);
+        QFormLayout* conditionsForm = formFor(conditionsBox);
         for (int i = 0; i < 4; ++i) {
-            auto* pill = new QLabel(QString::fromLatin1(kBandGroupLabels[i]),
-                                    bodyWidget());
+            auto* pill = new QLabel(conditionsBox);
             pill->setAlignment(Qt::AlignCenter);
             m_bandCondPills[i] = pill;
-            bottomBar->addWidget(pill);
+            conditionsForm->addRow(pill);
         }
+        // Immediately after Reports, before the map/overlay configuration.
+        sections->insertWidget(2, conditionsBox);
         connect(m_propForecast, &PropForecastClient::detailUpdated, this,
                 [this] { updateBandConditions(); });
     }
-    bottomBar->addStretch(1);
     m_statusLabel = new QLabel(bodyWidget());
-    m_statusLabel->setStyleSheet(QStringLiteral("color: palette(mid);"));
+    m_statusLabel->setObjectName(QStringLiteral("pskReporterUpdateStatus"));
+    m_statusLabel->setAccessibleName(tr("PSK Reporter update status"));
+    ThemeManager::instance().applyStyleSheet(m_statusLabel, QStringLiteral(
+        "QLabel { color: {{color.text.secondary}}; background: transparent; }"));
     m_statusLabel->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
-    bottomBar->addWidget(m_statusLabel);
+    m_statusLabel->setWordWrap(true);
+    // The stats row sits on the footer surface like its neighbours, so it must
+    // opt out of the app-wide QWidget background.0 fill rather than paint its
+    // own rectangle through background.1.
+    ThemeManager::instance().applyStyleSheet(m_dxLabel, QStringLiteral(
+        "QLabel { background: transparent; }"));
+    footerLayout->addWidget(m_dxLabel);
+    footerLayout->addWidget(m_statusLabel);
     // Connection indicator pinned to the bottom-right corner: "MQTT"/"HTTP"
     // plus a status bullet (green=connected w/ data, yellow=no data,
     // red=no good connection).
     m_connLabel = new QLabel(bodyWidget());
     m_connLabel->setObjectName(QStringLiteral("pskReporterConnection"));
+    ThemeManager::instance().applyStyleSheet(m_connLabel, QStringLiteral(
+        "QLabel { background: transparent; }"));
     m_connLabel->setAccessibleName(tr("PSK Reporter connection status"));
     m_connLabel->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
     bottomBar->addSpacing(10);
     bottomBar->addWidget(m_connLabel);
-    root->addLayout(bottomBar);
+    mapLayout->addWidget(statusBar);
 
     connect(m_client, &PskReporterClient::connectionStateChanged,
             this, &PskReporterMapDialog::updateConnectionIndicator);
@@ -714,7 +1419,7 @@ PskReporterMapDialog::PskReporterMapDialog(AudioEngine* audioEngine,
                 m_statusLabel->setText(tr("All Callsigns: %1").arg(status));
             });
     connect(m_beaconButton, &QPushButton::clicked,
-            this, &PskReporterMapDialog::scheduleBeacon);
+            this, [this] { scheduleBeacon(); });
     connect(m_beaconPower, &QComboBox::currentIndexChanged, this, [this] {
         writePskSetting("beaconPowerDbm", m_beaconPower->currentData().toInt());
     });
@@ -736,7 +1441,7 @@ PskReporterMapDialog::PskReporterMapDialog(AudioEngine* audioEngine,
         // encode the same string. (PR #4537 review.)
         double lat = 0.0, lon = 0.0;
         if (!MaidenheadLocator::toLatLon(grid, lat, lon)) {
-            m_beaconStatus->setText(
+            setBeaconStatus(
                 tr("“%1” is not a valid grid locator — expected 4 characters "
                    "like DM06").arg(grid));
             // Put the last good value back rather than leaving an unusable
@@ -793,10 +1498,10 @@ PskReporterMapDialog::PskReporterMapDialog(AudioEngine* audioEngine,
     // reach here and tune the radio back at itself.
     connect(m_beaconBand, &QComboBox::currentIndexChanged, this, [this] {
         const double dialMhz = m_beaconBand->currentData().toDouble();
-        m_beaconStatus->setText(
+        setBeaconStatus(
             tr("%1 · %2 MHz USB on transmit")
                 .arg(m_beaconBand->currentText())
-                .arg(dialMhz, 0, 'f', 6));
+                .arg(dialMhz, 0, 'f', 6), "color.text.secondary");
         if (m_beaconArmed || m_radioModel == nullptr) {
             return;   // armed: applyBeaconBand() owns the dial until it stops
         }
@@ -810,8 +1515,8 @@ PskReporterMapDialog::PskReporterMapDialog(AudioEngine* audioEngine,
         }
         slice->tuneAndRecenter(dialMhz);
     });
-    connect(m_beaconLevel, &QSpinBox::valueChanged, this, [](int dbfs) {
-        writePskSetting("beaconLevelDbFs", dbfs);
+    connect(m_beaconLevel, &QSpinBox::valueChanged, this, [this](int dbfs) {
+        writeBeaconLevelDbFs(dbfs);
     });
     connect(m_beaconTone, &QDoubleSpinBox::valueChanged, this, [](double hz) {
         writePskSetting("beaconToneHz", hz);
@@ -849,8 +1554,141 @@ PskReporterMapDialog::PskReporterMapDialog(AudioEngine* audioEngine,
                 stopBeacon(tr("Stopped: transmitter unkeyed"));
             }
         });
+        // BOTH signals, and neither is redundant.
+        //
+        // connectionStateChanged is the one that carries the radio IDENTITY
+        // change, so it is what re-reads the newly connected radio's stored
+        // level. RadioModel installs publishCapabilities() on this same signal
+        // in its constructor, before any dialog exists, so capabilities are
+        // already published by the time this runs.
+        //
+        // hostModulationChanged is a CHANGE signal and fires only when the
+        // answer flips, which is not every connect: TransmitModel returns early
+        // when the value is unchanged, so connecting a Flex (false -> false)
+        // emits nothing at all. It is here for the case connectionStateChanged
+        // cannot see -- a capability republish within a live session, which
+        // RadioModel also drives from a backend capability update.
+        //
+        // applyBeaconLevel() is a pure recomputation, so being called twice on
+        // one edge costs a settings read and changes nothing.
+        connect(m_radioModel, &RadioModel::connectionStateChanged, this,
+                [this] { applyBeaconLevel(); });
+        connect(&m_radioModel->transmitModel(),
+                &TransmitModel::hostModulationChanged, this, [this] {
+            applyBeaconLevel();
+        });
     }
     updateBeaconDefaults();
+}
+
+// The beacon level's stored value for the CONNECTED radio, if it has one.
+//
+// Returns nothing when this radio has never had one set -- which is the
+// condition for a default to apply, and is not the same as "the store is
+// empty". A present document with no levelDbFs field is a radio whose level
+// was never chosen; a present document WITH one is a deliberate choice.
+//
+// Claim-and-freeze, per scope, on first access (AGENTS.md, "Settings
+// Migration"): the first time a given radio is seen, the legacy app-global
+// PskReporter.beaconLevelDbFs is imported into that radio's document if the
+// policy says it described an on-air level there. The document's existence is
+// the migration marker, so an operator who cleared their level does not have it
+// resurrected, and the legacy key is never rewritten -- it stays frozen as the
+// downgrade snapshot.
+std::optional<int> PskReporterMapDialog::storedBeaconLevelDbFs(bool hostModulates)
+{
+    if (m_radioModel == nullptr) {
+        return std::nullopt;
+    }
+    const RadioSettingsScope scope = m_radioModel->settingsScope();
+    // No identity yet means the family-wide row, and writing one of those by
+    // accident is how a per-radio setting becomes everyone's (BandStackSettings
+    // guards the same way). With nothing to key a level to there is also
+    // nothing stored, so the capability default answers.
+    if (!scope.isValid() || !scope.hasRadioIdentity()) {
+        return std::nullopt;
+    }
+
+    AppSettings::FeatureReadStatus status = AppSettings::FeatureReadStatus::Missing;
+    const QJsonObject doc = scope.featureExact(kBeaconFeature, nullptr, &status);
+    if (status == AppSettings::FeatureReadStatus::Present) {
+        const QJsonValue level = doc.value(QStringLiteral("levelDbFs"));
+        // isDouble() rather than toInt(): a field that is null, a string from a
+        // hand-edited store, or anything a future schema leaves in an
+        // unexpected shape must fall through to the default rather than resolve
+        // to 0 and clamp to -3, which is the LOUDEST value this control can
+        // express, on an unattended 111.6 s transmission.
+        return level.isDouble() ? std::optional<int>(level.toInt())
+                                : std::nullopt;
+    }
+    if (status != AppSettings::FeatureReadStatus::Missing) {
+        // Corrupt or unavailable: retryable, so do not claim over it and do not
+        // memoize anything. The default answers for this session.
+        return std::nullopt;
+    }
+
+    // Missing: this radio has never been claimed.
+    if (!legacyBeaconLevelAppliesTo(hostModulates)) {
+        return std::nullopt;
+    }
+    const QJsonValue legacy = pskSettings().value(QStringLiteral("beaconLevelDbFs"));
+    if (!legacy.isDouble()) {
+        return std::nullopt;
+    }
+    const int claimed = legacy.toInt();
+    if (!scope.setFeature(kBeaconFeature, kBeaconSchemaVersion,
+                          QJsonObject{{QStringLiteral("levelDbFs"), claimed}})) {
+        // A refused write that the UI repaints over is the worst failure shape.
+        // The value is still correct for this session; it just will not persist.
+        qWarning() << "PskReporter: WSPR beacon level claim did not persist for"
+                   << scope.family() << scope.radioId();
+    }
+    return claimed;
+}
+
+// Persist a deliberate level for the connected radio.
+void PskReporterMapDialog::writeBeaconLevelDbFs(int dbfs)
+{
+    if (m_radioModel == nullptr) {
+        return;
+    }
+    const RadioSettingsScope scope = m_radioModel->settingsScope();
+    if (!scope.isValid() || !scope.hasRadioIdentity()) {
+        // Setting a level with no radio attached is a session-only value: there
+        // is no radio to key it to, and the beacon cannot key without one
+        // anyway. Refusing beats writing the family-wide row.
+        return;
+    }
+    QJsonObject doc = scope.featureExact(kBeaconFeature);
+    doc.insert(QStringLiteral("levelDbFs"), dbfs);
+    if (!scope.setFeature(kBeaconFeature, kBeaconSchemaVersion, doc)) {
+        qWarning() << "PskReporter: WSPR beacon level write did not persist for"
+                   << scope.family() << scope.radioId();
+    }
+}
+
+// The level this radio should show, applied whenever that answer can change.
+//
+// ONLY WHEN THE OPERATOR HAS NOT SET ONE FOR THIS RADIO. A stored value is a
+// deliberate choice and is never overridden here -- that is the difference
+// between a default and a policy.
+void PskReporterMapDialog::applyBeaconLevel()
+{
+    if (m_beaconLevel == nullptr) {
+        return;
+    }
+    const bool hostModulates =
+        m_radioModel && m_radioModel->transmitModel().hostModulation();
+    const std::optional<int> wanted = beaconLevelToApplyDbFs(
+        m_beaconArmed, storedBeaconLevelDbFs(hostModulates), hostModulates);
+    if (!wanted.has_value()) {
+        return;
+    }
+    // Blocked, because setValue() would otherwise fire valueChanged and write
+    // the very setting whose absence is the condition for being here -- one
+    // connect would turn a default into a stored choice the operator never made.
+    const QSignalBlocker blocker(m_beaconLevel);
+    m_beaconLevel->setValue(*wanted);
 }
 
 void PskReporterMapDialog::updateBeaconDefaults()
@@ -955,11 +1793,19 @@ bool PskReporterMapDialog::applyBeaconBand()
     // WSPR offset, so the request is advisory there rather than dropped-and-
     // wrong. The generated tone is a single 4-FSK carrier ~6 Hz wide; nothing
     // about the frame depends on the narrower passband being applied.
+    const QPointer<PskReporterMapDialog> self(this);
+    const QPointer<SliceModel> sliceGuard(slice);
+    const TxCoordinator::Request original = m_beaconRequest;
+    const auto current = [&] { return self && sliceGuard && original.valid()
+        && original.sameRequest(self->m_beaconRequest); };
     slice->tuneAndRecenter(m_beaconBand->currentData().toDouble());
+    if (!current()) { return false; }
     slice->setMode(QStringLiteral("DIGU"));
+    if (!current()) { return false; }
     slice->setFilterWidth(1200, 1800);
+    if (!current()) { return false; }
     tx.setTxFilter(1200, 1800);
-    return true;
+    return current();
 }
 
 // Re-send mode and both passbands, and report whether this is still the
@@ -1035,11 +1881,19 @@ bool PskReporterMapDialog::reassertBeaconChannel(QString* reason)
         qCInfo(lcGui) << "WSPR: TX slice was" << slice->mode()
                       << "at key time, not DIGU — re-asserting";
     }
+    const QPointer<PskReporterMapDialog> self(this);
+    const QPointer<SliceModel> sliceGuard(slice);
+    const TxCoordinator::Request original = m_beaconRequest;
+    const auto current = [&] { return self && sliceGuard && original.valid()
+        && original.sameRequest(self->m_beaconRequest); };
     slice->setMode(QStringLiteral("DIGU"));
+    if (!current()) { return false; }
     slice->setFilterWidth(1200, 1800);
+    if (!current()) { return false; }
     tx.setTxFilter(1200, 1800);
+    if (!current()) { return false; }
     borrowBeaconSpeechChain(tx);
-    return true;
+    return current();
 }
 
 // Switch off the station audio processing that would misshape the frame, and
@@ -1080,12 +1934,19 @@ void PskReporterMapDialog::borrowBeaconSpeechChain(TransmitModel& tx)
     m_beaconPrevVox = tx.voxEnable();
     m_beaconPrevTxEq = eq.txEnabled();
     m_beaconTxChainSaved = true;
+    const QPointer<PskReporterMapDialog> self(this);
+    const TxCoordinator::Request original = m_beaconRequest;
+    const auto current = [&] { return self && self->m_radioModel && original.valid()
+        && original.sameRequest(self->m_beaconRequest); };
     if (m_beaconPrevSpeechProc) tx.setSpeechProcessorEnable(false);
+    if (!current()) { return; }
     if (m_beaconPrevCompander) tx.setDexp(false);
+    if (!current()) { return; }
     // VOX is not audio shaping — it is a second thing that can key and unkey
     // the transmitter. Ours is a 111.6 s frame held by an explicit MOX, and a
     // VOX release part-way through would truncate it.
     if (m_beaconPrevVox) tx.setVoxEnable(false);
+    if (!current()) { return; }
     if (m_beaconPrevTxEq) eq.setTxEnabled(false);
 }
 
@@ -1093,41 +1954,74 @@ void PskReporterMapDialog::borrowBeaconSpeechChain(TransmitModel& tx)
 // passband and the speech chain. The slice frequency and mode are deliberately
 // left on the WSPR channel — the operator asked to go there — but none of this
 // is slice state.
-void PskReporterMapDialog::restoreBorrowedTxState()
+void PskReporterMapDialog::restoreBorrowedTxState(const TxCoordinator::Request& original)
 {
-    if (m_radioModel == nullptr) {
-        m_beaconTxFilterSaved = false;
-        m_beaconTxChainSaved = false;
-        return;
-    }
-    TransmitModel& tx = m_radioModel->transmitModel();
-    if (m_beaconTxFilterSaved) {
-        m_beaconTxFilterSaved = false;
-        tx.setTxFilter(m_beaconPrevTxFilterLow, m_beaconPrevTxFilterHigh);
-    }
-    if (m_beaconTxChainSaved) {
-        m_beaconTxChainSaved = false;
+    const bool filter = std::exchange(m_beaconTxFilterSaved, false);
+    const bool chain = std::exchange(m_beaconTxChainSaved, false);
+    const int low = m_beaconPrevTxFilterLow;
+    const int high = m_beaconPrevTxFilterHigh;
+    const bool speech = m_beaconPrevSpeechProc;
+    const bool compander = m_beaconPrevCompander;
+    const bool vox = m_beaconPrevVox;
+    const bool eq = m_beaconPrevTxEq;
+    const QPointer<PskReporterMapDialog> self(this);
+    const QPointer<RadioModel> radio = m_radioModel;
+    const auto current = [&] { return self && radio && original.originalSessionCurrent(); };
+    if (!current()) { return; }
+    if (filter) { radio->transmitModel().setTxFilter(low, high); }
+    if (!current()) { return; }
+    if (chain) {
         // Only what was actually on gets switched back on, so a restore can
         // never enable something the operator had off.
-        if (m_beaconPrevSpeechProc) tx.setSpeechProcessorEnable(true);
-        if (m_beaconPrevCompander) tx.setDexp(true);
-        if (m_beaconPrevVox) tx.setVoxEnable(true);
-        if (m_beaconPrevTxEq) m_radioModel->equalizerModel().setTxEnabled(true);
+        if (speech) { radio->transmitModel().setSpeechProcessorEnable(true); }
+        if (!current()) { return; }
+        if (compander) { radio->transmitModel().setDexp(true); }
+        if (!current()) { return; }
+        if (vox) { radio->transmitModel().setVoxEnable(true); }
+        if (!current()) { return; }
+        if (eq) { radio->equalizerModel().setTxEnabled(true); }
     }
 }
 
 void PskReporterMapDialog::scheduleBeacon()
 {
-    if (m_beaconArmed || m_beaconTransmitting) {
-        stopBeacon(tr("Cancelled"));
+    if (m_beaconTransition) {
         return;
     }
+    if (m_beaconArmed || m_beaconTransmitting) {
+        stopBeacon(tr("Cancelled"), BeaconStopOutcome::Cancelled);
+        return;
+    }
+    if (m_radioModel) {
+        const auto controller = std::make_shared<TxController>(
+            m_radioModel, TransmitModel::PttSource::Wspr);
+        scheduleBeacon(controller, controller->captureProgram(TxController::Activity::Mox).request());
+    }
+}
+
+PskReporterMapDialog::~PskReporterMapDialog()
+{
+    if (m_beaconRequest.valid() || m_beaconArmed || m_beaconTransmitting) {
+        stopBeacon({}, BeaconStopOutcome::Cancelled);
+    }
+}
+
+void PskReporterMapDialog::scheduleBeacon(const std::shared_ptr<TxController>& controller,
+                                         TxCoordinator::Request request)
+{
+    if (m_beaconTransition || m_beaconArmed || m_beaconTransmitting || !request.valid()
+        || !controller || !controller->belongsTo(m_radioModel)) {
+        return;
+    }
+    const QPointer<PskReporterMapDialog> self(this);
+    m_beaconTransition = true;
+    const auto transition = qScopeGuard([self] { if (self) { self->m_beaconTransition = false; } });
     if (m_audioEngine == nullptr || m_radioModel == nullptr) {
-        m_beaconStatus->setText(tr("TX audio is unavailable"));
+        setBeaconStatus(tr("TX audio is unavailable"));
         return;
     }
     if (m_audioEngine->isRadeMode()) {
-        m_beaconStatus->setText(tr("Stop RADE first"));
+        setBeaconStatus(tr("Stop RADE first"));
         return;
     }
 
@@ -1135,26 +2029,26 @@ void PskReporterMapDialog::scheduleBeacon()
     // the Flex-shaped preconditions below. An RX-only backend (RFC §6,
     // capabilities().canTransmit == false) has no transmitter to check.
     if (!m_radioModel->backendCapabilities().canTransmit) {
-        m_beaconStatus->setText(tr("This radio cannot transmit"));
+        setBeaconStatus(tr("This radio cannot transmit"));
         return;
     }
     TransmitModel& tx = m_radioModel->transmitModel();
     if (tx.isTransmitting() || tx.isTuning()) {
-        m_beaconStatus->setText(tr("Transmitter is already in use"));
+        setBeaconStatus(tr("Transmitter is already in use"));
         return;
     }
     SliceModel* slice = m_radioModel->txSlice();
     if (slice == nullptr) {
-        m_beaconStatus->setText(tr("No TX slice is selected"));
+        setBeaconStatus(tr("No TX slice is selected"));
         return;
     }
     if (slice->isLocked()) {
-        m_beaconStatus->setText(tr("TX slice is locked"));
+        setBeaconStatus(tr("TX slice is locked"));
         return;
     }
     const int timeoutMs = tx.interlockTimeout();
     if (!WsprBeacon::isInterlockTimeoutSufficient(timeoutMs)) {
-        m_beaconStatus->setText(
+        setBeaconStatus(
             tr("Radio TX timeout is %1 s; set Radio Setup → TX → Timeout to at least 120 s")
                 .arg(timeoutMs / 1000));
         return;
@@ -1164,19 +2058,36 @@ void PskReporterMapDialog::scheduleBeacon()
         m_beaconCallsign->text(), m_beaconGrid->text(),
         m_beaconPower->currentData().toInt());
     if (!encoded) {
-        m_beaconStatus->setText(encoded.error);
+        setBeaconStatus(encoded.error);
         return;
     }
 
     // Reassert the visible band/mode/filter selection in case another client
     // changed the TX slice after the operator selected the WSPR band.
-    if (!applyBeaconBand()) {
-        m_beaconStatus->setText(tr("WSPR TX audio route is unavailable"));
+    m_beaconController = controller;
+    m_beaconRequest = request;
+    const bool bandReady = applyBeaconBand();
+    if (!self) {
         return;
     }
-    if (!m_radioModel->prepareWsprTransmit()) {
-        restoreBorrowedTxState();  // applyBeaconBand() already borrowed it
-        m_beaconStatus->setText(tr("WSPR TX audio route is unavailable"));
+    if (!request.valid() || !request.sameRequest(m_beaconRequest)) {
+        stopBeacon(tr("Transmit request was blocked"));
+        return;
+    }
+    if (!bandReady) {
+        stopBeacon(tr("WSPR TX audio route is unavailable"));
+        return;
+    }
+    const bool routeReady = m_radioModel->prepareWsprTransmit(request);
+    if (!self) {
+        return;
+    }
+    if (!request.valid() || !request.sameRequest(m_beaconRequest)) {
+        stopBeacon(tr("Transmit request was blocked"));
+        return;
+    }
+    if (!routeReady) {
+        stopBeacon(tr("WSPR TX audio route is unavailable"));
         return;
     }
 
@@ -1192,8 +2103,30 @@ void PskReporterMapDialog::scheduleBeacon()
     updateBeaconState();
 }
 
-void PskReporterMapDialog::stopBeacon(const QString& status)
+void PskReporterMapDialog::setBeaconStatus(const QString& text, const char* colourToken)
 {
+    m_beaconStatus->setText(text);
+    m_beaconStatus->setToolTip(text);
+    const QString token = QString::fromLatin1(colourToken);
+    if (m_beaconStatusDot->property("statusColourToken").toString() != token) {
+        m_beaconStatusDot->setProperty("statusColourToken", token);
+        ThemeManager::instance().applyStyleSheet(m_beaconStatusDot,
+            QStringLiteral("QLabel { background: {{%1}}; border: none; border-radius: 4px; }")
+                .arg(token));
+    }
+}
+
+void PskReporterMapDialog::stopBeacon(const QString& status, BeaconStopOutcome outcome)
+{
+    const QPointer<PskReporterMapDialog> self(this);
+    const bool wasTransitioning = std::exchange(m_beaconTransition, true);
+    const auto transition = qScopeGuard([self, wasTransitioning] {
+        if (self) { self->m_beaconTransition = wasTransitioning; }
+    });
+    const TxCoordinator::Request request = std::exchange(m_beaconRequest, {});
+    const std::shared_ptr<TxController> controller = std::exchange(m_beaconController, {});
+    const uint64_t generation = std::exchange(m_beaconGeneration, 0);
+    const TxCoordinator::Context context = std::exchange(m_beaconContext, {});
     const bool ownedTransmit = m_beaconTransmitting;
     m_beaconTimer->stop();
     m_beaconArmed = false;
@@ -1202,25 +2135,52 @@ void PskReporterMapDialog::stopBeacon(const QString& status)
     m_beaconStopDeadlineMs = 0;
     m_beaconDeferrals = 0;
     m_beaconDeferReason.clear();
-    if (ownedTransmit && m_radioModel != nullptr
-        && m_radioModel->transmitModel().isTransmitting()) {
-        m_radioModel->transmitModel().requestPttOff(
-            TransmitModel::PttSource::Wspr);
-    }
     if (m_radioModel != nullptr) {
-        m_radioModel->releaseWsprTransmit();
+        if (ownedTransmit) {
+            m_radioModel->requestProducerPttOff(request, TransmitModel::PttSource::Wspr);
+        } else {
+            m_radioModel->abortProducerPtt(request, TransmitModel::PttSource::Wspr);
+        }
     }
-    restoreBorrowedTxState();
+    if (!self) {
+        return;
+    }
+    if (m_radioModel && controller && controller->originalSessionCurrent()) {
+        m_radioModel->releaseWsprTransmit(request);
+    }
+    if (!self) {
+        return;
+    }
+    if (controller && controller->originalSessionCurrent()) {
+        restoreBorrowedTxState(request);
+    } else {
+        m_beaconTxFilterSaved = false;
+        m_beaconTxChainSaved = false;
+    }
+    if (!self) {
+        return;
+    }
     // Keep the generator active (and therefore holding silence) through the
     // local unkey command so an external DAX source cannot leak into the tail.
     if (m_audioEngine != nullptr && m_audioEngine->wsprBeacon() != nullptr) {
-        m_audioEngine->wsprBeacon()->stop();
-        QMetaObject::invokeMethod(
-            m_audioEngine, &AudioEngine::stopWsprPump, Qt::QueuedConnection);
+        m_audioEngine->wsprBeacon()->stopIfCurrent(generation);
+        QMetaObject::invokeMethod(m_audioEngine, [audio = m_audioEngine, context] {
+            if (audio) { audio->stopWsprPumpIfCurrent(context); }
+        }, Qt::QueuedConnection);
     }
     m_beaconButton->setText(tr("Transmit once"));
     setBeaconControlsEnabled(true);
-    m_beaconStatus->setText(status);
+    switch (outcome) {
+    case BeaconStopOutcome::Completed:
+        setBeaconStatus(status, "color.accent.success");
+        break;
+    case BeaconStopOutcome::Cancelled:
+        setBeaconStatus(status, "color.text.secondary");
+        break;
+    case BeaconStopOutcome::Interrupted:
+        setBeaconStatus(status, "color.accent.warning");
+        break;
+    }
 }
 
 void PskReporterMapDialog::deferBeaconToNextSlot(const QString& reason)
@@ -1240,8 +2200,12 @@ void PskReporterMapDialog::deferBeaconToNextSlot(const QString& reason)
 
 void PskReporterMapDialog::updateBeaconState()
 {
-    if (!m_beaconArmed || m_audioEngine == nullptr
+    if (m_beaconTransition || !m_beaconArmed || m_audioEngine == nullptr
         || m_radioModel == nullptr) {
+        return;
+    }
+    if (!m_beaconRequest.valid()) {
+        stopBeacon(tr("Stopped: original TX request is no longer valid"));
         return;
     }
 
@@ -1260,21 +2224,21 @@ void PskReporterMapDialog::updateBeaconState()
             return;
         }
         if (beacon->isComplete()) {
-            stopBeacon(tr("Complete"));
+            stopBeacon(tr("Complete"), BeaconStopOutcome::Completed);
             return;
         }
         const int symbol = std::max(0, beacon->currentSymbol());
-        m_beaconStatus->setText(
+        setBeaconStatus(
             tr("Transmitting · symbol %1/%2")
                 .arg(std::min(symbol + 1, WsprBeacon::kSymbolCount))
-                .arg(WsprBeacon::kSymbolCount));
+                .arg(WsprBeacon::kSymbolCount), "color.highlight.tx");
         return;
     }
 
     const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
     const qint64 remainingMs = std::max<qint64>(0, m_beaconSlotMs - nowMs);
     if (remainingMs > 0) {
-        m_beaconStatus->setText(
+        setBeaconStatus(
             tr("%1 · starts in %2.%3 s")
                 .arg(m_beaconDeferReason.isEmpty() ? tr("Armed")
                                                    : m_beaconDeferReason)
@@ -1334,8 +2298,18 @@ void PskReporterMapDialog::updateBeaconState()
     }
 
     // Last look at the channel before the key. See reassertBeaconChannel().
+    const QPointer<PskReporterMapDialog> self(this);
+    const TxCoordinator::Request request = m_beaconRequest;
     QString channelProblem;
-    if (!reassertBeaconChannel(&channelProblem)) {
+    const bool channelReady = reassertBeaconChannel(&channelProblem);
+    if (!self) {
+        return;
+    }
+    if (!request.valid() || !request.sameRequest(m_beaconRequest)) {
+        stopBeacon(tr("Transmit request was blocked"));
+        return;
+    }
+    if (!channelReady) {
         stopBeacon(tr("Stopped: %1").arg(channelProblem));
         return;
     }
@@ -1370,19 +2344,23 @@ void PskReporterMapDialog::updateBeaconState()
     beacon->start(encoded.symbols, m_beaconTone->value(),
                   static_cast<float>(m_beaconLevel->value()),
                   preRollFrames, skipFrames);
-    QMetaObject::invokeMethod(
-        m_audioEngine, &AudioEngine::startWsprPump, Qt::QueuedConnection);
+    m_beaconGeneration = beacon->generation();
     m_beaconStopDeadlineMs = QDateTime::currentMSecsSinceEpoch() + 115000;
-    TransmitModel& tx = m_radioModel->transmitModel();
-    tx.requestPttOn(TransmitModel::PttSource::Wspr);
-    if (!tx.isTransmitting()) {
-        beacon->stop();
+    const bool keyed = m_radioModel->requestProducerPttOn(request, TransmitModel::PttSource::Wspr);
+    if (!self) {
+        return;
+    }
+    if (!keyed || !request.valid() || !request.sameRequest(m_beaconRequest)) {
         stopBeacon(tr("Transmit request was blocked"));
         return;
     }
+    m_beaconContext = m_radioModel->captureTxMedia(request);
+    QMetaObject::invokeMethod(m_audioEngine, [audio = m_audioEngine, context = m_beaconContext] {
+        if (audio) { audio->startWsprPump(context); }
+    }, Qt::QueuedConnection);
     m_beaconTransmitting = true;
     m_beaconButton->setText(tr("Stop"));
-    m_beaconStatus->setText(tr("Transmitting · pre-roll"));
+    setBeaconStatus(tr("Transmitting · pre-roll"), "color.highlight.tx");
 }
 
 // Where "home" is on the map. Without it the MapView has no origin, so it can
@@ -1872,6 +2850,7 @@ void PskReporterMapDialog::rebuildMarkers()
         }
     }
     m_dxLabel->setText(parts.join(QStringLiteral("  •  ")));
+    m_dxLabel->setVisible(!parts.isEmpty());
 
     // Data presence affects the connection bullet color.
     updateConnectionIndicator();
@@ -1906,6 +2885,10 @@ void PskReporterMapDialog::updateBandConditions()
 void PskReporterMapDialog::showEvent(QShowEvent* event)
 {
     PersistentDialog::showEvent(event);
+    m_mapView->setWeatherRadarVisible(m_weatherRadarCheck->isChecked());
+    m_mapView->setRadarCoverageVisible(m_radarCoverageCheck->isChecked());
+    m_mapView->setWeatherRadarPlaybackSpeed(
+        m_weatherRadarSpeedSlider->value());
     updateHomeFromRadio();
     if (m_propForecast != nullptr) {
         // Refresh the detailed forecast (band conditions) on open; the
@@ -1922,11 +2905,13 @@ void PskReporterMapDialog::showEvent(QShowEvent* event)
 void PskReporterMapDialog::closeEvent(QCloseEvent* event)
 {
     if (m_beaconArmed || m_beaconTransmitting) {
-        stopBeacon(tr("Stopped"));
+        stopBeacon(tr("Stopped"), BeaconStopOutcome::Cancelled);
     }
     // Stop hitting the network while the window is closed.
     m_client->stop();
     m_globalClient->stop();
+    m_mapView->setWeatherRadarVisible(false);
+    m_mapView->setRadarCoverageVisible(false);
     m_started = false;
     PersistentDialog::closeEvent(event);
 }

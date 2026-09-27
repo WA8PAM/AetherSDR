@@ -572,6 +572,9 @@ void MainWindow::setKiwiSdrVirtualAntennaForSliceInternal(int sliceId,
         setActiveSliceInternal(sliceId, false);
     }
 
+    // A Monitor TX hold's temporary mute must not become the "previous" Flex
+    // mute Kiwi restores on removal, or the receiver comes back silent. (#2242)
+    endSplitMonitorForSlice(sliceId, /*deferWrites=*/false);
     if (!m_kiwiSdrVirtualPreviousMute.contains(sliceId)) {
         m_kiwiSdrVirtualPreviousMute.insert(sliceId, slice->flexAudioMute());
     }
@@ -2005,10 +2008,10 @@ void MainWindow::wireKiwiSdr()
                 m_radioModel.transmitModel().cwPitch());
         });
         if (m_audio) {
-            connect(m_kiwiSdrManager, &KiwiSdrManager::decodedAudioReady,
+            connect(m_kiwiSdrManager, &KiwiSdrManager::pcmFrameReady,
                     m_audio, [audio = m_audio](const QString& id,
-                                                const QByteArray& pcm) {
-                audio->feedKiwiSdrAudioData(id, pcm);
+                                                const PcmFrame& pcm) {
+                audio->feedKiwiPcmFrame(id, pcm);
             }, Qt::QueuedConnection);
             connect(m_kiwiSdrManager, &KiwiSdrManager::audioSourceEnabledChanged,
                     m_audio, [audio = m_audio](const QString& id, bool enabled) {
@@ -2364,6 +2367,7 @@ void MainWindow::refreshKiwiSdrAppletReceivers()
             KiwiSdrReceiverStatus receiver;
             receiver.id = profile.id;
             receiver.name = m_kiwiSdrManager->displayName(profile.id);
+            receiver.family = profile.family;
             receiver.state = m_kiwiSdrManager->state(profile.id);
             receiver.detail = m_kiwiSdrManager->stateDetail(profile.id);
             if (receiver.state == KiwiSdrClient::State::Connected

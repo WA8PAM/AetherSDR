@@ -8,9 +8,12 @@
 #include <QStringList>
 #include <QVector>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <limits>
+#include <utility>
+#include <vector>
 
 using namespace AetherSDR;
 
@@ -59,6 +62,227 @@ MeterDef slcMeter(int index, int sliceIndex)
     def.low = -150.0;
     def.high = 20.0;
     return def;
+}
+
+// ---------------------------------------------------------------------------
+// #5852: the second receiver's S-meter.
+//
+// Hl2Backend::sliceMeterName publishes receiver N>0 as "SLC<N>:LEVEL", and
+// IRadioBackend::meterUpdate carries no sourceIndex field, so the index has to
+// survive the trip inside the id. Two joints, and the bug is that BOTH were
+// open: the name had no definition, and nothing carried the index even if it
+// had. Fixing either alone is worse than fixing neither —
+//
+//   * a definition whose SOURCE is the string "SLC1" is accepted and appears in
+//     allMeters(), but defineMeter() keys its per-slice cache on
+//     `source == "SLC"` exactly, so the cache gains no key and nothing fires.
+//     It looks fixed and changes nothing (testSlc1SourceNeverKeysTheSliceCache).
+//   * corrected definitions with the index left unsent resolve through
+//     findMeter()'s sourceIndex<0 match-any, which returns the FIRST matching
+//     definition — so every receiver's reading lands on the lowest one. That is
+//     a plausible wrong number replacing an honest absence, which is why the
+//     "must not reach receiver 0" half below is the assertion that matters.
+
+using SliceLevel = std::pair<int, float>;
+
+// The tests below record every sLevelChanged the model emits, so they can
+// assert on what did NOT arrive as well as on what did.
+bool sawSlice(const std::vector<SliceLevel>& seen, int slice)
+{
+    return std::any_of(seen.begin(), seen.end(),
+                       [slice](const SliceLevel& s) { return s.first == slice; });
+}
+
+void testSuffixedSliceMeterIdReachesItsOwnReceiver()
+{
+    MeterModel model;
+    // Exactly what Hl2Backend declares: receiver 0 keeps meter index 1 and
+    // sourceIndex 0; receiver 1 takes an index from the per-receiver band.
+    model.defineMeter(slcMeter(1, 0));
+    model.defineMeter(slcMeter(101, 1));
+
+    QObject ctx;
+    std::vector<SliceLevel> seen;
+    QObject::connect(&model, &MeterModel::sLevelChanged, &ctx,
+                     [&seen](int slice, float dbm) { seen.emplace_back(slice, dbm); });
+
+    QString source;
+    QString name;
+    int sourceIndex = -1;
+    const bool split = MeterModel::splitMeterId(QStringLiteral("SLC1:LEVEL"),
+                                                &source, &name, &sourceIndex);
+    report("SLC1:LEVEL splits into source SLC, name LEVEL and index 1",
+           split && source == QStringLiteral("SLC")
+               && name == QStringLiteral("LEVEL") && sourceIndex == 1);
+
+    const bool accepted = model.updateValueByName(source, name, -73.0f, sourceIndex);
+    report("the second receiver's level is accepted at all", accepted);
+    report("the second receiver's level reaches the second receiver",
+           seen.size() == 1 && seen.front().first == 1
+               && nearlyEqual(seen.front().second, -73.0f));
+    // The half that a "receiver 1 got something" test would pass without.
+    report("the second receiver's level never reaches the first",
+           !sawSlice(seen, 0));
+    report("the first receiver's meter holds no value from the second",
+           model.valueAgeMs(1) < 0);
+}
+
+void testBareSliceMeterIdStillReachesTheFirstReceiver()
+{
+    MeterModel model;
+    model.defineMeter(slcMeter(1, 0));
+    model.defineMeter(slcMeter(101, 1));
+
+    QObject ctx;
+    std::vector<SliceLevel> seen;
+    QObject::connect(&model, &MeterModel::sLevelChanged, &ctx,
+                     [&seen](int slice, float dbm) { seen.emplace_back(slice, dbm); });
+
+    QString source;
+    QString name;
+    int sourceIndex = 99;
+    const bool split = MeterModel::splitMeterId(QStringLiteral("SLC:LEVEL"),
+                                                &source, &name, &sourceIndex);
+    report("SLC:LEVEL keeps its bare source and asks for match-any",
+           split && source == QStringLiteral("SLC")
+               && name == QStringLiteral("LEVEL") && sourceIndex == -1);
+
+    model.updateValueByName(source, name, -101.0f, sourceIndex);
+    report("the bare name still reaches the first receiver",
+           seen.size() == 1 && seen.front().first == 0
+               && nearlyEqual(seen.front().second, -101.0f));
+    report("the bare name does not reach the second receiver",
+           !sawSlice(seen, 1));
+}
+
+void testUnsuffixedSourcesKeepMatchAnyResolution()
+{
+    // The regression this fix could have caused. Every single-instance meter
+    // sends a source with no digits and relies on match-any to find a
+    // definition whose sourceIndex is whatever the backend chose — 8 here,
+    // which is what a TX waveform meter carries. Stripping or defaulting that
+    // to 0 would strand it.
+    MeterModel model;
+    // Source "TX", not the helper's "TX-": this is the plain transmit meter
+    // Hl2Backend and IcomCivBackend publish, and its sourceIndex is 8 here so
+    // that match-any is doing real work rather than agreeing with a default.
+    MeterDef fwd = txMeter(2, QStringLiteral("FWDPWR"), QStringLiteral("Watts"), 8);
+    fwd.source = QStringLiteral("TX");
+    model.defineMeter(fwd);
+
+    QString source;
+    QString name;
+    int sourceIndex = 0;
+    const bool split = MeterModel::splitMeterId(QStringLiteral("TX:FWDPWR"),
+                                                &source, &name, &sourceIndex);
+    report("TX:FWDPWR is unchanged by the split and stays match-any",
+           split && source == QStringLiteral("TX")
+               && name == QStringLiteral("FWDPWR") && sourceIndex == -1);
+    // updateValueByName returns false for an undefined meter, so a true here IS
+    // the resolution: findMeter matched sourceIndex 8 from an id carrying none.
+    report("an indexless id still resolves a definition with a nonzero index",
+           model.updateValueByName(source, name, 5.0f, sourceIndex));
+    report("and the same id with a wrong explicit index would not",
+           !model.updateValueByName(source, name, 5.0f, 0));
+}
+
+void testSlc1SourceNeverKeysTheSliceCache()
+{
+    // Why "add a def for SLC1" is not the fix. The definition is accepted, the
+    // value is accepted, and the receiver is still not reachable.
+    MeterModel model;
+    MeterDef bad = slcMeter(101, 0);
+    bad.source = QStringLiteral("SLC1");
+    model.defineMeter(bad);
+
+    QObject ctx;
+    std::vector<SliceLevel> seen;
+    QObject::connect(&model, &MeterModel::sLevelChanged, &ctx,
+                     [&seen](int slice, float dbm) { seen.emplace_back(slice, dbm); });
+
+    report("a definition whose source is SLC1 is accepted",
+           model.findMeter(QStringLiteral("SLC1"), QStringLiteral("LEVEL")) == 101);
+    report("and its value is accepted",
+           model.updateValueByName(QStringLiteral("SLC1"), QStringLiteral("LEVEL"), -73.0f));
+    report("but no receiver ever hears it",
+           seen.empty());
+}
+
+void testMeterIdSplitEdges()
+{
+    QString source;
+    QString name;
+    int sourceIndex = -1;
+
+    report("a multi-digit suffix parses whole",
+           MeterModel::splitMeterId(QStringLiteral("SLC12:LEVEL"), &source, &name, &sourceIndex)
+               && source == QStringLiteral("SLC") && sourceIndex == 12);
+
+    sourceIndex = -1;
+    report("digits in the NAME are left alone",
+           MeterModel::splitMeterId(QStringLiteral("RAD:+13.8A"), &source, &name, &sourceIndex)
+               && source == QStringLiteral("RAD")
+               && name == QStringLiteral("+13.8A") && sourceIndex == -1);
+
+    sourceIndex = -1;
+    report("an all-digit source is not a source with an index",
+           MeterModel::splitMeterId(QStringLiteral("12:LEVEL"), &source, &name, &sourceIndex)
+               && source == QStringLiteral("12") && sourceIndex == -1);
+
+    report("an id with no colon is refused",
+           !MeterModel::splitMeterId(QStringLiteral("SWR"), &source, &name, &sourceIndex));
+    report("an id with an empty source is refused",
+           !MeterModel::splitMeterId(QStringLiteral(":LEVEL"), &source, &name, &sourceIndex));
+    report("an id with an empty name is refused",
+           !MeterModel::splitMeterId(QStringLiteral("SLC:"), &source, &name, &sourceIndex));
+}
+
+// WITHDRAWING A METER THAT WAS NEVER DEFINED MUST DO NOTHING AT ALL.
+//
+// Backends withdraw defensively, over a set of receivers rather than over a set
+// of declarations: Hl2Backend's trim loop withdraws for every receiver at or
+// past the failure without knowing which of their chains got far enough to
+// declare anything. So removeMeter() is reached with indices nothing defines,
+// and it is reached that way on the ordinary paths, not only in error handling.
+//
+// Both halves below are consequences a consumer can see, not internal state.
+// The signal is the one the amplifier panel, the telemetry adapter and the DSP
+// applets hear; the manifest context is what decides which slice the NEXT TX
+// waveform definition belongs to, and removeMeter() resets it unconditionally,
+// so a stray withdrawal landing between an SLC block and its TX block moved
+// that block to the source-index fallback.
+void testWithdrawingAnUndeclaredMeterChangesNothing()
+{
+    MeterModel model;
+    int removals = 0;
+    QObject::connect(&model, &MeterModel::meterRemoved, &model,
+                     [&removals](int) { ++removals; });
+
+    model.defineMeter(slcMeter(12, 0));
+    model.removeMeter(4242);   // never declared, by any backend, ever
+    report("withdrawing an undeclared meter announces nothing", removals == 0);
+    report("withdrawing an undeclared meter leaves the declared ones alone",
+           model.findMeter(QStringLiteral("SLC"), QStringLiteral("LEVEL"), 0) == 12);
+
+    // The context half. Same shape as testMixedSourceTxWaveformMetersUseManifest
+    // SliceContext: slice 1's TX block declares itself with source index 9, which
+    // no arithmetic maps to slice 1 -- only the SLC block in front of it does.
+    // The stray withdrawal sits exactly where a defensive teardown would put it.
+    model.defineMeter(txMeter(20, "COMPPEAK", "dB", 0));
+    model.defineMeter(slcMeter(30, 1));
+    model.removeMeter(4242);
+    model.defineMeter(txMeter(38, "COMPPEAK", "dB", 9));
+
+    model.setActiveTxSlice(1);
+    model.updateValues({38}, {rawDb(8.0f)});
+    report("a stray withdrawal does not break the SLC -> TX manifest context",
+           model.hasCompressionMeterValue() && nearlyEqual(model.compPeak(), 8.0f));
+
+    // And the guard has not made removeMeter() deaf to real withdrawals.
+    model.removeMeter(30);
+    report("a declared meter is still withdrawn, and still announced",
+           removals == 1
+               && model.findMeter(QStringLiteral("SLC"), QStringLiteral("LEVEL"), 1) < 0);
 }
 
 // These tests keep active-slice routing and direct COMPPEAK coverage. They
@@ -541,6 +765,196 @@ void testTxMeterRedefinitionsPreserveTheirSlice()
                implicit ? nearlyEqual(model.swAlc(), -10)
                         : nearlyEqual(model.swAlc(), -20));
     }
+}
+
+// TX:ALCGAIN — how hard the ALC is working, which is the quantity TX:ALC does
+// NOT carry. Hl2TxDsp::processAudioBlock says why in its own words: a post-ALC
+// level meter "sits pinned near the target by definition and tells the operator
+// nothing — it reports the ALC's success, not their input level."
+//
+// Routed exactly like ALC and COMPPEAK, because a gain is a property of ONE
+// transmitter and a radio may publish a TX waveform block per active slice. The
+// difference from swAlc is the conversion: there is none. TX:ALC accepts dBFS
+// or Percent because Icom reports a percentage of its own full scale; nothing
+// in the tree reports a GAIN in anything but dB, so a mapping here would be
+// inventing a second unit to be wrong about.
+void testAlcGainIsRoutedAndConvertedByNobody()
+{
+    MeterModel model;
+    report("ALC gain starts at unity with no sample behind it",
+           nearlyEqual(model.alcGainDb(), 0.0f) && !model.hasAlcGainValue());
+
+    model.defineMeter(slcMeter(10, 0));
+    model.defineMeter(txMeter(21, "ALCGAIN", "dB", 8));
+    model.setActiveTxSlice(0);
+
+    float emitted = 999.0f;
+    int emissions = 0;
+    QObject::connect(&model, &MeterModel::alcGainChanged, [&](float db) {
+        emitted = db;
+        ++emissions;
+    });
+
+    model.updateValues({21}, {rawDb(18.5f)});
+    report("an ALCGAIN sample reaches the accessor and the signal unconverted",
+           nearlyEqual(model.alcGainDb(), 18.5f) && nearlyEqual(emitted, 18.5f)
+               && emissions == 1 && model.hasAlcGainValue());
+
+    // Reduction is the other half of the same meter, and it is what an operator
+    // driving the chain too hard needs to see.
+    model.updateValues({21}, {rawDb(-6.0f)});
+    report("a NEGATIVE ALC gain is carried, not floored",
+           nearlyEqual(model.alcGainDb(), -6.0f) && emissions == 2);
+
+    // 0 dB IS A READING — the ALC is holding at unity — so it must be
+    // distinguishable from "nothing has ever been fed". That is the same
+    // distinction hasSupplyVoltage() and hasCompressionMeterValue() draw, and
+    // for the same reason: without it the initialiser renders as a measurement.
+    model.updateValues({21}, {rawDb(0.0f)});
+    report("unity gain is a value, not a silence",
+           nearlyEqual(model.alcGainDb(), 0.0f) && model.hasAlcGainValue()
+               && emissions == 3);
+}
+
+// Both reset paths, plus undefine. A gain must never outlive the meter it
+// describes: a stranded +30 dB on a gauge after a slice change or a disconnect
+// is precisely the stuck-needle reading a meter inventory cannot tell from a
+// live one.
+void testAlcGainClearsOnEveryPathThatInvalidatesIt()
+{
+    // Path 1 — the active TX slice moves to a transmitter this reading does not
+    // describe.
+    {
+        MeterModel model;
+        model.defineMeter(slcMeter(10, 0));
+        model.defineMeter(txMeter(21, "ALCGAIN", "dB", 8));
+        model.defineMeter(slcMeter(30, 1));
+        model.defineMeter(txMeter(41, "ALCGAIN", "dB", 9));
+        model.setActiveTxSlice(0);
+        model.updateValues({21}, {rawDb(12.0f)});
+
+        int emissions = 0;
+        QObject::connect(&model, &MeterModel::alcGainChanged,
+                         [&](float) { ++emissions; });
+        model.setActiveTxSlice(1);
+        report("a TX slice change clears the ALC gain and says so",
+               nearlyEqual(model.alcGainDb(), 0.0f) && !model.hasAlcGainValue()
+                   && emissions == 1);
+        // THE NO-OP CONTRACT, PINNED WHERE IT CAN ACTUALLY FAIL.
+        //
+        // This used to re-select slice 1 and assert no second emission. That
+        // could not fail twice over: setActiveTxSlice() early-returns on an
+        // unchanged index so clearAlcGainState() is never reached, and there is
+        // no fresh sample by then so it would return false anyway
+        // (aethersdr-agent, #5636 review).
+        //
+        // Removing an inactive meter must bypass clearAlcGainState() even
+        // when the active meter has a live sample.
+        model.setActiveTxSlice(0);
+        model.updateValues({21}, {rawDb(12.0f)});
+        const int before = emissions;
+        report("the active ALC gain is live again before the removal",
+               model.hasAlcGainValue() && nearlyEqual(model.alcGainDb(), 12.0f));
+        model.removeMeter(41);   // the INACTIVE slice-9 ALCGAIN
+        report("removing an inactive ALCGAIN meter emits no clear",
+               emissions == before);
+        report("and leaves the active reading standing",
+               model.hasAlcGainValue() && nearlyEqual(model.alcGainDb(), 12.0f));
+    }
+
+    // Path 2 — disconnect.
+    {
+        MeterModel model;
+        model.defineMeter(slcMeter(10, 0));
+        model.defineMeter(txMeter(21, "ALCGAIN", "dB", 8));
+        model.setActiveTxSlice(0);
+        model.updateValues({21}, {rawDb(12.0f)});
+        model.clear();
+        report("disconnect resets the ALC gain to unity with no sample behind it",
+               nearlyEqual(model.alcGainDb(), 0.0f) && !model.hasAlcGainValue());
+    }
+
+    // Path 3 — the radio withdraws the meter.
+    {
+        MeterModel model;
+        model.defineMeter(slcMeter(10, 0));
+        model.defineMeter(txMeter(21, "ALCGAIN", "dB", 8));
+        model.setActiveTxSlice(0);
+        model.updateValues({21}, {rawDb(12.0f)});
+
+        int emissions = 0;
+        QObject::connect(&model, &MeterModel::alcGainChanged,
+                         [&](float) { ++emissions; });
+        int removals = 0;
+        QObject::connect(&model, &MeterModel::meterRemoved, [&](int index) {
+            ++removals;
+            report("meterRemoved subscribers see the withdrawn definition and routing gone",
+                   index == 21 && model.meterDef(index) == nullptr
+                       && !model.hasAlcGainMeter() && !model.hasAlcGainValue());
+        });
+        model.removeMeter(21);
+        report("meter withdrawal notifies subscribers exactly once", removals == 1);
+        report("removing the active ALCGAIN meter clears the gain and says so",
+               nearlyEqual(model.alcGainDb(), 0.0f) && !model.hasAlcGainValue()
+                   && emissions == 1);
+    }
+}
+
+// The HL2's actual declaration, in its actual order. Every case above uses the
+// Flex shape ("TX-", sourceIndex 8) because that is where the per-slice routing
+// rules came from, and a meter that routes correctly there can still be
+// unreachable on a one-transmitter radio: this backend declares source "TX"
+// with sourceIndex 0, and it interleaves a RAD meter between the SLC block and
+// the TX ones, which ENDS the manifest slice context. So the registration falls
+// through to the implicit-slice path, and the reading is only visible because
+// the resolver volunteers a single implicit modulator.
+//
+// That is a chain of three defaults, none of them stated at the declaration
+// site, and getting any of them wrong publishes a meter the operator never
+// sees — the 2->3 gap MeterSurfaces.h calls "completely invisible: nothing is
+// wrong anywhere you would think to look."
+void testHl2StyleDeclarationReachesTheAlcGainAccessor()
+{
+    MeterModel model;
+    const auto hl2Meter = [](int index, const QString& name, const QString& unit) {
+        MeterDef def;
+        def.index = index;
+        def.source = "TX";
+        def.sourceIndex = 0;
+        def.name = name;
+        def.unit = unit;
+        return def;
+    };
+    MeterDef slc;
+    slc.index = 1;
+    slc.source = "SLC";
+    slc.sourceIndex = 0;
+    slc.name = "LEVEL";
+    slc.unit = "dBm";
+    MeterDef paTemp;
+    paTemp.index = 5;
+    paTemp.source = "RAD";
+    paTemp.sourceIndex = 0;
+    paTemp.name = "PATEMP";
+    paTemp.unit = "degC";
+
+    model.defineMeter(slc);
+    model.defineMeter(paTemp);                         // ends the SLC context
+    model.defineMeter(hl2Meter(7, "ALC", "dBFS"));
+    model.defineMeter(hl2Meter(8, "COMPPEAK", "dB"));
+    model.defineMeter(hl2Meter(9, "ALCGAIN", "dB"));
+    model.setActiveTxSlice(0);
+
+    // Through updateValueByName, which is the entry point a backend that
+    // decodes its own telemetry actually uses — meterUpdate("TX:ALCGAIN", db)
+    // is split on the colon and arrives here.
+    report("an HL2-shaped TX:ALCGAIN declaration is reachable by name",
+           model.updateValueByName(QStringLiteral("TX"), QStringLiteral("ALCGAIN"),
+                                   14.0f));
+    report("...and its value reaches the accessor unconverted",
+           nearlyEqual(model.alcGainDb(), 14.0f) && model.hasAlcGainValue());
+    report("...without disturbing the ALC level meter beside it",
+           nearlyEqual(model.swAlc(), -20.0f));
 }
 
 void testAlcClearsToPresentationFloor()
@@ -1219,6 +1633,189 @@ void testConvertedPowerPreservesPrecision()
            nearlyEqual(flex.fwdPowerInstant(), 10.0f));
 }
 
+// The amplifier meter manifest exactly as a FLEX-8600 publishes it with a
+// PGXL and a TGXL both attached (captured 2026-09-15, firmware 3.8.9 / 1.2.17):
+//
+//   12 src=AMP num=0x16C58EE4 nam=FWD  low=30.0 hi=63.0 unit=dBm   <- PGXL
+//   13 src=AMP num=0x16C58EE4 nam=RL   low=0.3  hi=60.0 unit=dB
+//   14 src=AMP num=0x16C58EE4 nam=DRV  low=10.0 hi=50.0 unit=dBm
+//   15 src=AMP num=0x16C58EE4 nam=ID   low=0.0  hi=70.0 unit=Amps
+//   16 src=AMP num=0x16C58EE4 nam=TEMP low=0.0  hi=100.0 unit=degC
+//   17 src=AMP num=0x49BBFC97 nam=FWD  low=30.0 hi=63.0 unit=dBm   <- TGXL
+//   18 src=AMP num=0x49BBFC97 nam=RL   low=0.3  hi=60.0 unit=dB
+constexpr int kPgxlHandle = 0x16C58EE4;
+constexpr int kTgxlHandle = 0x49BBFC97;
+
+MeterDef ampMeter(int index, int handle, const QString& name,
+                  const QString& unit, double low, double high)
+{
+    MeterDef def;
+    def.index = index;
+    def.source = "AMP";
+    def.sourceIndex = handle;
+    def.name = name;
+    def.unit = unit;
+    def.low = low;
+    def.high = high;
+    def.description = "External Meter";
+    return def;
+}
+
+void defineAmpManifest(MeterModel& model)
+{
+    model.defineMeter(ampMeter(12, kPgxlHandle, "FWD",  "dBm",  30.0, 63.0));
+    model.defineMeter(ampMeter(13, kPgxlHandle, "RL",   "dB",    0.3, 60.0));
+    model.defineMeter(ampMeter(14, kPgxlHandle, "DRV",  "dBm",  10.0, 50.0));
+    model.defineMeter(ampMeter(16, kPgxlHandle, "TEMP", "degC",  0.0, 100.0));
+    model.defineMeter(ampMeter(17, kTgxlHandle, "FWD",  "dBm",  30.0, 63.0));
+    model.defineMeter(ampMeter(18, kTgxlHandle, "RL",   "dB",    0.3, 60.0));
+}
+
+// The amplifier's drive meter reaches the amplifier's consumers, in watts.
+void testAmplifierDriveMeterIsRouted()
+{
+    MeterModel model;
+    model.setTgxlHandle(kTgxlHandle);
+    defineAmpManifest(model);
+
+    float drive = -1.0f;
+    bool valid = false;
+    QObject::connect(&model, &MeterModel::ampMetersChanged,
+                     [&](float, float, float, float d, bool v) { drive = d; valid = v; });
+
+    // 40.4 dBm is what the PGXL reported at its input on a steady carrier
+    // while the radio's own exciter meter read 9.8 W.
+    model.updateValues({14}, {rawDb(40.4f)});
+    report("amplifier drive meter is routed and converted to watts",
+           valid && nearlyEqual(drive, 10.96f));
+}
+
+// Drive is absent, not zero, when the amplifier publishes no DRV meter. A
+// gauge resting at 0 W would read as "no drive" rather than "not measured".
+void testAmplifierDriveIsAbsentWithoutTheMeter()
+{
+    MeterModel model;
+    model.setTgxlHandle(kTgxlHandle);
+    model.defineMeter(ampMeter(12, kPgxlHandle, "FWD", "dBm", 30.0, 63.0));
+
+    bool sawValid = true;
+    QObject::connect(&model, &MeterModel::ampMetersChanged,
+                     [&](float, float, float, float, bool v) { sawValid = v; });
+
+    model.updateValues({12}, {rawDb(60.0f)});
+    report("drive reads absent when the amplifier publishes no DRV meter",
+           !sawValid);
+}
+
+// Withdrawing the meter withdraws the reading with it: a drive figure must not
+// outlive the meter it came from.
+void testRemovingTheDriveMeterClearsTheReading()
+{
+    MeterModel model;
+    model.setTgxlHandle(kTgxlHandle);
+    defineAmpManifest(model);
+    model.updateValues({14}, {rawDb(40.4f)});
+
+    bool valid = true;
+    QObject::connect(&model, &MeterModel::ampMetersChanged,
+                     [&](float, float, float, float, bool v) { valid = v; });
+
+    model.removeMeter(14);
+    model.updateValues({12}, {rawDb(60.0f)});
+    report("removing the drive meter clears the drive reading", !valid);
+}
+
+// The two FWD meters are told apart by handle, and the manifest arrives BEFORE
+// the TGXL handle is known on a cold start. The rescan in setTgxlHandle is what
+// stops the tuner's FWD landing on the amplifier's gauge — without it the two
+// definitions are last-match-wins and meter 17 overwrites meter 12.
+void testAmpAndTunerMetersSplitByHandleAfterALateHandle()
+{
+    MeterModel model;
+    defineAmpManifest(model);          // no TGXL handle yet
+    model.setTgxlHandle(kTgxlHandle);  // learned afterwards
+
+    float ampFwd = -1.0f;
+    float tunerFwd = -1.0f;
+    QObject::connect(&model, &MeterModel::ampMetersChanged,
+                     [&](float f, float, float, float, bool) { ampFwd = f; });
+    QObject::connect(&model, &MeterModel::tgxlMetersChanged,
+                     [&](float f, float) { tunerFwd = f; });
+
+    // 60.0 dBm = 1000 W through the amplifier, 59.0 dBm = 794 W past the tuner.
+    model.updateValues({12, 17}, {rawDb(60.0f), rawDb(59.0f)});
+    report("amplifier and tuner forward power split by handle",
+           nearlyEqual(ampFwd, 1000.0f) && nearlyEqual(tunerFwd, 794.33f));
+}
+
+// The drive meter follows the same handle rule as FWD and RL. Only the PGXL
+// publishes DRV today; a tuner-handle DRV must not reach the amplifier panel.
+void testTunerHandleDriveDoesNotReachTheAmplifier()
+{
+    MeterModel model;
+    model.setTgxlHandle(kTgxlHandle);
+    model.defineMeter(ampMeter(12, kPgxlHandle, "FWD", "dBm", 30.0, 63.0));
+    model.defineMeter(ampMeter(19, kTgxlHandle, "DRV", "dBm", 10.0, 50.0));
+
+    bool valid = true;
+    QObject::connect(&model, &MeterModel::ampMetersChanged,
+                     [&](float, float, float, float, bool v) { valid = v; });
+
+    model.updateValues({19}, {rawDb(40.0f)});
+    model.updateValues({12}, {rawDb(60.0f)});
+    report("a tuner-handle drive meter never reaches the amplifier", !valid);
+}
+
+// The relay is only the live meter source when a POWER sample actually landed.
+// ampMetersChanged fires for TEMP and DRV too, and a consumer that treats
+// those as a power sample holds the relay "fresh" at 0 W — locking out the
+// amplifier's own socket on exactly the station that needs it (#4805).
+void testAmpPowerFlagTracksOnlyPowerMeters()
+{
+    MeterModel model;
+    model.setTgxlHandle(kTgxlHandle);
+    defineAmpManifest(model);
+
+    report("no amp power before any sample", !model.hasAmpPower());
+
+    // Temperature alone is not a power sample.
+    model.updateValues({16}, {rawDb(43.9f)});
+    report("a temperature sample is not a power sample", !model.hasAmpPower());
+
+    // Neither is drive.
+    model.updateValues({14}, {rawDb(40.4f)});
+    report("a drive sample is not a power sample", !model.hasAmpPower());
+
+    // Forward power is.
+    model.updateValues({12}, {rawDb(60.0f)});
+    report("forward power sets the amp power flag", model.hasAmpPower());
+}
+
+// Withdrawing an amplifier meter has to be ANNOUNCED, not just cached away:
+// the panel only ever hears about these meters through ampMetersChanged, so
+// without an emit it keeps rendering the last reading of a meter that is gone.
+void testWithdrawingAnAmpMeterAnnouncesItself()
+{
+    MeterModel model;
+    model.setTgxlHandle(kTgxlHandle);
+    defineAmpManifest(model);
+    model.updateValues({14}, {rawDb(40.4f)});
+
+    int emits = 0;
+    bool valid = true;
+    QObject::connect(&model, &MeterModel::ampMetersChanged,
+                     [&](float, float, float, float, bool v) { ++emits; valid = v; });
+
+    // No value packet afterwards — the removal alone must speak.
+    model.removeMeter(14);
+    report("removing the drive meter announces the loss on its own",
+           emits == 1 && !valid);
+
+    model.removeMeter(12);
+    report("removing forward power clears the amp power flag",
+           !model.hasAmpPower());
+}
+
 void testMeterObservationWindow()
 {
     MeterObservationWindow window;
@@ -1271,6 +1868,13 @@ int main(int argc, char** argv)
 {
     QCoreApplication app(argc, argv);
 
+    testSuffixedSliceMeterIdReachesItsOwnReceiver();
+    testBareSliceMeterIdStillReachesTheFirstReceiver();
+    testUnsuffixedSourcesKeepMatchAnyResolution();
+    testSlc1SourceNeverKeysTheSliceCache();
+    testMeterIdSplitEdges();
+    testWithdrawingAnUndeclaredMeterChangesNothing();
+
     testAdjacentMetersDoNotSynthesizeCompression();
     testCompPeakDirectlyExposesCompression();
     testCompPeakClampsToGaugeRange();
@@ -1305,6 +1909,9 @@ int main(int argc, char** argv)
     testZeroSourceAlcUsesSliceContext();
     testSingleImplicitAlcFollowsTransmitToAnySlice();
     testTxMeterRedefinitionsPreserveTheirSlice();
+    testAlcGainIsRoutedAndConvertedByNobody();
+    testAlcGainClearsOnEveryPathThatInvalidatesIt();
+    testHl2StyleDeclarationReachesTheAlcGainAccessor();
     testAlcClearsToPresentationFloor();
     testTxMeterIdentityReuseAndContextLifetime();
     testExplicitAlcIsNotVolunteeredToAnotherSlice();
@@ -1332,6 +1939,14 @@ int main(int argc, char** argv)
     testPaCurrentIsDistinctFromTemperature();
     testConvertedPowerPreservesPrecision();
     testMeterObservationWindow();
+
+    testAmplifierDriveMeterIsRouted();
+    testAmplifierDriveIsAbsentWithoutTheMeter();
+    testRemovingTheDriveMeterClearsTheReading();
+    testAmpAndTunerMetersSplitByHandleAfterALateHandle();
+    testTunerHandleDriveDoesNotReachTheAmplifier();
+    testAmpPowerFlagTracksOnlyPowerMeters();
+    testWithdrawingAnAmpMeterAnnouncesItself();
 
     return g_failed == 0 ? 0 : 1;
 }

@@ -53,6 +53,7 @@ public:
                               LpMeterConnection* lpMeter = nullptr,
                               QWidget* parent = nullptr);
     void selectTab(const QString& tabName);
+    void done(int result) override;
     // Like selectTab("Serial & Controllers"), but also scrolls the page so
     // the FlexControl Tuning Knob group is actually in view instead of just
     // landing at the top of a long, scroll-wrapped page (#4940 follow-up —
@@ -60,6 +61,14 @@ public:
     void revealFlexControlSettings();
     void refreshFlexControlButtonActions();
     void setFlexControlConnectionStatus(bool connected, const QString& port = {});
+    // Result of the automation-bridge start the Network-tab toggle kicked off
+    // (#4181). The start is ASYNCHRONOUS — the token read has to land before
+    // the socket can listen — so the toggle handler can't know whether the
+    // bridge came up. MainWindow reports back here; on failure we revert the
+    // toggle so the operator isn't told the bridge is listening when nothing
+    // is. MainWindow owns persistence. No-op if the Network tab hasn't
+    // been built (m_automationBridgeBtn == nullptr).
+    void reportAutomationBridgeStartResult(bool ok);
 
 signals:
     void txBandSettingsRequested();
@@ -98,6 +107,9 @@ protected:
     void showEvent(QShowEvent* event) override;
 
 private:
+    friend class RadioSetupDialogTestAccess;
+    bool confirmFirmwareClose();
+    bool m_firmwareClosePromptOpen{false};
     bool isFlexOnlyPage(const QTreeWidgetItem* item) const;
     bool isCapabilityPageAvailable(const QTreeWidgetItem* item) const;
     bool isGpsSetupAvailable() const;
@@ -115,6 +127,29 @@ private:
     // hostFrequencyCalibration — the HL2 today). A Flex calibrates itself and
     // keeps its own Frequency Offset group on the Receive page.
     QWidget* buildCalibrationTab();
+    // Live DDC0 droop-correction sweep, for families with a measured DDC edge
+    // droop (RadioCapabilities::hostDroopCalibration -- the ANAN-G2 today).
+    // Mirrors buildCalibrationTab()'s own shape (gated on the capability, not
+    // the family; a m_droopReseed lambda re-synced the same two ways).
+    QWidget* buildDroopCalibrationTab();
+    // Which Hermes-Lite 2 variant is on the other end: local audio codec, the
+    // dither bit's three incompatible meanings, the companion filter board and
+    // the gateware ATU. Protocol 1 exposes none of it, so the operator is the
+    // only source — see Hl2HardwareOptions.
+    //
+    // Gated on the backend's DECLARED extension namespace, like the two pages
+    // above are gated on declared capabilities. What no backend can answer is
+    // the value — "does this radio have an AK4951 companion board" — which is
+    // why these are settings; that is a different question from which backend
+    // answers the verbs, and the backend states the latter itself. Every
+    // control writes through the hl2 extension namespace, which refuses
+    // anything else.
+    QWidget* buildHl2HardwareTab();
+    // Whether the connected backend declares the "hl2" extension namespace —
+    // i.e. whether anything will answer the hw.get / hw.set verbs this page is
+    // built on. NOT a family-string check: #5554 bars new ones, and the name a
+    // backend carries is a different question from the verbs it answers.
+    bool declaresHl2Extension() const;
     QWidget* buildAudioTab();
     QWidget* buildFiltersTab();
     QWidget* buildXvtrTab();
@@ -129,7 +164,7 @@ private:
     // Forget All button. Backed by WanCertCache in WanConnection.cpp.
     QWidget* buildSmartLinkTab();
     // QRZ.com account for callsign lookups (CW decoder contact card +
-    // View → Callsign Lookup).  Username in AppSettings, password in the
+    // Tools → Callsign Lookup).  Username in AppSettings, password in the
     // OS keychain, lookups cached 7 days by CallsignLookupService.
     QWidget* buildQrzTab();
 
@@ -224,6 +259,9 @@ private:
     QLineEdit* m_nicknameEdit{nullptr};
     QLineEdit* m_callsignEdit{nullptr};
     QPushButton* m_remoteOnBtn{nullptr};
+    // Network tab → Agent Automation (MCP) toggle. Held so the async start
+    // result can reconcile it (#4181); null until buildNetworkTab() runs.
+    QPushButton* m_automationBridgeBtn{nullptr};
 
     // License Info
     QLabel* m_licSubscriptionLabel{nullptr};
@@ -252,6 +290,23 @@ private:
     // keeps whatever it read at first build — and the next Trim press would
     // commit that stale number to whichever radio is connected now.
     std::function<void()>     m_calibrationReseed;
+    int                       m_droopCalibrationPageIndex{-1};
+    int                       m_hl2HardwarePageIndex{-1};
+    // Same reason as m_calibrationReseed: the page is built once per process
+    // and the dialog is a persistent singleton, so a different HL2 connected
+    // later would otherwise be shown — and written — with the first one's
+    // hardware options.
+    std::function<void()>     m_hl2HardwareReseed;
+    // Same reason as m_calibrationReseed above, for the Droop Correction page.
+    std::function<void()>     m_droopReseed;
+    // Re-fills the Audio page's PC Input/Output combos from a LIVE device
+    // enumeration. Same cause as m_calibrationReseed — page built once, dialog
+    // a persistent singleton — but the stale thing here is the LIST, not one
+    // value: without it a headset connected after first build never appears,
+    // with or without closing the dialog. A QMediaDevices watcher on the page
+    // drives the same lambda so the pane also updates while it is open.
+    std::function<void()>     m_audioDeviceReseed;
+    QMetaObject::Connection   m_droopStatusConnection;
     QHash<QString, QComboBox*> m_apdSamplerCombos;
 
     // Peripherals tab — savers run on dialog close to persist field edits
@@ -260,6 +315,12 @@ private:
     // → wipe the saved manual IP/port. New-IP edits still require an
     // explicit Connect click so an unfinished value cannot leak in.
     QVector<std::function<void()>> m_peripheralRowSavers;
+
+    // Refresh already-built serial pages without rebuilding their controls.
+    // Each page is built once per dialog instance; normal close deletes the
+    // dialog. Used by showEvent and Refresh buttons, and empty until the
+    // owning page is built so enumeration remains deferred (#1776).
+    QVector<std::function<void()>> m_serialPortReseeds;
 };
 
 } // namespace AetherSDR

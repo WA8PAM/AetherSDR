@@ -11,18 +11,35 @@ name: Static Checks
 # #4585's colour ratchet was folded in below per #4657, and colour-ratchet.yml
 # deleted, rather than left as a fourth near-identical workflow.
 #
-# `Static checks` is NOT yet a required status check. The required contexts
-# are build / check-windows / check-macos; adding this one is the LAST action
-# of the #5405 rollout, after that PR merges, and until it happens the frozen
-# per-PR test gate below (tools/check_ci_test_gate.py) is advisory — a red run
-# here does not block a merge. Do not describe it as enforced before the flip
-# is made and verified.
+# `Static checks` IS a required status check (flipped 2026-09-12). The required
+# contexts are build / check-windows / check-macos / Static checks, so a red run
+# here blocks a merge — the frozen per-PR test gate
+# (tools/check_ci_test_gate.py) included, which is what the #5405 rollout was
+# for.
+#
+# WHAT THAT DOES AND DOES NOT MAKE ENFORCING. A step only blocks if it can fail
+# the job, so "required" promotes the --strict steps and nothing else. Still
+# advisory by design, and unchanged by the flip:
+#   * the accessibility step below — warnings only, never fails the job
+#     (docs/a11y.md);
+#   * EB2/EB3 findings against TRACKED baselines — those warn; only a new
+#     violation or a grown baseline errors. 102 warnings currently ride on a
+#     green run.
+#
+# This was the LAST action of the #5405 rollout and it sat undone from
+# 2026-09-04 to 2026-09-12: for eight days the gate that PR existed to enforce
+# was itself unenforced. The lesson for the next rollout ending in a manual
+# step is the durable part — nothing in CI can tell you the step was skipped,
+# and this file asserted "NOT yet required" throughout with nothing checking
+# whether that was still true.
 #
 # The `paths:` filter is gone, and that ordering is deliberate: a required
 # check a PR never triggers blocks that PR forever, so the filter has to go
 # BEFORE the flip, not with it. (Making it required first is what briefly
 # blocked eleven open PRs.) Every step is stdlib Python in seconds, so running
-# on every pull request costs less than one blocked docs-only PR.
+# on every pull request costs less than one blocked docs-only PR. That ordering
+# held: at the flip every open PR had already run this workflow, so none was
+# stranded on a check it could not trigger.
 
 on:
   pull_request:
@@ -162,6 +179,37 @@ jobs:
         if: ${{ !cancelled() }}
         run: python tools/gen_touchpoint_manifest.py --check
 
+      # ── The seam-probe table (tests/SeamSignalProbeTable.inc) is generated
+      # from IRadioBackend.h's signals: section. #5868.
+      #
+      # backend_seam_affinity_test already asserts this, against the
+      # meta-object — but at RUNTIME, and no PR lane runs it: ci-test-gate.txt
+      # is frozen so it cannot join the per-PR allow-list, and ci.yml's Linux
+      # job runs no ctest at all. It therefore first executes in
+      # full-suite.yml, post-merge on main. Detection was late, not absent:
+      # #5825 added autoRfGainArmSettled without the probe line, was green on
+      # every PR check, and went red on the merge with "51 probed, 52
+      # declared" (#5865 repaired it).
+      #
+      # This is that assertion restated as a static check, where it can block
+      # the PR — stdlib Python, seconds, no build, no Qt. Generating the table
+      # rather than only auditing it is the other half: a checker keeps two
+      # lists honest, a generator leaves one.
+      - name: Seam probe table covers every IRadioBackend signal
+        if: ${{ !cancelled() }}
+        run: python tools/gen_seam_probe_table.py --check
+
+      # The scanner behind that table, run here and not only as a ctest.
+      # --check compares the committed table against the SAME parser that
+      # generates it, so a parser that under-reads produces a table that is
+      # short in exactly the matching way and --check reports "up to date".
+      # The generator refuses rather than under-reads (residue()), and these
+      # tests are what hold it to that — which makes them load-bearing for
+      # the step above, unlike the other tools/test_*.py that are ctest-only.
+      - name: Seam probe scanner
+        if: ${{ !cancelled() }}
+        run: python tools/test_gen_seam_probe_table.py
+
       # ── Test registration stays in tests/tests.cmake. The root CMakeLists.txt
       # was 6,357 lines, over half of it 300+ test-target declarations; the split
       # cut it to ~2,780. tests/tests.cmake fails the CONFIGURE step if a test
@@ -172,6 +220,58 @@ jobs:
       - name: Test registration location
         if: ${{ !cancelled() }}
         run: python tools/check_test_registration.py --strict
+
+      # ── #5262 M2: the capability descriptor's boolean population is FROZEN.
+      # A new capability lands as a per-feature record (std::optional<Record>:
+      # engaged = present, fields = shape), not another loose bool. Booleans
+      # fission when the second radio family arrives (hasRadioSideDsp became
+      # four tiers, hostModulates became two fields), and one a backend simply
+      # forgot to set reports a definite "no" indistinguishable from a
+      # considered one.
+      #
+      # This is a ratchet rather than a convention because the convention was
+      # written down and did not hold: #5299 alone added seven bools after M2
+      # was recorded. The count only falls; converting one means lowering
+      # FROZEN_BOOL_COUNT in the same commit.
+      - name: Capability record convention
+        if: ${{ !cancelled() }}
+        run: python tools/check_capability_records.py --strict
+
+      # ── The step above is only as good as its PARSER, and #5727 showed the
+      # parser losing fields silently: an accessor declared beside a capability
+      # deleted the NEXT bool from the count, and a bool added after one was
+      # never seen — so the population could grow past the freeze with the
+      # count flat and the step above green. The `std::optional<Record>` +
+      # accessor shape the ratchet asks for is the shape that broke it.
+      #
+      # tools/test_check_capability_records.py is also declared in
+      # tests/tests.cmake, so it runs unfiltered post-merge in full-suite.yml
+      # and weekly under the sanitizers. This second line is deliberate and is
+      # the same argument the "Test registration location" step above makes:
+      # the thing under test is a PR gate, so its regression test has to run on
+      # the same PR, not minutes after the merge that broke it. Stdlib-only and
+      # sub-second, like every other step here — it costs nothing to keep both.
+      # (Not a `ctest -R` step, so it does not touch the frozen per-PR test
+      # gate in .github/ci-test-gate.txt; that freeze is about ci.yml's build.)
+      - name: Capability record parser
+        if: ${{ !cancelled() }}
+        run: python tools/test_check_capability_records.py
+
+      # ── #5262 M4: raw Flex wire text above the seam is FROZEN per file.
+      # Models emitting commandReady and widgets calling sendCommand hand
+      # RadioModel::sendCmd() a wire string that is SILENTLY DROPPED on
+      # HL2/Icom/ANAN/RTL — so every unconverted control is a live-looking dead
+      # control there. M0 (#5265) made the drop loud; this stops the backlog
+      # growing while the by-subsystem conversion works through it.
+      #
+      # Per file, not a total: a total would let one subsystem's conversion pay
+      # for another's regression, and a file absent from the baseline must stay
+      # at zero so a NEW control on the old plane fails even mid-migration.
+      # Growth under src/core/backends/flex/ is deliberately not counted — that
+      # is where the encode is supposed to end up.
+      - name: Command plane above the seam
+        if: ${{ !cancelled() }}
+        run: python tools/check_command_plane.py --strict
 
       # ── The per-PR test gate in ci.yml is FROZEN. ci.yml runs no Linux tests
       # and a short allow-list of platform-toolchain tests behind `ctest -R`

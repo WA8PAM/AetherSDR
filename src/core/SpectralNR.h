@@ -32,7 +32,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #include <atomic>
 #include <cstdint>
 #include <functional>
-#include <mutex>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -49,9 +49,11 @@ namespace AetherSDR {
 // Uses FFTW3 for FFT computation (with wisdom file for optimised plans)
 // when available; falls back to a built-in radix-2 FFT otherwise.
 //
-// Processes mono float32 audio at 24 kHz.  For stereo Flex speaker audio,
-// processStereoSharedMask() computes one mono NR mask and applies it to both
-// original channels so radio-side balance survives client NR.
+// Processes mono float32 audio at 24 kHz.  For stereo RX audio,
+// processStereo() runs each channel through its own noise estimate and mask,
+// the way RN2 runs one RNNoise state per channel: a diversity pair hard-panned
+// L/R has two antennas with two different noise floors, and a pan change
+// reaches the output as soon as the audio carrying it does.
 
 class SpectralNR {
 public:
@@ -68,15 +70,33 @@ public:
     void process(const float* input, float* output, int numSamples);
 
     // Feed interleaved stereo float32 samples in, get interleaved stereo
-    // float32 out.  The NR estimate/mask is computed from (L+R)/2, then the
-    // same spectral gain is applied to each original channel.
+    // float32 out. The left channel runs through this instance and the right
+    // through a second one with the same geometry, so each channel has its own
+    // noise estimate and mask. Every setter and reset reaches both; the
+    // getters and reset counters report this (left) instance.
     // Output buffer must be at least numFrames * 2 samples long.
-    // Use only one process entry point for an instance between resets; the mono
-    // and stereo paths share ring cursors but maintain different OLA buffers.
-    void processStereoSharedMask(const float* input, float* output, int numFrames);
+    // Use only one process entry point for an instance between resets.
+    void processStereo(const float* input, float* output, int numFrames);
 
     // Reset all internal state (call when toggling on or stream restarts).
     void reset();
+
+    // Flush only the transient state — overlap-add rings, gain masks, the
+    // AGC common-mode references, and the dry→wet startup ramp — while
+    // retaining the converged OSMS/MMSE/NSTAT noise estimates. For the
+    // TX→RX edge, where the stream resumes on the same band and the stale
+    // overlap-add ring is the hazard (#3340): a full reset() there re-seeds
+    // the noise floor and costs a fresh estimator convergence on every
+    // over, heard as un-suppressed band noise after unkey (#3821). Not a
+    // substitute for reset() on enable or source switches, where the old
+    // noise profile does not describe the new stream.
+    void resetTransient();
+
+    // Monotonic diagnostics used by the bridge and the socket-free TX->RX
+    // integration test. A full reset increments both counters; the warm
+    // TX->RX path increments only transientResetCount().
+    std::uint64_t transientResetCount() const { return m_transientResetCount; }
+    std::uint64_t noiseEstimateResetCount() const { return m_noiseEstimateResetCount; }
 
     // User-adjustable parameters (thread-safe, called from main thread)
     void setGainMax(float v);
@@ -96,13 +116,52 @@ public:
     int  npeMethod() const      { return m_npeMethod.load(); }
 
     // AE filter: artifact elimination post-processing
-    void setAeFilter(bool on)   { m_aeFilter.store(on); }
+    void setAeFilter(bool on);
     bool aeFilter() const       { return m_aeFilter.load(); }
 
+    // ── Psychoacoustic post-processing (WDSP emnr.c's post2 stage) ─────────
+    //
+    // Spectral NR leaves the gaps between syllables completely silent, which
+    // operators hear as the receiver going dead rather than quiet, and its
+    // residual has the processed character that gives spectral NR its
+    // reputation. WDSP's answer is to mix a controlled amount of noise back in
+    // over a tapered low band: partly the GENUINE residual this reduction just
+    // removed, partly synthetic white, with the level following the signal's
+    // own peak. Off by default, exactly as WDSP ships it.
+    void setPost2Run(bool on);
+    bool post2Run() const            { return m_post2Run.load(); }
+
+    // Blend between the removed residual (0.0) and synthetic white (1.0).
+    void setPost2Factor(float v);
+    float post2Factor() const        { return m_post2Factor.load(); }
+
+    // How much of that blend is mixed back in. 0.0 injects nothing.
+    void setPost2Nlevel(float v);
+    float post2Nlevel() const        { return m_post2Nlevel.load(); }
+
+    // Top of the band the stage covers, in Hz. NOT WDSP's `taper` fraction:
+    // that constant is calibrated to WDSP's own 48 kHz/4096 geometry and means
+    // a different frequency at ours, so the control is specified where it is
+    // meaningful and converted to a bin count from the live geometry. Bins
+    // above it are zeroed, so this doubles as a lowpass on the NR output.
+    void setPost2TaperHz(float hz);
+    float post2TaperHz() const       { return m_post2TaperHz.load(); }
+
+    // Decay time constant of the peak follower that sets the injected level.
+    void setPost2DecaySeconds(float seconds);
+    float post2DecaySeconds() const  { return m_post2Decay.load(); }
+
     int fftSize() const { return m_fftSize; }
+
+    // Highest bin the post-processing stage touches, for the current geometry.
+    // Exposed so a test can pin the Hz-to-bin conversion the port turns on.
+    int post2BinLimit() const;
     bool usesLegacyGainMethods() const { return m_useLegacyGainMethods; }
 #ifdef HAVE_FFTW3
-    bool hasPlanFailed() const { return m_planFailed; }
+    bool hasPlanFailed() const
+    {
+        return m_planFailed || (m_rightChannel && m_rightChannel->m_planFailed);
+    }
 #else
     bool hasPlanFailed() const { return false; }
 #endif
@@ -124,10 +183,26 @@ public:
                                        WisdomCancelCb shouldCancel = nullptr);
 
 private:
-    // FFTW plan creation/destruction is NOT thread-safe. This mutex guards
-    // all fftw_plan_*, fftw_destroy_plan, and wisdom import/export calls.
-    // fftw_execute() is thread-safe and does not need the lock. (#467)
-    static std::mutex s_fftwMutex;
+    // FFTW plan creation/destruction is NOT thread-safe, and neither is the
+    // allocator pairing TSan named in #5424. THE LOCK IS NOT OURS AND IS NOT
+    // DECLARED HERE: every site in the .cpp that plans, allocates, frees or
+    // moves wisdom takes AetherSDR::fftwPlannerLock() from
+    // core/dsp/FftwPlannerLock.h, because the planner it guards is
+    // process-global and WDSP, Hl2Spectrum and AnanPanAnalyzer reach the same
+    // one in the same double-precision family. This class used to keep a
+    // private static mutex here (#467, written when SpectralNR.cpp held all
+    // the FFTW in the tree); two mutexes over one planner serialise nothing
+    // (#5895). fftw_execute() is thread-safe and does not need the lock.
+
+    SpectralNR(int fftSize, int sampleRate, int overlap,
+               bool useLegacyGainMethods, bool withRightChannel);
+
+    // The right channel of processStereo(). Null on that instance itself.
+    std::unique_ptr<SpectralNR> m_rightChannel;
+    // De-interleaved staging for processStereo(), at most one hop per channel.
+    std::vector<float> m_stereoIn[2];
+    std::vector<float> m_stereoOut[2];
+
     // FFT parameters
     int m_fftSize;
     int m_overlap;          // supported values: 2 (50%) or 4 (75%)
@@ -147,10 +222,6 @@ private:
     int m_outWritePos{0};
     int m_outReadPos{0};
     int m_outputAvailable{0};           // finalized samples queued for callers
-    std::vector<double> m_stereoInAccumL;
-    std::vector<double> m_stereoInAccumR;
-    std::vector<double> m_stereoOutAccumL;
-    std::vector<double> m_stereoOutAccumR;
 
     // Window
     std::vector<double> m_window;
@@ -279,6 +350,8 @@ private:
     // Startup ramp
     int m_frameCount{0};                // frames processed since reset
     int m_rampFrames{1};                // one second at the configured hop rate
+    std::uint64_t m_transientResetCount{0};
+    std::uint64_t m_noiseEstimateResetCount{0};
 
     // ── Algorithm constants (fixed) ─────────────────────────────────────
     static constexpr double GammaMax   = 40.0;    // linear a-posteriori SNR cap
@@ -301,10 +374,10 @@ private:
 
     // ── Internal methods ───────────────────────────────────────────────
     void initWindow();
+    void resetNoiseEstimate();
     void processFrame();
     bool updateMaskFromCurrentFrame();
     void synthesizeCurrentFrequencyBinsWithMask();
-    void synthesizeCurrentFrameWithMask();
 
     // Noise estimation (keeps every estimator warm, then selects one)
     void estimateNoise();
@@ -313,6 +386,25 @@ private:
     void estimateNoiseNstat();  // method 2: Non-stationary noise estimator
     void detectCommonModeScale();
     bool isCommonWantedLike(int bin) const;
+
+    // Runs on m_gainRe/m_gainIm after the mask is applied and before the
+    // inverse transform, which is where WDSP runs it (emnr.c: post2()).
+    void applyPsychoacousticPostProcessing();
+    unsigned int post2NextRandom();
+
+    std::atomic<bool>  m_post2Run{false};
+    std::atomic<float> m_post2Factor{0.15f};
+    std::atomic<float> m_post2Nlevel{0.15f};
+    std::atomic<float> m_post2TaperHz{2871.0f};
+    std::atomic<float> m_post2Decay{5.0f};
+    // Seeded per instance, as upstream does from its own pointer: every
+    // receiver seeded identically would inject correlated noise across them.
+    unsigned int m_post2RngState{0};
+    double m_post2PeakHold{0.0};
+    // Raised-cosine taper, rebuilt only when the band limit moves, rather than
+    // a std::cos per bin per hop on the audio thread (upstream: post2_calc_w).
+    std::vector<double> m_post2Window;
+    int m_post2WindowBins{-1};
     void applyCommonModeNoiseEstimate();
     void scalePowerHistory(double ratio,
                            const std::vector<std::uint8_t>* binMask = nullptr);

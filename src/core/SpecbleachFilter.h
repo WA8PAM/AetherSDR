@@ -2,9 +2,8 @@
 
 #ifdef HAVE_SPECBLEACH
 
-#include "MonoDspStereoAdapter.h"
-
 #include <QByteArray>
+#include <array>
 #include <atomic>
 #include <vector>
 
@@ -13,20 +12,25 @@ typedef void* SpectralBleachHandle;
 namespace AetherSDR {
 
 // SpecbleachFilter - wrapper around libspecbleach for NR4 noise reduction.
-// Processes 24 kHz stereo float32 audio (same interface as RNNoiseFilter).
+// Processes stereo float32 audio at an immutable 24 or 48 kHz sample rate.
+// Each channel has its own libspecbleach instance and so its own noise
+// profile, as RN2 runs one RNNoise state per channel: the two sides of a
+// diversity pair are different antennas with different noise.
 // Thread-safe parameter setters (main thread writes, audio thread reads).
 class SpecbleachFilter {
 public:
-    SpecbleachFilter();
+    explicit SpecbleachFilter(int sampleRate = 24000);
     ~SpecbleachFilter();
 
     SpecbleachFilter(const SpecbleachFilter&) = delete;
     SpecbleachFilter& operator=(const SpecbleachFilter&) = delete;
 
-    // Process stereo float32 PCM at 24 kHz. Returns processed audio.
-    QByteArray process(const QByteArray& pcm24kStereo);
+    // Process stereo float32 PCM at the configured sample rate. Returns processed audio.
+    QByteArray process(const QByteArray& pcmStereo);
 
-    bool isValid() const { return m_handle != nullptr; }
+    bool isValid() const { return m_handles[0] != nullptr && m_handles[1] != nullptr; }
+    // Reset both noise profiles. Recreate on a new source or discontinuity to
+    // also discard libspecbleach's internal overlap state.
     void reset();
 
     // User-adjustable parameters (thread-safe)
@@ -46,10 +50,13 @@ public:
     float maskingDepth() const { return m_maskingDepth.load(); }
     float suppressionStrength() const { return m_suppression.load(); }
 
+    int sampleRate() const { return m_sampleRate; }
+
 private:
+    const int m_sampleRate;
     void applyParams();
 
-    SpectralBleachHandle m_handle{nullptr};
+    std::array<SpectralBleachHandle, 2> m_handles{};
 
     // Param atomics
     std::atomic<float> m_reduction{10.0f};
@@ -66,10 +73,9 @@ private:
     int m_frameCount{0};
     static constexpr int kLearningFrames = 25;  // ~1 sec at 40ms/frame
 
-    // Buffers
-    std::vector<float> m_monoIn;
-    std::vector<float> m_monoOut;
-    MonoDspStereoAdapter m_stereoAdapter;
+    // De-interleaved per-channel buffers
+    std::array<std::vector<float>, 2> m_channelIn;
+    std::array<std::vector<float>, 2> m_channelOut;
 };
 
 } // namespace AetherSDR

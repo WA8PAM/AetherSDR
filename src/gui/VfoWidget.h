@@ -54,6 +54,9 @@ class VfoWidget : public QWidget {
 public:
     explicit VfoWidget(QWidget* parent = nullptr);
     ~VfoWidget() override;
+#ifdef HAVE_DEEPFIST
+    void refreshCwDecoderControls();
+#endif
 
     void setSlice(SliceModel* slice);
     void setAntennaList(const QStringList& ants);
@@ -214,6 +217,22 @@ public:
         return 1000 + std::max(sliceId, 0);
     }
 
+    // Locked flag side for one member of an attached diversity pair, keyed by
+    // its position after diversityPairOrderKey ordering. Order index 0 is the
+    // parent / master slice — the one DIV was enabled on, which SmartSDR tags
+    // "DIV" — whenever the radio reports diversity_parent or diversity_index;
+    // with neither field present the key falls back to slice ID and index 0 is
+    // simply the lower-numbered slice. In the reported case index 0 locks RIGHT
+    // to match SmartSDR's layout, so a cross-client operator finds the DIV flag
+    // where muscle memory reaches for it; in the fallback case the swap still
+    // yields stable opposite sides, which is all the pre-metadata path promised.
+    // index 1 locks LEFT. Both are Lock* (not Force*) so the pair holds opposite
+    // sides through a pan edge instead of collapsing together (#2663, #3880).
+    static FlagDir diversityPairFlagDir(int orderIndex)
+    {
+        return orderIndex == 0 ? LockRight : LockLeft;
+    }
+
     static FlagPlacement placementForMarker(int markerX,
                                             int specTop,
                                             int widgetWidth,
@@ -326,6 +345,10 @@ Q_SIGNALS:
     void aetherVoiceRequested();   // user clicked the AetherVoice button on the DSP tab
     void splitToggled();
     void swapRequested();
+    // Right-click on the SPLIT/SWAP badge. The menu itself is built by
+    // MainWindow, which owns the split pair and the remembered arrangement;
+    // this widget only reports where the operator clicked. (#2242, #311)
+    void splitBadgeMenuRequested(const QPoint& globalPos);
     void autotuneRequested(bool intermittent);  // CW auto-tune: false=stop, true=loop
     void autotuneOnceRequested();               // CW auto-tune one-shot
     void zeroBeatRequested();                   // client-side CW zero-beat
@@ -624,8 +647,12 @@ public:
     // markerWidth: 0 = off, 1 = 1 px, 3 = 3 px.
     int  markerWidth() const { return m_markerWidth; }
     bool filterEdgesHidden() const { return m_filterEdgesHidden; }
-    void setMarkerWidth(int widthPx);
-    void setFilterEdgesHidden(bool hide);
+    static int defaultMarkerWidth();
+    static bool defaultFilterEdgesHidden();
+    static void setDefaultMarkerWidth(int widthPx);
+    static void setDefaultFilterEdgesHidden(bool hide);
+    void setMarkerWidth(int widthPx, bool persist = true);
+    void setFilterEdgesHidden(bool hide, bool persist = true);
 private:
     int  m_markerWidth{1};
     bool m_filterEdgesHidden{false};
@@ -636,7 +663,8 @@ private:
     // unchecked = edges hidden.
     class QPushButton* m_edgesBtn{nullptr};
     void loadDisplayPrefs();
-    void saveDisplayPrefs();
+    void saveMarkerWidthPref();
+    void saveFilterEdgesPref();
     // Adaptive RX filter controls (SSB-only, rebuilt with the Mode tab) — RFC #3878
     // Reusable adaptive-RX-filter control group (shared with the RX applet);
     // recreated on each SSB grid rebuild, bound to the slice as source of truth.
@@ -661,6 +689,9 @@ private:
     QPushButton* m_aetherDspBtn{nullptr};    // launches AetherDSP Settings dialog
     bool         m_aetherDspActive{false};   // any client NR module on (#3800)
     QPushButton* m_aetherVoiceBtn{nullptr};  // toggles Aetherial Audio Channel Strip
+    // Holds the two launchers side by side; relayoutDspGrid() spans it across
+    // whatever columns the toggles leave free, and the pair split that evenly.
+    QWidget*     m_aetherLauncherRow{nullptr};
 
     // Shared DSP-level row at the bottom of the DSP grid: one slider whose
     // target switches based on which leveled DSP the user most recently

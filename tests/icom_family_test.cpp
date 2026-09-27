@@ -10,6 +10,7 @@
 // written, tested and green while nothing in the application could construct it.
 
 #include "models/RadioModel.h"
+#include "models/TransmitModel.h"
 #include "core/RadioDiscovery.h"
 #include "core/backends/icom/IcomCivBackend.h"
 #include "core/backends/icom/IcomControls.h"
@@ -49,6 +50,21 @@ struct IcomCivBackendTestAccess {
         backend.m_connected = true;
         backend.onCivFrame(frame, backend.m_sessionGeneration);
     }
+
+    // The mic-gain mirror, which setMicGain() writes BEFORE sendUserCommand()
+    // decides whether a frame can go out. It is therefore the honest witness to
+    // "did this backend take the value at all" on a backend that has no session
+    // yet: the CI-V write is dropped by the not-connected guard, but the mirror
+    // is already dirty, and healthSnapshot() publishes it as the radio's own.
+    static bool micGainReported(const IcomCivBackend& backend)
+    {
+        return backend.m_micGainReported;
+    }
+
+    static int micGainPercent(const IcomCivBackend& backend)
+    {
+        return backend.m_micGainPercent;
+    }
 };
 
 } // namespace AetherSDR::icom
@@ -79,10 +95,44 @@ int main(int argc, char** argv)
     RadioModel model;
 
     const auto icomNotice = experimentalRadioDescriptor(QStringLiteral("icom"));
+    const auto ic7300Mk2Notice = experimentalRadioDescriptor(
+        QStringLiteral("icom"), QStringLiteral("IC-7300MK2"));
+    const auto ic705Notice = experimentalRadioDescriptor(
+        QStringLiteral("icom"), QStringLiteral("IC-705"));
     const auto hl2Notice = experimentalRadioDescriptor(QStringLiteral("hl2"));
     const auto ananNotice = experimentalRadioDescriptor(QStringLiteral("anan"));
     check(icomNotice && icomNotice->displayName == QStringLiteral("Icom"),
           "Icom is identified as an experimental radio family");
+    check(!ic7300Mk2Notice,
+          "CI-V-resolved IC-7300MK2 is not classified as experimental");
+    check(ic705Notice && ic705Notice->displayName == QStringLiteral("Icom"),
+          "another identified Icom model remains experimental");
+    check(experimentalRadioIdentityPending(
+              QStringLiteral("icom"), QStringLiteral("Unknown Icom")),
+          "an unresolved Icom identity waits before family classification");
+    check(!experimentalRadioIdentityPending(
+              QStringLiteral("icom"), QStringLiteral("IC-7300MK2")),
+          "a verified IC-7300MK2 identity is settled");
+    check(experimentalRadioIdentityHold(
+              QStringLiteral("icom"), QStringLiteral("Unknown Icom"), false, false)
+              == ExperimentalRadioIdentityHold::UntilTimeout,
+          "an ordinary Icom connect holds only for the bounded identity window");
+    check(experimentalRadioIdentityHold(
+              QStringLiteral("icom"), QStringLiteral("Unknown Icom"), true, false)
+              == ExperimentalRadioIdentityHold::UntilWakeEnds,
+          "a wake reconnect holds until the wake ends, not the ordinary window");
+    check(experimentalRadioIdentityHold(
+              QStringLiteral("icom"), QStringLiteral("Unknown Icom"), false, true)
+              == ExperimentalRadioIdentityHold::None,
+          "an expired identity window classifies an unidentified Icom");
+    check(experimentalRadioIdentityHold(
+              QStringLiteral("icom"), QStringLiteral("IC-7300MK2"), true, false)
+              == ExperimentalRadioIdentityHold::None,
+          "an identified radio is not held even while a wake is finishing");
+    check(experimentalRadioIdentityHold(
+              QStringLiteral("hl2"), QString(), false, false)
+              == ExperimentalRadioIdentityHold::None,
+          "non-Icom families classify on the connected edge");
     check(hl2Notice && hl2Notice->displayName == QStringLiteral("Hermes-Lite 2"),
           "Hermes-Lite 2 is identified as an experimental radio family");
     check(ananNotice && ananNotice->displayName == QStringLiteral("ANAN-G2"),
@@ -238,6 +288,12 @@ int main(int argc, char** argv)
     // ownership invariant.
     {
         RadioModel reconnectModel;
+        int connectTimeDroppedCommands = 0;
+        QObject::connect(&reconnectModel, &RadioModel::commandDropped,
+                         &reconnectModel,
+                         [&connectTimeDroppedCommands](const QString&) {
+            ++connectTimeDroppedCommands;
+        });
         reconnectModel.connectToRadio(infoFor(QStringLiteral("icom")));
         auto* icomBackend =
             dynamic_cast<icom::IcomCivBackend*>(reconnectModel.backend());
@@ -252,6 +308,15 @@ int main(int argc, char** argv)
                 icomBackend, "onSessionConnected", Qt::DirectConnection,
                 Q_ARG(QString, QStringLiteral("IC-705")));
             check(firstConnected, "the first Icom session reaches its connected edge");
+            check(connectTimeDroppedCommands == 0,
+                  "Icom connect does not leak Flex commands into the unsupported-control notice");
+            reconnectModel.setPanWnb(false);
+            reconnectModel.setPanWnbLevel(50);
+            reconnectModel.setWaterfallColorGain(50);
+            reconnectModel.setWaterfallBlackLevel(15);
+            reconnectModel.setWaterfallAutoBlack(false);
+            check(connectTimeDroppedCommands == 0,
+                  "Icom display-state sync does not emit Flex-only pan or waterfall commands");
             check(!icomBackend->capabilities().hasGpsHardware,
                   "a familiar network name cannot grant GPS before CI-V identity");
             icom::CivFrame identity;
@@ -804,6 +869,69 @@ int main(int argc, char** argv)
         other.sub = 0x01;
         check(!icom::parseModelIdReply(other).has_value(),
               "and neither is a different sub-command");
+    }
+
+    // ── The construction-time mic push stops at a radio that owns its mic gain ──
+    //
+    // RadioModel::setupBackend() hands a freshly built backend the mic level
+    // the model already holds, so a host modulator constructed at its own unity
+    // default cannot silently part from the slider (pinned from the other side
+    // by hl2_family_transition_test). That push is gated on
+    // caps.hostModulates, and this is the family it exists to exclude.
+    //
+    // On an Icom the mic level is not a client-side DSP gain at all: it is the
+    // radio's own 14 0B MIC GAIN register — or, on an IC-9700 with LAN as the
+    // modulation input, SET 0114 — read back on connect and mirrored into the
+    // same slider (IcomControls: "mic.gain", Wiring::Both). A backend rebuild
+    // is not the operator asking for anything, so pushing a number carried in
+    // from the previous radio is a silent write of state this radio never asked
+    // for. The wire itself is defended by sendUserCommand()'s not-connected
+    // guard, but the mirror is written before that guard is reached, and
+    // healthSnapshot() then prints our number where the radio's belongs.
+    //
+    // Break it by restoring the !usesFlexCommandPlane() gate at the end of
+    // setupBackend() and the first check below fails with the mirror reporting
+    // 80 on a radio that has answered nothing.
+    {
+        // Away and back, because connectToRadio() rebuilds only on a family
+        // CHANGE — a same-family reconnect keeps the backend it already has.
+        model.connectToRadio(infoFor(QStringLiteral("flex"),
+                                     QStringLiteral("1234-5678-9012-3456")));
+        // Where the operator left the slider on the PREVIOUS radio. The model is
+        // never reset across a family switch, which is what makes this a value
+        // that can travel. Set while Flex is live, where the seam is silent and
+        // `transmit set miclevel=` is the wire form.
+        model.transmitModel().setMicLevel(80);
+        model.connectToRadio(infoFor(QStringLiteral("icom")));
+        auto* rebuilt = dynamic_cast<icom::IcomCivBackend*>(model.backend());
+        check(rebuilt != nullptr, "the family switch produced a fresh Icom backend");
+        if (rebuilt) {
+            check(!icom::IcomCivBackendTestAccess::micGainReported(*rebuilt),
+                  "a rebuilt Icom backend is not handed the previous radio's mic "
+                  "level: the radio owns 14 0B and has not been asked yet");
+
+            // AND THE OPERATOR'S OWN HAND STILL REACHES IT. This narrows the
+            // construction push only; micLevelCommandIssued is operator intent
+            // and stays wired, so the Phone MIC slider remains a live control on
+            // an Icom rather than a readout that cannot write back.
+            // WHY THIS LANDS IN THE PHYSICAL-MIC BRANCH, since the answer is not
+            // local: IcomCivBackend's constructor seeds m_model to
+            // unknownModel(), whose civAddress matches no case in profileFor(),
+            // so modulationProfileFor() is nullopt and setMicGain() never takes
+            // its LAN-MOD early return. An unidentified Icom has no modulation
+            // profile, so this is the 14 0B path.
+            //
+            // It matters for the NEXT reader rather than for today: if
+            // unknownModel() ever gained a profile with
+            // phoneLevelFollowsNetworkInput, this would fail on the
+            // m_networkModLevelPercent < 0 refusal — a reason that has nothing
+            // to do with the gate this section pins (PR #5643 review).
+            model.transmitModel().setMicLevel(70);
+            check(icom::IcomCivBackendTestAccess::micGainReported(*rebuilt)
+                      && icom::IcomCivBackendTestAccess::micGainPercent(*rebuilt)
+                             == 70,
+                  "the operator moving the slider still reaches the Icom mic gain");
+        }
     }
 
     if (g_failures == 0)

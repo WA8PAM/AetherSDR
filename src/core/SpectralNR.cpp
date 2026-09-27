@@ -29,6 +29,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 #include "SpectralNR.h"
 #include "LogManager.h"
+#include "core/dsp/FftwPlannerLock.h"
 #include <QByteArray>
 #include <QCryptographicHash>
 #include <algorithm>
@@ -36,12 +37,11 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #include <cstdio>
 #include <cmath>
 #include <cstring>
+#include <cstdint>
 #include <numbers>
 #include <numeric>
 
 namespace AetherSDR {
-
-std::mutex SpectralNR::s_fftwMutex;
 
 namespace {
 
@@ -264,6 +264,17 @@ std::string wisdomTempPathForDirectory(const std::string& directory)
 }
 
 #ifdef HAVE_FFTW3
+// DELIBERATELY NOT SELF-GUARDING — do not "fix" this by taking
+// fftwPlannerLock() here. fftw_export_wisdom_to_filename touches the
+// process-global wisdom store and does need the lock, but EVERY caller
+// already holds it, and one of them holds it ACROSS this call: the Windows
+// Thetis branch of generateWisdom() invokes this from inside its own lock
+// scope. fftwPlannerLock() hands out a plain std::mutex, which is not
+// recursive, so making this helper acquire the lock itself would deadlock on
+// Windows and nowhere else — a platform this tree does not build in CI.
+// Neither half of that was written down before #5895; it is written down now.
+//
+// CALLER MUST HOLD fftwPlannerLock().
 bool exportWisdomAtomically(const std::string& directory)
 {
     const std::string wisdomFile = wisdomPathForDirectory(directory);
@@ -295,6 +306,12 @@ bool exportWisdomAtomically(const std::string& directory)
 
 SpectralNR::SpectralNR(int fftSize, int sampleRate, int overlap,
                        bool useLegacyGainMethods)
+    : SpectralNR(fftSize, sampleRate, overlap, useLegacyGainMethods, true)
+{
+}
+
+SpectralNR::SpectralNR(int fftSize, int sampleRate, int overlap,
+                       bool useLegacyGainMethods, bool withRightChannel)
     : m_fftSize(fftSize)
     , m_overlap(overlap == 4 ? 4 : 2)
     , m_hopSize(fftSize / m_overlap)
@@ -373,10 +390,6 @@ SpectralNR::SpectralNR(int fftSize, int sampleRate, int overlap,
     // Allocate overlap-add accumulators
     m_inAccum.resize(fftSize * 4, 0.0);
     m_outAccum.resize(fftSize * 4, 0.0);
-    m_stereoInAccumL.resize(fftSize * 4, 0.0);
-    m_stereoInAccumR.resize(fftSize * 4, 0.0);
-    m_stereoOutAccumL.resize(fftSize * 4, 0.0);
-    m_stereoOutAccumR.resize(fftSize * 4, 0.0);
 
     m_window.resize(fftSize);
     m_fftIn.resize(fftSize);
@@ -389,16 +402,47 @@ SpectralNR::SpectralNR(int fftSize, int sampleRate, int overlap,
     m_gainIm.resize(m_msize);
 
 #ifdef HAVE_FFTW3
-    // FFTW-allocated complex arrays (16-byte aligned)
-    m_fftOut = fftw_alloc_complex(m_msize);
-    m_ifftIn = fftw_alloc_complex(m_msize);
-
     // Create plans — uses wisdom if available for optimal performance.
     // FFTW_MEASURE is used here: fast enough for the NR2 working sizes without
     // prior wisdom, and will use wisdom when it's been generated.
-    // Lock: FFTW plan creation is NOT thread-safe (#467)
+    //
+    // ONE PROCESS, ONE PLANNER, ONE LOCK. This class used to guard these two
+    // plans with a private static mutex of its own (#467, filed when "all
+    // FFTW usage is in SpectralNR.cpp" was still true). It stopped being true
+    // when WDSP was vendored: WdspChannel, Hl2Spectrum and AnanPanAnalyzer all
+    // reach the same process-global, double-precision planner, and two
+    // mutexes over one planner serialise nothing (#5895). See
+    // core/dsp/FftwPlannerLock.h — the lock is FFTW's, not any one class's.
+    //
+    // The window is one connect, and the two sides are on DIFFERENT threads
+    // whichever way this is reached. Hl2RxDsp::buildChannel runs
+    // WdspChannel::create() and then constructs Hl2Spectrum on the HL2 DSP
+    // build thread. createNr2Filter runs HERE, and which thread that is
+    // depends on the CALL SITE, because MainWindow moves AudioEngine to the
+    // audio worker thread (#502) and thread affinity does not redirect a
+    // DIRECT method call:
+    //
+    //   queued, audio worker thread — MainWindow.cpp's invokeMethod sites
+    //   direct, GUI thread          — AetherDspWidget's NR2 checkbox and
+    //                                 MainWindow_DspApplets, the two direct
+    //                                 sites that can pass TRUE and therefore
+    //                                 build a filter
+    //
+    // The other direct sites (AetherRxDialog, ClientRxChainWidget,
+    // MainWindow_Shortcuts) only ever pass false, so they reach the
+    // DESTRUCTOR on the GUI thread — microseconds of held work, but the same
+    // wait if another thread has the planner.
+    //
+    // The lock covers the ALLOCATIONS as well as the plans, the same width
+    // Hl2Spectrum's constructor uses and for the same reason: the two frames
+    // TSan named in #5424 are fftw_malloc_plain's memalign and a free on the
+    // WDSP thread, not the planner, so a plan-only lock leaves the reported
+    // edge unsynchronised. fftw_execute() stays unguarded.
     {
-        std::lock_guard<std::mutex> lock(s_fftwMutex);
+        auto lock = fftwPlannerLock();
+        // FFTW-allocated complex arrays (16-byte aligned)
+        m_fftOut = fftw_alloc_complex(m_msize);
+        m_ifftIn = fftw_alloc_complex(m_msize);
         m_planFwd = fftw_plan_dft_r2c_1d(fftSize, m_fftIn.data(),
                                           m_fftOut, FFTW_MEASURE);
         m_planRev = fftw_plan_dft_c2r_1d(fftSize, m_ifftIn,
@@ -464,16 +508,27 @@ SpectralNR::SpectralNR(int fftSize, int sampleRate, int overlap,
 
     initWindow();
     reset();
+
+    if (withRightChannel) {
+        // Built here, never on the audio thread: its constructor plans FFTW.
+        m_rightChannel.reset(new SpectralNR(fftSize, sampleRate, overlap,
+                                            useLegacyGainMethods, false));
+        for (int channel = 0; channel < 2; ++channel) {
+            m_stereoIn[channel].resize(m_hopSize);
+            m_stereoOut[channel].resize(m_hopSize);
+        }
+    }
 }
 
 SpectralNR::~SpectralNR()
 {
 #ifdef HAVE_FFTW3
-    {
-        std::lock_guard<std::mutex> lock(s_fftwMutex);
-        if (m_planFwd) fftw_destroy_plan(m_planFwd);
-        if (m_planRev) fftw_destroy_plan(m_planRev);
-    }
+    // Same lock as the constructor, and over the frees for the same reason:
+    // the race #5424 reported was a free on one thread against an allocation
+    // on another, so guarding only destroy_plan leaves the teardown half open.
+    auto lock = fftwPlannerLock();
+    if (m_planFwd) fftw_destroy_plan(m_planFwd);
+    if (m_planRev) fftw_destroy_plan(m_planRev);
     if (m_fftOut)  fftw_free(m_fftOut);
     if (m_ifftIn)  fftw_free(m_ifftIn);
 #endif
@@ -485,6 +540,7 @@ void SpectralNR::setGainMax(float value)
         ? std::clamp(static_cast<double>(value), 0.0, 2.0)
         : 1.0;
     m_gainMax.store(safeValue);
+    if (m_rightChannel) m_rightChannel->setGainMax(value);
 }
 
 void SpectralNR::setGainFloor(float value)
@@ -493,6 +549,7 @@ void SpectralNR::setGainFloor(float value)
         ? std::clamp(static_cast<double>(value), 0.0, 1.0)
         : 0.0;
     m_gainFloor.store(safeValue);
+    if (m_rightChannel) m_rightChannel->setGainFloor(value);
 }
 
 void SpectralNR::setQspp(float value)
@@ -501,6 +558,7 @@ void SpectralNR::setQspp(float value)
         ? std::clamp(static_cast<double>(value), 1.0e-4, 1.0 - 1.0e-4)
         : 0.20;
     m_qSpp.store(safeValue);
+    if (m_rightChannel) m_rightChannel->setQspp(value);
 }
 
 void SpectralNR::setGainSmooth(float value)
@@ -509,26 +567,52 @@ void SpectralNR::setGainSmooth(float value)
         ? std::clamp(static_cast<double>(value), 0.0, 0.9999)
         : 0.85;
     m_gainSmooth.store(safeValue);
+    if (m_rightChannel) m_rightChannel->setGainSmooth(value);
 }
 
 void SpectralNR::setGainMethod(int method)
 {
     m_gainMethod.store(std::clamp(method, 0, 3));
+    if (m_rightChannel) m_rightChannel->setGainMethod(method);
 }
 
 void SpectralNR::setNpeMethod(int method)
 {
     m_npeMethod.store(std::clamp(method, 0, 2));
+    if (m_rightChannel) m_rightChannel->setNpeMethod(method);
+}
+
+void SpectralNR::setAeFilter(bool on)
+{
+    m_aeFilter.store(on);
+    if (m_rightChannel) m_rightChannel->setAeFilter(on);
 }
 
 void SpectralNR::reset()
 {
+    resetTransient();
+    resetNoiseEstimate();
+}
+
+void SpectralNR::resetTransient()
+{
+    ++m_transientResetCount;
+    if (m_rightChannel) m_rightChannel->resetTransient();
+    // Upstream zeroes olddmag in its flush path (emnr.c). Without this a peak
+    // captured before a transmit pass keeps inflating the injected level for
+    // seconds after receive resumes, since the follower decays over 5 s.
+    m_post2PeakHold = 0.0;
+    if (m_post2RngState == 0) {
+        // Upstream seeds from the instance pointer for the same reason.
+        m_post2RngState = 2463534242u
+            + 2654435761u * static_cast<unsigned int>(
+                  reinterpret_cast<std::uintptr_t>(this));
+        if (m_post2RngState == 0) {
+            m_post2RngState = 2463534242u;
+        }
+    }
     std::fill(m_inAccum.begin(), m_inAccum.end(), 0.0);
     std::fill(m_outAccum.begin(), m_outAccum.end(), 0.0);
-    std::fill(m_stereoInAccumL.begin(), m_stereoInAccumL.end(), 0.0);
-    std::fill(m_stereoInAccumR.begin(), m_stereoInAccumR.end(), 0.0);
-    std::fill(m_stereoOutAccumL.begin(), m_stereoOutAccumL.end(), 0.0);
-    std::fill(m_stereoOutAccumR.begin(), m_stereoOutAccumR.end(), 0.0);
     m_inWritePos = 0;
     m_inReadPos = 0;
     m_samplesAccum = 0;
@@ -542,6 +626,62 @@ void SpectralNR::reset()
     m_outReadPos = 0;
     m_outputAvailable = m_fftSize;
 
+    // The AGC common-mode references flush with the transients rather than
+    // surviving alongside the noise estimate: their calibration re-runs
+    // inside the re-armed ramp window (m_frameCount < m_rampFrames), and its
+    // first frame overwrites the level reference with weight 1/(0+1) anyway,
+    // so a retained value could only live for one frame. Flushing keeps the
+    // recalibration deterministic — and post-TX the receiver AGC state that
+    // these references describe is exactly what may have changed.
+    //
+    // What this cannot preserve is a level step that straddles the gap. NR2
+    // sees post-AGC audio on every path (the radio's AGC for a Flex, WDSP's
+    // inside Hl2RxDsp for an HL2), and the first post-TX frame re-seeds
+    // m_commonReferencePsd from the post-TX spectrum (detectCommonModeScale),
+    // so the scale corrector never observes the step and scalePowerHistory()
+    // will not rescale the retained noise estimate for it. The fallout is
+    // bounded rather than corrected: minimum statistics re-levels a floor that
+    // is now too high within a few frames, and one that is too low over the
+    // following windows — still climbing at 1.6 s (−15.5 dB against a
+    // −27.4 dB settled depth on the +6 dB row) and settled by 2.5 s, no
+    // slower than the full reset() this path replaced. Pinned by the
+    // ±6 dB step rows in nr2_tx_rx_reset_test, which measure both windows.
+    std::fill(m_commonWantedProtected.begin(),
+              m_commonWantedProtected.end(), 0);
+    std::fill(m_commonReferencePsd.begin(),
+              m_commonReferencePsd.end(), 0.0);
+    std::fill(m_residualReferencePsd.begin(),
+              m_residualReferencePsd.end(), 0.0);
+    std::fill(m_residualReferenceGainRatio.begin(),
+              m_residualReferenceGainRatio.end(), 1.0);
+    std::fill(m_residualReferenceValid.begin(),
+              m_residualReferenceValid.end(), 0);
+    std::fill(m_commonNoiseLike.begin(), m_commonNoiseLike.end(), 0);
+
+    std::fill(m_prevMask.begin(), m_prevMask.end(), 1.0);
+    std::fill(m_prevGamma.begin(), m_prevGamma.end(), 1.0);
+    std::fill(m_mask.begin(), m_mask.end(), 1.0);
+    std::fill(m_smoothMask.begin(), m_smoothMask.end(), 1.0);
+    std::fill(m_aeMask.begin(), m_aeMask.end(), 1.0);
+    std::fill(m_aePrefix.begin(), m_aePrefix.end(), 0.0);
+
+    m_commonReferenceInitialized = false;
+    m_commonReferenceReacquiring = false;
+    m_commonSilenceRecoveryContext = false;
+    m_commonLevelReferenceInitialized = false;
+    m_commonLevelReferencePower = 0.0;
+    m_commonScaleLog = 0.0;
+    m_commonAppliedScale = 1.0;
+    m_commonReturnScale = 1.0;
+    m_commonDetectedScale = 1.0;
+    m_frameCount = 0;
+    m_currentWet = 0.0;
+}
+
+void SpectralNR::resetNoiseEstimate()
+{
+    ++m_noiseEstimateResetCount;
+    if (m_rightChannel) m_rightChannel->resetNoiseEstimate();
     // Start with a HIGH noise estimate — gains will be < 1 during convergence,
     // producing gentle suppression rather than amplification spikes.
     // The OSMS tracker will converge downward to the true noise floor in ~2s.
@@ -568,45 +708,16 @@ void SpectralNR::reset()
               m_nstatTonalProbability.end(), 0.0);
     std::fill(m_nstatTonalIndicator.begin(),
               m_nstatTonalIndicator.end(), 0);
-    std::fill(m_commonWantedProtected.begin(),
-              m_commonWantedProtected.end(), 0);
     std::fill(m_nstatNoisePsd.begin(), m_nstatNoisePsd.end(), 0.0);
-    std::fill(m_commonReferencePsd.begin(),
-              m_commonReferencePsd.end(), 0.0);
-    std::fill(m_residualReferencePsd.begin(),
-              m_residualReferencePsd.end(), 0.0);
-    std::fill(m_residualReferenceGainRatio.begin(),
-              m_residualReferenceGainRatio.end(), 1.0);
-    std::fill(m_residualReferenceValid.begin(),
-              m_residualReferenceValid.end(), 0);
-    std::fill(m_commonNoiseLike.begin(), m_commonNoiseLike.end(), 0);
 
     for (auto& v : m_actMinBuf)
         std::fill(v.begin(), v.end(), 1e30);
-
-    std::fill(m_prevMask.begin(), m_prevMask.end(), 1.0);
-    std::fill(m_prevGamma.begin(), m_prevGamma.end(), 1.0);
-    std::fill(m_mask.begin(), m_mask.end(), 1.0);
-    std::fill(m_smoothMask.begin(), m_smoothMask.end(), 1.0);
-    std::fill(m_aeMask.begin(), m_aeMask.end(), 1.0);
-    std::fill(m_aePrefix.begin(), m_aePrefix.end(), 0.0);
 
     m_alphaC = 1.0;
     // WDSP rotates on the first complete frame so the estimator starts from
     // observed audio rather than waiting a full sub-window on its seed value.
     m_subwc = m_V;
     m_ambIdx = 0;
-    m_commonReferenceInitialized = false;
-    m_commonReferenceReacquiring = false;
-    m_commonSilenceRecoveryContext = false;
-    m_commonLevelReferenceInitialized = false;
-    m_commonLevelReferencePower = 0.0;
-    m_commonScaleLog = 0.0;
-    m_commonAppliedScale = 1.0;
-    m_commonReturnScale = 1.0;
-    m_commonDetectedScale = 1.0;
-    m_frameCount = 0;
-    m_currentWet = 0.0;
 }
 
 void SpectralNR::initWindow()
@@ -628,7 +739,20 @@ bool SpectralNR::loadWisdom(const std::string& directory)
 {
 #ifdef HAVE_FFTW3
     const std::string wisdomFile = wisdomPathForDirectory(directory);
-    std::lock_guard<std::mutex> lock(s_fftwMutex);
+    // The wisdom store is process-global and shared with WdspChannel's own
+    // cache at a different path, so an import mutates state the WDSP planner
+    // reads — and, because fftw_export_wisdom_to_filename writes the WHOLE
+    // accumulated store, each side's file already carries the other's
+    // entries. NOT RECURSIVE: generateWisdom() calls this before it takes the
+    // lock itself, and fftwPlannerLock() hands out a plain std::mutex.
+    //
+    // REACHED FROM THE GUI THREAD. AudioEngine's constructor
+    // (logNr2WisdomSummary) and AudioEngine::needsWisdomGeneration(), which
+    // MainWindow::enableNr2WithWisdom() calls before every NR2 enable, both
+    // land here. The import itself is well under a millisecond; what is new
+    // with a shared lock is the WAIT, bounded by whatever FFTW work another
+    // thread is holding the planner for.
+    auto lock = fftwPlannerLock();
     return fftw_import_wisdom_from_filename(wisdomFile.c_str()) != 0;
 #else
     (void)directory;
@@ -665,7 +789,7 @@ SpectralNR::WisdomResult SpectralNR::generateWisdom(const std::string& directory
         if (!appData.isEmpty()) {
             std::string thetisWisdom = std::string(appData.constData())
                 + "\\OpenHPSDR\\Thetis-x64\\wdspWisdom00";
-            std::lock_guard<std::mutex> lock(s_fftwMutex);
+            auto lock = fftwPlannerLock();
             if (fftw_import_wisdom_from_filename(thetisWisdom.c_str())) {
                 if (cancelled())
                     return WisdomResult::Cancelled;
@@ -687,11 +811,41 @@ SpectralNR::WisdomResult SpectralNR::generateWisdom(const std::string& directory
     // This takes several minutes on first run.  FFTW_PATIENT produces
     // highly optimised plans for each size.
     constexpr int maxSize = 262144;
-    auto* cbuf = fftw_alloc_complex(maxSize);
-    auto* rbuf = static_cast<double*>(fftw_malloc(maxSize * sizeof(double)));
-    if (!cbuf || !rbuf) {
+    // Allocated and released under the planner lock, like the constructor's
+    // buffers: fftw_malloc_plain is one half of the edge #5424 names. 6 MB
+    // here, so the hold is a memalign and nothing else.
+    fftw_complex* cbuf = nullptr;
+    double* rbuf = nullptr;
+    {
+        auto lock = fftwPlannerLock();
+        cbuf = fftw_alloc_complex(maxSize);
+        rbuf = static_cast<double*>(fftw_malloc(maxSize * sizeof(double)));
+    }
+    // fftw_free(nullptr) is a no-op, so this is safe on the allocation-failure
+    // path too. NEVER call it while already holding the lock —
+    // fftwPlannerLock() hands out a plain std::mutex and std::mutex is not
+    // recursive. The same rule is why exportWisdomAtomically() above does not
+    // lock itself; see its comment.
+    //
+    // IDEMPOTENT BY CONSTRUCTION, not by call-site discipline. It nulls what
+    // it frees. No second call is reachable today — all seven call sites
+    // below return before reaching another — but "today" is the whole of the
+    // guarantee, and the shape that would break it is a copy-paste: this
+    // function has thirteen loop iterations of four near-identical blocks,
+    // each ending freeBuffers() / remove() / return, and a fifth plan type or
+    // a new cancel point added by copying one of them is exactly the edit
+    // that drops the return. Nulling does not make that edit correct — it
+    // would then plan on a null buffer — but it turns silent heap corruption
+    // into a deterministic failure at the point of the mistake.
+    const auto freeBuffers = [&cbuf, &rbuf] {
+        auto lock = fftwPlannerLock();
         fftw_free(rbuf);
+        rbuf = nullptr;
         fftw_free(cbuf);
+        cbuf = nullptr;
+    };
+    if (!cbuf || !rbuf) {
+        freeBuffers();
         std::remove(wisdomTempPathForDirectory(directory).c_str());
         qCWarning(lcDsp) << "SpectralNR: failed to allocate buffers for FFTW wisdom";
         return WisdomResult::Failed;
@@ -709,14 +863,13 @@ SpectralNR::WisdomResult SpectralNR::generateWisdom(const std::string& directory
 
         // 1. Complex forward
         if (cancelled()) {
-            fftw_free(rbuf);
-            fftw_free(cbuf);
+            freeBuffers();
             std::remove(wisdomTempPathForDirectory(directory).c_str());
             return WisdomResult::Cancelled;
         }
         if (progress) progress(step, totalSteps,
             "Computing COMPLEX FORWARD FFT size " + std::to_string(psize) + "...");
-        {   std::lock_guard<std::mutex> lock(s_fftwMutex);
+        {   auto lock = fftwPlannerLock();
             fftw_plan p = fftw_plan_dft_1d(psize, cbuf, cbuf,
                                             FFTW_FORWARD, FFTW_PATIENT);
             if (p) fftw_destroy_plan(p);
@@ -725,14 +878,13 @@ SpectralNR::WisdomResult SpectralNR::generateWisdom(const std::string& directory
 
         // 2. Complex backward (same size)
         if (cancelled()) {
-            fftw_free(rbuf);
-            fftw_free(cbuf);
+            freeBuffers();
             std::remove(wisdomTempPathForDirectory(directory).c_str());
             return WisdomResult::Cancelled;
         }
         if (progress) progress(step, totalSteps,
             "Computing COMPLEX BACKWARD FFT size " + std::to_string(psize) + "...");
-        {   std::lock_guard<std::mutex> lock(s_fftwMutex);
+        {   auto lock = fftwPlannerLock();
             fftw_plan p = fftw_plan_dft_1d(psize, cbuf, cbuf,
                                             FFTW_BACKWARD, FFTW_PATIENT);
             if (p) fftw_destroy_plan(p);
@@ -741,14 +893,13 @@ SpectralNR::WisdomResult SpectralNR::generateWisdom(const std::string& directory
 
         // 3. Real-to-complex forward
         if (cancelled()) {
-            fftw_free(rbuf);
-            fftw_free(cbuf);
+            freeBuffers();
             std::remove(wisdomTempPathForDirectory(directory).c_str());
             return WisdomResult::Cancelled;
         }
         if (progress) progress(step, totalSteps,
             "Computing REAL-TO-COMPLEX FFT size " + std::to_string(psize) + "...");
-        {   std::lock_guard<std::mutex> lock(s_fftwMutex);
+        {   auto lock = fftwPlannerLock();
             fftw_plan p = fftw_plan_dft_r2c_1d(psize, rbuf, cbuf, FFTW_PATIENT);
             if (p) fftw_destroy_plan(p);
         }
@@ -756,14 +907,13 @@ SpectralNR::WisdomResult SpectralNR::generateWisdom(const std::string& directory
 
         // 4. Complex-to-real inverse
         if (cancelled()) {
-            fftw_free(rbuf);
-            fftw_free(cbuf);
+            freeBuffers();
             std::remove(wisdomTempPathForDirectory(directory).c_str());
             return WisdomResult::Cancelled;
         }
         if (progress) progress(step, totalSteps,
             "Computing COMPLEX-TO-REAL FFT size " + std::to_string(psize) + "...");
-        {   std::lock_guard<std::mutex> lock(s_fftwMutex);
+        {   auto lock = fftwPlannerLock();
             fftw_plan p = fftw_plan_dft_c2r_1d(psize, cbuf, rbuf, FFTW_PATIENT);
             if (p) fftw_destroy_plan(p);
         }
@@ -771,19 +921,17 @@ SpectralNR::WisdomResult SpectralNR::generateWisdom(const std::string& directory
     }
 
     if (cancelled()) {
-        fftw_free(rbuf);
-        fftw_free(cbuf);
+        freeBuffers();
         std::remove(wisdomTempPathForDirectory(directory).c_str());
         return WisdomResult::Cancelled;
     }
 
     bool exported = false;
     {
-        std::lock_guard<std::mutex> lock(s_fftwMutex);
+        auto lock = fftwPlannerLock();
         exported = exportWisdomAtomically(directory);
     }
-    fftw_free(rbuf);
-    fftw_free(cbuf);
+    freeBuffers();
     if (cancelled()) {
         std::remove(wisdomPathForDirectory(directory).c_str());
         std::remove(wisdomTempPathForDirectory(directory).c_str());
@@ -867,90 +1015,37 @@ void SpectralNR::process(const float* input, float* output, int numSamples)
     m_outputAvailable -= numSamples;
 }
 
-void SpectralNR::processStereoSharedMask(const float* input, float* output, int numFrames)
+void SpectralNR::processStereo(const float* input, float* output, int numFrames)
 {
     if (numFrames <= 0) {
         return;
     }
 
-    if (hasPlanFailed()) {
+    if (!m_rightChannel || hasPlanFailed()) {
         std::memmove(output, input, numFrames * 2 * sizeof(float));
         return;
     }
 
-    if (numFrames > m_hopSize) {
-        int offset = 0;
-        while (offset < numFrames) {
-            const int chunk = std::min(m_hopSize, numFrames - offset);
-            processStereoSharedMask(input + (2 * offset),
-                                    output + (2 * offset),
-                                    chunk);
-            offset += chunk;
+    // Both channels run the same hop-sized chunks, so their overlap-add
+    // cursors and startup ramps advance in lockstep and the image cannot
+    // drift. One hop is also what the staging buffers were sized for.
+    int offset = 0;
+    while (offset < numFrames) {
+        const int chunk = std::min(m_hopSize, numFrames - offset);
+        const float* src = input + (2 * offset);
+        for (int i = 0; i < chunk; ++i) {
+            m_stereoIn[0][i] = src[2 * i];
+            m_stereoIn[1][i] = src[2 * i + 1];
         }
-        return;
-    }
-
-    const int accSize = static_cast<int>(m_inAccum.size());
-    const int outSize = static_cast<int>(m_outAccum.size());
-
-    for (int i = 0; i < numFrames; ++i) {
-        const float left = input[2 * i];
-        const float right = input[2 * i + 1];
-        m_inAccum[m_inWritePos] =
-            0.5 * (static_cast<double>(left) + static_cast<double>(right));
-        m_stereoInAccumL[m_inWritePos] = static_cast<double>(left);
-        m_stereoInAccumR[m_inWritePos] = static_cast<double>(right);
-        m_inWritePos = (m_inWritePos + 1) % accSize;
-    }
-    m_samplesAccum += numFrames;
-
-    while (m_samplesAccum >= m_fftSize) {
-        const int frameReadPos = m_inReadPos;
-
-        for (int i = 0; i < m_fftSize; ++i) {
-            const int idx = (frameReadPos + i) % accSize;
-            m_fftIn[i] = m_window[i] * m_inAccum[idx];
+        process(m_stereoIn[0].data(), m_stereoOut[0].data(), chunk);
+        m_rightChannel->process(m_stereoIn[1].data(), m_stereoOut[1].data(), chunk);
+        float* dst = output + (2 * offset);
+        for (int i = 0; i < chunk; ++i) {
+            dst[2 * i] = m_stereoOut[0][i];
+            dst[2 * i + 1] = m_stereoOut[1][i];
         }
-
-        if (updateMaskFromCurrentFrame()) {
-            for (int i = 0; i < m_fftSize; ++i) {
-                const int idx = (frameReadPos + i) % accSize;
-                m_fftIn[i] = m_window[i] * m_stereoInAccumL[idx];
-            }
-            synthesizeCurrentFrameWithMask();
-            for (int i = 0; i < m_fftSize; ++i) {
-                const int idx = (m_outWritePos + i) % outSize;
-                m_stereoOutAccumL[idx] +=
-                    m_olaScale * m_window[i] * m_ifftOut[i];
-            }
-
-            for (int i = 0; i < m_fftSize; ++i) {
-                const int idx = (frameReadPos + i) % accSize;
-                m_fftIn[i] = m_window[i] * m_stereoInAccumR[idx];
-            }
-            synthesizeCurrentFrameWithMask();
-            for (int i = 0; i < m_fftSize; ++i) {
-                const int idx = (m_outWritePos + i) % outSize;
-                m_stereoOutAccumR[idx] +=
-                    m_olaScale * m_window[i] * m_ifftOut[i];
-            }
-        }
-
-        m_inReadPos = (m_inReadPos + m_hopSize) % accSize;
-        m_samplesAccum -= m_hopSize;
-        m_outWritePos = (m_outWritePos + m_hopSize) % outSize;
-        m_outputAvailable += m_hopSize;
+        offset += chunk;
     }
-
-    Q_ASSERT(m_outputAvailable >= numFrames);
-    for (int i = 0; i < numFrames; ++i) {
-        output[2 * i] = static_cast<float>(m_stereoOutAccumL[m_outReadPos]);
-        output[2 * i + 1] = static_cast<float>(m_stereoOutAccumR[m_outReadPos]);
-        m_stereoOutAccumL[m_outReadPos] = 0.0;
-        m_stereoOutAccumR[m_outReadPos] = 0.0;
-        m_outReadPos = (m_outReadPos + 1) % outSize;
-    }
-    m_outputAvailable -= numFrames;
 }
 
 bool SpectralNR::updateMaskFromCurrentFrame()
@@ -1076,21 +1171,206 @@ bool SpectralNR::updateMaskFromCurrentFrame()
     return true;
 }
 
-void SpectralNR::synthesizeCurrentFrameWithMask()
-{
-#ifdef HAVE_FFTW3
-    if (m_planFailed) return;
+// ─── Psychoacoustic post-processing — WDSP emnr.c's post2 stage ──────────────
+//
+// Ported from third_party/wdsp/upstream/emnr.c (post2(), post2_calc_w(),
+// post2_init_table()). The arithmetic is WDSP's; two things are deliberately
+// not copied verbatim:
+//
+//  * `taper` is a FREQUENCY here, not WDSP's fraction of the bin count. 0.12
+//    of WDSP's 2048 bins over 24 kHz is 2871 Hz; 0.12 of our 513 bins over
+//    12 kHz would be 1435 Hz, which lowpasses voice to telephone quality. The
+//    default below is WDSP's value expressed in Hz, so the two implementations
+//    cover the same band and the control stays correct if the FFT geometry is
+//    retuned again (it has been once already: 256/2 -> 1024/4).
+//
+//  * the decay is a time constant in seconds rather than a precomputed
+//    per-frame coefficient, derived here from the live hop size, which is the
+//    same quantity WDSP computes as exp(-fsize / (tc * rate * ovrlp)).
+//
+// Everything else — the peak follower, the residual/white blend, the raised
+// cosine taper, zeroing DC and everything above the band — is as upstream.
 
-    fftw_execute(m_planFwd);
-    for (int k = 0; k < m_msize; ++k) {
-        m_freqRe[k] = m_fftOut[k][0];
-        m_freqIm[k] = m_fftOut[k][1];
+namespace {
+constexpr int kPost2TableSize = 1024;
+
+// How loud the synthetic white term is, as a fraction of the band peak the
+// residual term is measured against.
+//
+// This is WDSP's `dmult = dmag * 4.0 * a->gain` with `POST2_NOISE_MAG =
+// 113.98` folded in -- but it CANNOT be copied as those two constants, which
+// was the first version of this port and was 16384x too loud. `a->gain` is
+// `ogain / fsize / ovrlp` (emnr.c:310), so upstream's white-to-residual ratio
+// is `4 * gain * 113.98`, which at WDSP's own 4096/4 geometry is 0.0278 --
+// about 3% of the in-band peak, sitting sensibly beside a residual term that
+// is at most 1.0 of it. Our bins carry no such gain factor (the 1/fftSize
+// lands after the inverse transform), so `4 * 113.98` bare made the white
+// term 456x the residual rather than 0.028x.
+//
+// Expressed as the ratio rather than as WDSP's two constants, the stage
+// behaves the same at any FFT size -- the same reasoning as the taper being a
+// frequency rather than a bin fraction.
+constexpr double kPost2WhiteFraction = 4.0 * 113.98 / (4096.0 * 4.0);
+
+struct Post2PhasorTable {
+    double cs[kPost2TableSize];
+    double sn[kPost2TableSize];
+    Post2PhasorTable()
+    {
+        for (int i = 0; i < kPost2TableSize; ++i) {
+            const double th = 2.0 * std::numbers::pi * static_cast<double>(i) / kPost2TableSize;
+            cs[i] = std::cos(th);
+            sn[i] = std::sin(th);
+        }
     }
-#else
-    fftForward(m_fftIn.data(), m_freqRe.data(), m_freqIm.data());
-#endif
+};
+const Post2PhasorTable& post2Table()
+{
+    static const Post2PhasorTable table;
+    return table;
+}
+}  // namespace
 
-    synthesizeCurrentFrequencyBinsWithMask();
+void SpectralNR::setPost2Run(bool on)
+{
+    m_post2Run.store(on);
+    if (m_rightChannel) m_rightChannel->setPost2Run(on);
+}
+
+void SpectralNR::setPost2Factor(float v)
+{
+    m_post2Factor.store(std::clamp(v, 0.0f, 1.0f));
+    if (m_rightChannel) m_rightChannel->setPost2Factor(v);
+}
+
+void SpectralNR::setPost2Nlevel(float v)
+{
+    m_post2Nlevel.store(std::clamp(v, 0.0f, 1.0f));
+    if (m_rightChannel) m_rightChannel->setPost2Nlevel(v);
+}
+
+void SpectralNR::setPost2TaperHz(float hz)
+{
+    m_post2TaperHz.store(std::clamp(hz, 300.0f, 6000.0f));
+    if (m_rightChannel) m_rightChannel->setPost2TaperHz(hz);
+}
+
+void SpectralNR::setPost2DecaySeconds(float seconds)
+{
+    m_post2Decay.store(std::clamp(seconds, 0.1f, 30.0f));
+    if (m_rightChannel) m_rightChannel->setPost2DecaySeconds(seconds);
+}
+
+int SpectralNR::post2BinLimit() const
+{
+    if (m_fftSize <= 0 || m_sampleRate <= 0) {
+        return 0;
+    }
+    const double binHz = static_cast<double>(m_sampleRate) / m_fftSize;
+    const int bins = static_cast<int>(m_post2TaperHz.load() / binHz);
+    return std::clamp(bins, 1, m_msize);
+}
+
+// xorshift32, as upstream: cheap, and the sequence only has to be white.
+unsigned int SpectralNR::post2NextRandom()
+{
+    unsigned int x = m_post2RngState;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    m_post2RngState = x;
+    return x;
+}
+
+void SpectralNR::applyPsychoacousticPostProcessing()
+{
+    if (!m_post2Run.load()) {
+        return;
+    }
+
+    const int ilim = post2BinLimit();
+    if (ilim <= 1) {
+        return;
+    }
+
+    const double factor = m_post2Factor.load();
+    const double nlevel = m_post2Nlevel.load();
+
+    // Per-frame decay of the peak follower, from the hop this instance runs at.
+    const double secondsPerFrame =
+        static_cast<double>(m_hopSize) / static_cast<double>(m_sampleRate);
+    const double rateDecay = std::exp(-secondsPerFrame / m_post2Decay.load());
+
+    // Peak magnitude in the band, held and decayed so the injected level
+    // follows the signal rather than jumping frame to frame.
+    double peak = 0.0;
+    for (int k = 1; k < ilim; ++k) {
+        const double mag = std::sqrt(m_freqRe[k] * m_freqRe[k]
+                                   + m_freqIm[k] * m_freqIm[k]);
+        if (mag > peak) {
+            peak = mag;
+        }
+    }
+    if (peak > m_post2PeakHold) {
+        m_post2PeakHold = peak;
+    } else {
+        m_post2PeakHold *= rateDecay;
+    }
+    peak = std::max(peak, m_post2PeakHold);
+    const double whiteScale = peak * kPost2WhiteFraction;
+
+    // Raised-cosine taper over the band, rebuilt only when the band moves --
+    // upstream builds it in post2_calc_w() for the same reason, and a
+    // std::cos per bin per hop is up to 40k calls a second in stereo.
+    if (m_post2WindowBins != ilim) {
+        m_post2Window.assign(static_cast<std::size_t>(ilim), 0.75);
+        for (int k = 1; k < ilim; ++k) {
+            m_post2Window[k] = (ilim > 1)
+                ? 0.75 - 0.25 * std::cos(std::numbers::pi * (ilim - 1 - k) / (ilim - 1))
+                : 0.75;
+        }
+        m_post2WindowBins = ilim;
+    }
+
+    // The startup dry/wet ramp applies here too. Without this the stage would
+    // zero the band above ilim and inject noise while the rest of the filter
+    // is still 100% dry, which is audible as a lowpass snapping in ahead of
+    // the noise reduction it belongs to.
+    const double wet = m_currentWet;
+    if (wet <= 0.0) {
+        return;
+    }
+
+    const auto& table = post2Table();
+    for (int k = 1; k < ilim; ++k) {
+        const double w = m_post2Window[k];
+
+        const unsigned int phase = post2NextRandom() & (kPost2TableSize - 1);
+
+        // What this reduction just removed, per bin.
+        const double residualRe = m_freqRe[k] - m_gainRe[k];
+        const double residualIm = m_freqIm[k] - m_gainIm[k];
+
+        const double whiteRe = whiteScale * table.cs[phase];
+        const double whiteIm = whiteScale * table.sn[phase];
+
+        const double noiseRe = (1.0 - factor) * residualRe + factor * whiteRe;
+        const double noiseIm = (1.0 - factor) * residualIm + factor * whiteIm;
+
+        const double filledRe = w * (m_gainRe[k] + nlevel * noiseRe);
+        const double filledIm = w * (m_gainIm[k] + nlevel * noiseIm);
+        m_gainRe[k] = wet * filledRe + (1.0 - wet) * m_gainRe[k];
+        m_gainIm[k] = wet * filledIm + (1.0 - wet) * m_gainIm[k];
+    }
+
+    // DC and everything above the band, as upstream -- crossfaded by the same
+    // ramp so the band limit arrives with the rest of the effect.
+    m_gainRe[0] *= (1.0 - wet);
+    m_gainIm[0] *= (1.0 - wet);
+    for (int k = ilim; k < m_msize; ++k) {
+        m_gainRe[k] *= (1.0 - wet);
+        m_gainIm[k] *= (1.0 - wet);
+    }
 }
 
 void SpectralNR::synthesizeCurrentFrequencyBinsWithMask()
@@ -1101,6 +1381,8 @@ void SpectralNR::synthesizeCurrentFrequencyBinsWithMask()
         m_gainRe[k] = g * m_freqRe[k];
         m_gainIm[k] = g * m_freqIm[k];
     }
+
+    applyPsychoacousticPostProcessing();
 
 #ifdef HAVE_FFTW3
     // Pack into FFTW complex input for inverse FFT

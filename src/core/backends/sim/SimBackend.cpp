@@ -5,8 +5,8 @@
 
 #include <cmath>
 
-#include "core/RadioConnection.h"
-#include "core/PanadapterStream.h"
+#include "core/backends/flex/RadioConnection.h"
+#include "core/backends/flex/PanadapterStream.h"
 #include "core/backends/sim/SimSignalSource.h"
 
 namespace AetherSDR {
@@ -31,12 +31,16 @@ SimBackend::SimBackend(QObject* parent) : IRadioBackend(parent)
     // disconnected backend emits nothing (sim_backend_test pins it; the
     // unguarded forward was a latent flake that fired on the slower build).
     connect(m_signalSource, &SimSignalSource::audioFrameReady,
-            this, [this](const QByteArray& pcm) {
-                if (m_connected) emit audioFrameReady(pcm);
+            this, [this](const PcmFrame& frame) {
+                if (m_connected && frame.stream().session == pcmSession()) {
+                    publishLegacyAudio(frame.legacyStereo24());
+                }
             });
     connect(m_signalSource, &SimSignalSource::sliceAudioFrameReady,
-            this, [this](int sliceId, const QByteArray& pcm) {
-                if (m_connected) emit sliceAudioFrameReady(sliceId, pcm);
+            this, [this](int sliceId, const PcmFrame& frame) {
+                if (m_connected && frame.stream().session == pcmSession()) {
+                    publishLegacySliceAudio(sliceId, frame.legacyStereo24());
+                }
             });
     connect(m_signalSource, &SimSignalSource::spectrumFrameReady,
             this, [this](int panId, const QByteArray& bins) {
@@ -114,7 +118,9 @@ SimBackend::SimBackend(QObject* parent) : IRadioBackend(parent)
         m_wirePanIds = QStringList{wirePanIdFor(0)};
         m_pansAwaitingGeometry.clear();
         pushPanIndicesToSource();
-        QMetaObject::invokeMethod(m_signalSource, &SimSignalSource::start,
+        QMetaObject::invokeMethod(m_signalSource, [source = m_signalSource, session = pcmSession()] {
+            source->startSession(session);
+        },
                                   Qt::QueuedConnection);
         QTimer::singleShot(150, this, [this]() {
             if (m_connected) emitInitialState();
@@ -248,12 +254,22 @@ void SimBackend::setDemoNb(bool on)
 }
 
 QString SimBackend::demoModelName() { return QStringLiteral("AetherSDR Demo"); }
-QString SimBackend::demoSerial()    { return QStringLiteral("DEMO-0001"); }
+QString SimBackend::demoSerial()    { return DemoRadio::serial(); }
 QString SimBackend::familyName()    { return QStringLiteral("sim"); }
 
 RadioCapabilities SimBackend::capabilities() const
 {
     RadioCapabilities caps;
+    // Synthetic receiver: this is the API's bounded numeric domain, not an
+    // advertised hardware tuning range. Off-scene signals simply become silent.
+    caps.sliceFrequencyControl = {SliceFrequencyControl::Authority::Engine,
+                                  1, 1'000'000'000'000};
+    caps.receiveModeControl = ReceiveModeControl{SliceFrequencyControl::Authority::Engine,
+                                                {QStringLiteral("USB"), QStringLiteral("LSB")}};
+    caps.receiveFilterControl = std::nullopt; // demo passband setters only echo state
+    caps.receiveAudioControl = std::nullopt; // no independently controlled RX mixer yet
+    caps.receivePanCenterControl = std::nullopt; // spectrum remains anchored to the VFO
+    caps.receivePanBandwidthControl = std::nullopt; // fixed synthetic span
     caps.canReboot = false;
     caps.hasRemoteOnControl = false;
     caps.canUpgradeFirmware = false;
@@ -269,10 +285,13 @@ RadioCapabilities SimBackend::capabilities() const
     caps.txPowerBands = {};
     caps.declaredBandRanges = {};
     caps.family = familyName();
+    // The demo cannot key at all (Principle VI), let alone synthesise tones.
+    caps.twoToneGenerator = std::nullopt;
     caps.manufacturer = QStringLiteral("AetherSDR");
     caps.model  = demoModelName();
     caps.fmTonePresentation = FmTonePresentation::Legacy;
     caps.fmDtcsCodes = {};
+    caps.canCreateSlices = false;
     caps.maxSlices = 1;          // Phase 1: a single slice. Phase 2 raises this.
     // Four receivers since #4887 phase 4 — enough to exercise the workspace
     // canvas's per-pan items and measure the multi-pan render budget in CI
@@ -286,6 +305,11 @@ RadioCapabilities SimBackend::capabilities() const
     caps.txPowerMaxWatts = 0.0;
     // Explicitly absent: the RX-only simulator publishes no forward power.
     caps.forwardPowerRequiresSmoothing = false;
+    // transmitDriveControl stays ABSENT (#5518): the RX-only simulator has no
+    // transmitter, so there is no drive for anyone to own. Distinct from an
+    // Engine-authority backend that owns a register — this one has none, and an
+    // absent record is what keeps `drive_confirmed` off the wire entirely.
+
     // Moot on a backend that cannot key at all — canTransmit=false refuses every
     // mode already. Empty, not "all of them", because this field means "the
     // exceptions", and a simulator has none.
@@ -300,12 +324,17 @@ RadioCapabilities SimBackend::capabilities() const
     caps.hasManualNotch = false;
     caps.hasTransmitFrequencyCheck = false;
     caps.hasDdcPanEdgeRolloff = false;   // synthetic scene, no real receive chain
+    // The demo vends a RadioConnection (RFC #4288 Route A) but understands no
+    // `band_zoom=`/`segment_zoom=`, so it declares absence explicitly -- the
+    // case a bare hasCommandPlane() test would have got wrong.
+    caps.panZoomModes = std::nullopt;
     // The synthesised stream has no impulse noise in it, and the demo has no IQ
     // path this host demodulates — there is nothing to blank.
     caps.hasHostNoiseBlanker = false;
     // Synthesised signals come out exactly where the demo says they are; there
     // is no oscillator to be wrong about.
     caps.hostFrequencyCalibration = false;
+    caps.hostDroopCalibration = false;   // synthesised bins have no DDC to droop
     // The simulator has no profile store to list, load or save into.
     caps.hasProfiles = false;
     caps.hasSelectableMicInputs = false;
@@ -371,12 +400,15 @@ void SimBackend::connectRadio(const RadioConnectRequest& /*request*/)
     emit connected();
     emit capabilitiesChanged();
     emitInitialState();
-    QMetaObject::invokeMethod(m_signalSource, &SimSignalSource::start,
+    QMetaObject::invokeMethod(m_signalSource, [source = m_signalSource, session = pcmSession()] {
+            source->startSession(session);
+        },
                               Qt::QueuedConnection);   // synthetic RX begins
 }
 
 void SimBackend::disconnectRadio()
 {
+    retirePcmStreams();
     if (!m_connected) {
         return;
     }
@@ -544,8 +576,10 @@ void SimBackend::setPanCenter(const QString& panId, double hz, PanCenterIntent)
                                    hz / 1.0e6, kDemoPanBandwidthMhz);
 }
 
-void SimBackend::setKeying(bool key)
+void SimBackend::setKeying(bool key, const AetherSDR::TxCoordinator::Operation& operation, const AetherSDR::TxCoordinator::Completion& completion)
 {
+    Q_UNUSED(operation);
+    Q_UNUSED(completion);
     // RX-only (capabilities().canTransmit == false): the engine TX guard above
     // the seam already denies keying. We DON'T transmit — but we do forward the
     // intent so the source mutes the synthetic RX while "keyed": the demo never

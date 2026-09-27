@@ -29,11 +29,28 @@ public:
         qint64 maxQueuedOutputBytes{kMaxQueuedOutputBytes};
     };
 
+    enum class ListenMode { Serve, ReserveEndpoint };
+
     explicit LocalControlServer(QObject* parent = nullptr);
-    LocalControlServer(QObject* parent, Limits limits);
+    LocalControlServer(QObject* parent, Limits limits,
+                       RadioConnectionTarget* connectionTarget = nullptr,
+                       bool allowLocalControl = false);
     ~LocalControlServer() override;
 
-    [[nodiscard]] bool listen(const QString& name);
+    // ReserveEndpoint claims the private endpoint but closes early arrivals.
+    // Startup code must finish binding targets before calling startServing().
+    [[nodiscard]] bool listen(const QString& name, ListenMode mode = ListenMode::Serve);
+    [[nodiscard]] bool startServing();
+    // Startup-only binding; never changes grants or replaces a lost target.
+    [[nodiscard]] bool bindConnectionTarget(RadioConnectionTarget* target);
+    [[nodiscard]] bool bindFrequencyTarget(SliceFrequencyTarget* target);
+    [[nodiscard]] bool bindReceiveTarget(ReceiveControlTarget* target);
+    [[nodiscard]] bool bindCredentials(ControlCredentials* credentials);
+    [[nodiscard]] bool bindTransmitTarget(TransmitControlTarget* target);
+    // Current-user lock only (no additional listener), shared by serving and
+    // offline provisioning across socket names. Hold through daemon shutdown.
+    [[nodiscard]] static std::unique_ptr<QLockFile> reserveCredentialAuthority(const QString& authorityId);
+    [[nodiscard]] static QString clientEndpoint(const QString& logicalName);
     void close();
     [[nodiscard]] bool isListening() const { return m_server.isListening(); }
     [[nodiscard]] QString fullServerName() const { return m_server.fullServerName(); }
@@ -56,8 +73,11 @@ private:
     ControlResourceStore m_resources;
     ControlService m_service;
     Limits m_limits;
+    const SessionAuthorization m_localAuthorization;
     std::unordered_map<QLocalSocket*, std::unique_ptr<Client>> m_clients;
     std::unique_ptr<QLockFile> m_lock;
+    bool m_serving{false};
+    bool m_closing{false};
 };
 
 } // namespace AetherSDR::control

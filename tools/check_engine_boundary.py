@@ -30,9 +30,11 @@ Guards the dependency direction the aetherd RFC
        This is RFC step 2.4's ratchet: the interface already exists, so
        no new code should reach around it — existing includers are
        decoupled subsystem-by-subsystem (each routed through the seam)
-       and their rows driven to empty. Ratchet-only: the vendor files
-       are NOT relocated in this step; EB3 makes the boundary
-       enforceable in place. The vendor vocabulary is derived at runtime
+       and their rows driven to empty. Relocation does not convert a
+       touchpoint: the five Flex wire classes now live under
+       src/core/backends/flex/ (#5554 §2.6 slice 1) and their callers
+       use those explicit paths, still tracked by EB3. Matching is by
+       header STEM, so a move changes no baseline row. The vendor vocabulary is derived at runtime
        from the touchpoint audit (docs/architecture/
        aetherd-touchpoint-tags.json) so the audit is the single source
        of truth — a header newly tagged vendor there is enforced without
@@ -102,27 +104,64 @@ KNOWN_WIDGETS_LEGACY = {
 # `vendor(*)` there is enforced automatically — no silent drift where the audit
 # grows a vendor family but this checker keeps permitting it.
 VENDOR_TAGS_JSON = REPO / "docs" / "architecture" / "aetherd-touchpoint-tags.json"
-# Sanity floor guards against the audit being moved, gutted, or parsed with a
-# changed schema. The live vocabulary now spans Flex, Kiwi, HL2, Sim, Icom,
-# ANAN and RTL;
-# deliberate reclassification can lower it, so keep the floor conservative.
-VENDOR_STEMS_FLOOR = 15
+# The audit is the source of truth for what IS vendor; this set is the ratchet
+# on what may STOP being vendor. A bare count floor could not do that job: the
+# original vocabulary spanned 33 stems across seven families, so a floor conservative
+# enough to survive a deliberate reclassification (the old 15) left roughly
+# eighteen headers that could be retagged `mixed(...)`/`peripheral(...)` one at
+# a time, each silently un-gating that header for every file above the seam on
+# a green run. Pinning the set closes that: a stem listed here that the audit
+# no longer tags `vendor(...)` is a blocking EB3-load error naming it.
+#
+# ASYMMETRIC ON PURPOSE, and this is the property to keep. Tagging a NEW header
+# `vendor(...)` in the audit arms more enforcement and needs no edit here —
+# never make arming the ratchet cost a second diff. Only DE-classification is
+# gated, because that is the direction that removes enforcement. Removing a
+# stem below is therefore the same act as an EB3 baseline re-baseline and takes
+# the same evidence: the classification change proven against the merge base,
+# the reasoning documented, and explicit maintainer review (AGENTS.md, "Engine
+# boundary ratchet — EB3"). Deleting a vendor header outright also lands here —
+# drop its stem in that commit.
+VENDOR_STEMS_PINNED = frozenset({
+    # anan
+    "AnanDiscovery", "AnanDroopCalibrator", "AnanDroopCorrection",
+    "P2Protocol",
+    # flex
+    "CommandParser", "DaxIqModel", "DaxTxPolicy", "DvkWavTransfer",
+    "FirmwareStager", "FirmwareUploader", "FlexWaveformModel",
+    "MemoryCsvCompat", "PanadapterStream", "ProfileLoadCommand",
+    "ProfileTransfer", "RadioConnection", "RadioStatusOwnership",
+    "SmartLinkClient", "StreamStatus", "WanConnection",
+    "WaveformInstaller",
+    # hl2
+    "Hl2Backend", "Hl2Discovery", "Hl2EmergencyStop", "MetisProtocol",
+    # icom
+    "IcomModels",
+    # kiwi
+    "KiwiPublicDirectory", "KiwiSdrClient", "KiwiSdrManager",
+    "KiwiSdrProtocol",
+    # rtl
+    "RtlSdrDiscovery",
+    # sim
+    "DemoRadioConstants", "NoiseMixer", "SimBackend",
+})
 
 
 def load_vendor_vocabulary():
     """Derive (stem -> family, {vendor TU rel-paths}) from the touchpoint audit.
 
     - stems: an include is a vendor include when the included header's basename
-      stem is a key here (so "core/RadioConnection.h", "RadioConnection.h",
-      "../core/RadioConnection.h", and <...> all resolve the same).
+      stem is a key here (so "core/backends/flex/RadioConnection.h", "RadioConnection.h",
+      "../core/backends/flex/RadioConnection.h", and <...> all resolve the same).
     - tu_paths: the EXACT rel-paths of the vendor translation units (each tagged
       header plus its sibling impl files). The below-seam exemption keys on these
       full paths, NOT a bare stem — so a *different* file that merely shares a
       vendor stem (a future src/gui/CommandParser.cpp) is NOT exempted.
 
-    Returns (stems, tu_paths, error-or-None). On any load/parse failure the
-    error string is returned so main() can emit a blocking EB3-load finding
-    rather than silently scanning with an empty vocabulary.
+    Returns (stems, tu_paths, error-or-None). On any load/parse failure, or
+    when a stem in VENDOR_STEMS_PINNED is no longer tagged vendor, the error
+    string is returned so main() can emit a blocking EB3-load finding rather
+    than silently scanning with a shrunken vocabulary.
     """
     try:
         data = json.loads(VENDOR_TAGS_JSON.read_text())
@@ -135,14 +174,20 @@ def load_vendor_vocabulary():
             continue
         family = tag[tag.find("(") + 1:tag.find(")")] if "(" in tag else "vendor"
         stems[Path(hdr).stem] = family
-        base = Path("src") / hdr           # e.g. "src/core/CommandParser.h"
+        base = Path("src") / hdr           # e.g. "src/core/backends/flex/CommandParser.h"
         for suf in ENGINE_SUFFIXES:         # header + sibling impl TUs
             tu_paths.add(base.with_suffix(suf).as_posix())
-    if len(stems) < VENDOR_STEMS_FLOOR:
+    missing = sorted(VENDOR_STEMS_PINNED - set(stems))
+    if missing:
         return stems, tu_paths, (
-            f"parsed only {len(stems)} vendor stems from {VENDOR_TAGS_JSON.name} "
-            f"(expected >= {VENDOR_STEMS_FLOOR}) — the audit moved or its schema "
-            "changed; EB3 is under-armed")
+            f"{len(missing)} pinned vendor stem(s) no longer tagged vendor(...) "
+            f"in {VENDOR_TAGS_JSON.name}: {', '.join(missing)}. EB3 stops "
+            "gating them for every file above the seam. If this is a deliberate "
+            "reclassification, it needs merge-base proof, documented reasoning "
+            "and maintainer review, then drop the stem from VENDOR_STEMS_PINNED "
+            "in the same commit; if the audit merely moved or its schema "
+            "changed, EB3 is under-armed until it is fixed"
+        )
     return stems, tu_paths, None
 
 

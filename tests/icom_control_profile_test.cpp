@@ -7,6 +7,7 @@
 #include "core/backends/flex/FlexBackend.h"
 #include "core/backends/hl2/Hl2Backend.h"
 #include "TestSettingsProfile.h"
+#include "TxTestAuthority.h"
 
 #include <QCoreApplication>
 #include <algorithm>
@@ -91,9 +92,60 @@ struct IcomCivBackendTestAccess {
         backend.m_civModelId = model.civAddress;
     }
 
+    static void antennaReply(IcomCivBackend& b, std::uint8_t sub,
+                             std::vector<std::uint8_t> data, std::uint64_t generation = 1)
+    {
+        b.m_sessionGeneration = 1;
+        CivFrame frame;
+        frame.cmd = cmd::kRxAntenna;
+        frame.hasSub = true;
+        frame.sub = sub;
+        frame.data = std::move(data);
+        b.onCivFrame(frame, generation);
+    }
+    static bool antennaReads(IcomCivBackend& b, bool startup)
+    {
+        b.m_controlPollPhase = 2; // next tick is the three-second controls group
+        if (startup) { b.sendConnectReadBurst(); }
+        else { b.onLinkTick(); }
+        const auto read = cmdReadRxAntenna(b.m_session->civAddress());
+        return std::any_of(b.m_civScheduler.m_queue.begin(), b.m_civScheduler.m_queue.end(),
+            [&](const auto& request) { return request.request.frame == read; });
+    }
+    static bool antennaReplyCompletesRead(IcomCivBackend& b)
+    {
+        b.queueRead(cmdReadRxAntenna(b.m_session->civAddress()), "rx.antenna",
+                    IcomCivScheduler::Priority::Control);
+        const auto now = b.m_civScheduler.m_queue.front().enqueuedAtMs;
+        if (!b.m_civScheduler.takeNext(now)) { return false; }
+        CivFrame reply;
+        reply.cmd = cmd::kRxAntenna;
+        reply.hasSub = true;
+        reply.sub = 0;
+        reply.data = {1};
+        return b.m_civScheduler.observe(reply, now + 5) == IcomCivScheduler::Observation::Accepted
+            && !b.m_civScheduler.stats().readInFlight
+            && b.m_civScheduler.stats().timeouts == 0;
+    }
+
+    static bool antennaConfirmation(IcomCivBackend& b)
+    {
+        const auto write = cmdSetRxAntenna(b.m_session->civAddress(), true);
+        const auto read = cmdReadRxAntenna(b.m_session->civAddress());
+        return b.confirmationFor(write) == read && b.semanticKey(write) == b.semanticKey(read);
+    }
+
     static QString lastOutboundCiv(const IcomCivBackend& backend)
     {
         return backend.m_lastOutboundCiv;
+    }
+
+    static void dispatchReady(IcomCivBackend& backend)
+    {
+        // sendUserCommand samples its pump time before enqueue samples its own
+        // deadline. Crossing a millisecond leaves the write for the next tick.
+        // Drive that tick explicitly; this fixture never runs the event loop.
+        backend.pumpCiv(backend.nowMs());
     }
 
     static std::size_t queuedRequestCount(const IcomCivBackend& backend)
@@ -123,6 +175,7 @@ int main(int argc, char** argv)
     {
         FlexBackend flex;
         const RadioCapabilities caps = flex.capabilities();
+        check(caps.canCreateSlices, "Flex retains independent ordinary slice creation");
         check(caps.hasAgcThreshold && caps.hasAmCarrierLevel && caps.hasVoxDelay,
               "Flex retains AGC threshold, AM carrier, and VOX delay");
         check(!caps.hasModeIndependentSquelch, "Flex retains its mode-specific SQL policy");
@@ -131,6 +184,8 @@ int main(int argc, char** argv)
                   && caps.cwPitchStepHz == 10,
               "Flex retains its existing CW control ranges");
         hl2::Hl2Backend hl2Backend;
+        check(!hl2Backend.capabilities().canCreateSlices,
+              "HL2 paired receiver/pan topology does not expose independent creation");
         check(hl2Backend.capabilities().hasAgcThreshold, "HL2 retains host AGC threshold");
     }
     {
@@ -141,6 +196,7 @@ int main(int argc, char** argv)
             IcomCivBackend backend;
             IcomCivBackendTestAccess::selectModel(backend, *ic705);
             const RadioCapabilities caps = backend.capabilities();
+            check(!caps.canCreateSlices, "Icom fixed receivers do not expose independent slice creation");
             check(caps.txPowerBands.size() == 1
                       && caps.txPowerMaxWattsAt(14'200'000.0) == 10.0,
                   "IC-705 alone declares its continuous 10 W rated-output range");
@@ -156,6 +212,8 @@ int main(int argc, char** argv)
             check(!caps.hasModeIndependentSquelch, "IC-705 SQL policy remains unchanged");
             check(caps.hasFmRepeaterOffset, "IC-705 retains native repeater offsets");
             check(caps.hasCwTune, "IC-705 CW Tune policy remains unchanged");
+            check(!caps.twoToneGenerator,
+                  "no Icom declares a two-tone generator it does not have");
         }
 
         const IcomModel* ic7300Mk2 = modelForName("IC-7300MK2");
@@ -182,6 +240,8 @@ int main(int argc, char** argv)
                   "IC-7300MK2 allows its native squelch in data and CW modes");
             check(!caps.hasFmRepeaterOffset, "MK2 does not advertise absent duplex commands");
             check(!caps.hasCwTune, "MK2 does not advertise an unimplemented CW tune carrier");
+            check(!caps.twoToneGenerator,
+                  "MK2 setTune() is one sine wave and must not claim otherwise");
             {
                 IcomCivBackend polled;
                 IcomCivBackendTestAccess::prepareSession(polled, *ic7300Mk2);
@@ -189,11 +249,13 @@ int main(int argc, char** argv)
                       "MK2 periodic polling includes CW, squelch and active data TBW");
             }
             for (const bool reverse : {false, true}) {
+                TxTestAuthority authority;
                 IcomCivBackend cwBackend;
+                cwBackend.setTransmitContext(authority.context);
                 IcomCivBackendTestAccess::prepareSession(cwBackend, *ic7300Mk2);
                 IcomCivBackendTestAccess::selectCwMode(cwBackend, reverse);
                 const int power = IcomCivBackendTestAccess::power(cwBackend);
-                cwBackend.setTune(true, 3);
+                cwBackend.setTune(true, 3, authority.operation);
                 check(!IcomCivBackendTestAccess::tuning(cwBackend)
                           && IcomCivBackendTestAccess::power(cwBackend) == power
                           && IcomCivBackendTestAccess::lastOutboundCiv(cwBackend).isEmpty(),
@@ -259,6 +321,7 @@ int main(int argc, char** argv)
                     IcomCivBackendTestAccess::prepareSession(writer, *model);
                     IcomCivBackendTestAccess::deliverDataBandwidth(writer, profile->dataItem, 0x30);
                     writer.setTxFilter(profile->lowEdgesHz[l], profile->highEdgesHz[h]);
+                    IcomCivBackendTestAccess::dispatchReady(writer);
                     const QString expected = QStringLiteral("1a 05 00 %1 %2")
                         .arg((profile->dataItem / 10) * 16 + profile->dataItem % 10,
                              2, 16, QLatin1Char('0'))
@@ -269,6 +332,60 @@ int main(int argc, char** argv)
             }
         }
 
+    }
+    check(cmdReadRxAntenna(0xB6) == std::vector<std::uint8_t>({0xFE,0xFE,0xB6,0xE0,0x12,0xFD}),
+          "MK2 antenna read uses observed bare 12 form");
+    for (const std::vector<uint8_t>& payload : {std::vector<uint8_t>{}, {2}, {0, 1}}) {
+        IcomCivBackend backend;
+        IcomCivBackendTestAccess::prepareSession(backend, *modelForName("IC-7300MK2"));
+        const ControlSpec* antennaSpec = nullptr;
+        for (const auto& spec : controlSpecs()) {
+            if (spec.id == "rx.antenna") { antennaSpec = &spec; }
+        }
+        check(antennaSpec != nullptr, "antenna registry row exists");
+        if (antennaSpec) {
+            check(!backend.scrubDrive(*antennaSpec), "unread antenna cannot be scrubbed");
+            IcomCivBackendTestAccess::antennaReply(backend, 0, payload);
+            check(!backend.scrubDrive(*antennaSpec), "malformed first antenna reply cannot seed scrub");
+            check(IcomCivBackendTestAccess::lastOutboundCiv(backend).isEmpty(),
+                  "malformed antenna reply cannot cause a default antenna write");
+        }
+    }
+    for (const char* name : {"IC-7300MK2", "IC-705", "IC-9700"}) {
+        const auto* model = modelForName(name);
+        check(model != nullptr, "antenna test model resolves");
+        if (!model) { continue; }
+        const bool supported = std::string(name) == "IC-7300MK2";
+        IcomCivBackend b;
+        IcomCivBackendTestAccess::prepareSession(b, *model);
+        QString antenna;
+        int publications = 0;
+        QObject::connect(&b, &IRadioBackend::sliceChanged, [&](int, const SliceDelta& delta) {
+            if (delta.rxAntenna) { antenna = *delta.rxAntenna; ++publications; }
+        });
+        IcomCivBackendTestAccess::antennaReply(b, 0, {1});
+        check(supported ? antenna == "RX-ANT" : antenna.isEmpty(), "antenna adoption is model gated");
+        const int before = publications;
+        IcomCivBackendTestAccess::antennaReply(b, 0, {});
+        IcomCivBackendTestAccess::antennaReply(b, 0, {2});
+        IcomCivBackendTestAccess::antennaReply(b, 1, {0});
+        IcomCivBackendTestAccess::antennaReply(b, 0, {0, 1});
+        IcomCivBackendTestAccess::antennaReply(b, 0, {0}, 0);
+        check(publications == before, "invalid and stale antenna replies cannot publish");
+        IcomCivBackendTestAccess::antennaReply(b, 0, {0});
+        check(supported ? antenna == "ANT1" : antenna.isEmpty(), "radio ANT1 return adopted");
+        check(IcomCivBackendTestAccess::lastOutboundCiv(b).isEmpty(), "passive antenna adoption writes nothing");
+        check(IcomCivBackendTestAccess::antennaReads(b, false) == supported, "periodic antenna read is model gated");
+        IcomCivBackend startup;
+        IcomCivBackendTestAccess::prepareSession(startup, *model);
+        check(IcomCivBackendTestAccess::antennaReads(startup, true) == supported, "startup antenna read is model gated");
+        if (supported) {
+            check(IcomCivBackendTestAccess::antennaConfirmation(b), "antenna write confirmation shares generation");
+            IcomCivBackend transaction;
+            IcomCivBackendTestAccess::prepareSession(transaction, *model);
+            check(IcomCivBackendTestAccess::antennaReplyCompletesRead(transaction),
+                  "bare antenna read completes on subcommand-bearing reply without timeout");
+        }
     }
     return g_failures ? 1 : 0;
 }

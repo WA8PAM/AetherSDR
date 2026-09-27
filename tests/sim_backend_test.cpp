@@ -5,6 +5,7 @@
 // disconnect removes the slice + reconnect works, and TX stays fail-closed.
 
 #include "core/backends/sim/SimBackend.h"
+#include "core/backends/sim/DemoRadioConstants.h"
 
 #include <QCoreApplication>
 #include <QEventLoop>
@@ -38,8 +39,17 @@ void testConnectEmitsInitialState()
     QSignalSpy connectedSpy(&sim, &SimBackend::connected);
     QSignalSpy radioSpy(&sim, &SimBackend::radioChanged);
     QSignalSpy sliceSpy(&sim, &SimBackend::sliceChanged);
+    QSignalSpy waterfallSpy(&sim, &SimBackend::panWaterfallLineDurationChanged);
 
     report("starts disconnected", !sim.isConnected());
+    report("Demo serial remains compatible with saved selections",
+           SimBackend::demoSerial() == QStringLiteral("DEMO-0001"));
+    // The pan span and the spectrum span are one value with two units; if they
+    // ever stop agreeing the demo birdie lands outside the RX passband.
+    report("Demo pan span is 8 kHz, stated in MHz",
+           AetherSDR::DemoRadio::kPanBandwidthMhz == 0.008);
+    report("the spectrum span is that same 8 kHz, stated in Hz",
+           AetherSDR::DemoRadio::kAudioSpanHz == 8000.0);
 
     sim.connectRadio(RadioConnectRequest{});
 
@@ -47,6 +57,13 @@ void testConnectEmitsInitialState()
     report("connect() reports connected", sim.isConnected());
     report("connect() emits a radio-global snapshot", radioSpy.count() == 1);
     report("connect() emits an initial slice", sliceSpy.count() == 1);
+    report("connect() emits one initial waterfall rate", waterfallSpy.count() == 1);
+    if (waterfallSpy.count() == 1) {
+        report("waterfall rate belongs to the initial Demo pan",
+               waterfallSpy.first().at(0).toString() == QStringLiteral("0x40000000"));
+        report("waterfall rate is 100, not the 48 ms row cadence",
+               waterfallSpy.first().at(1).toInt() == 100);
+    }
 
     if (radioSpy.count() == 1) {
         const auto delta = radioSpy.first().at(0).value<RadioDelta>();
@@ -68,6 +85,7 @@ void testCapabilitiesAreReceiveOnly()
 {
     SimBackend sim;
     const RadioCapabilities caps = sim.capabilities();
+    report("demo does not advertise independent slice creation", !caps.canCreateSlices);
     report("capabilities family is 'sim'", caps.family == QStringLiteral("sim"));
     report("a demo radio cannot transmit (Principle VI)", !caps.canTransmit);
     report("TX power is zero when RX-only", caps.txPowerMaxWatts == 0.0);
@@ -143,8 +161,8 @@ void testKeyingIsAlwaysInert()
     // No transmit-related signal exists to fire; the contract is simply that
     // setKeying never drives a transmit path. This asserts it does not crash or
     // change connection state — the real TX guard lives above the seam.
-    sim.setKeying(true);
-    sim.setKeying(false);
+    sim.setKeying(true, {});
+    sim.setKeying(false, {});
     report("setKeying is a safe no-op on an RX-only sim", sim.isConnected());
 }
 
@@ -174,7 +192,7 @@ void testEmitsAudioWhenConnected()
     const int expectBytes =
         NoiseMixer::kFrameLen * 2 * static_cast<int>(sizeof(float));
     const auto lastArgs = audioSpy.constLast();
-    const int bytes = lastArgs.isEmpty() ? -1 : lastArgs.at(0).toByteArray().size();
+    const int bytes = lastArgs.isEmpty() ? -1 : lastArgs.at(0).value<AetherSDR::PcmFrame>().legacyStereo24().size();
     report("audio frame is 24 kHz stereo float32 sized", bytes == expectBytes);
 }
 
@@ -183,12 +201,12 @@ void testKeyingMutesAudio()
     SimBackend sim;
     sim.connectRadio({});
     QSignalSpy audioSpy(&sim, &SimBackend::audioFrameReady);
-    sim.setKeying(true);                     // muted while "keyed" (Principle VI)
+    sim.setKeying(true, {});                  // muted while "keyed" (Principle VI)
     pumpFrames(audioSpy, 60);
     // Frames still FLOW (stream stays alive) but are all-zero when keyed.
     bool allSilent = audioSpy.count() > 0;
     for (const auto& call : audioSpy) {
-        const QByteArray pcm = call.at(0).toByteArray();
+        const QByteArray pcm = call.at(0).value<AetherSDR::PcmFrame>().legacyStereo24();
         const auto* f = reinterpret_cast<const float*>(pcm.constData());
         const int n = pcm.size() / static_cast<int>(sizeof(float));
         for (int i = 0; i < n; ++i)

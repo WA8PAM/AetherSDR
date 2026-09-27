@@ -39,6 +39,8 @@ public:
     ClientTube(const ClientTube&)            = delete;
     ClientTube& operator=(const ClientTube&) = delete;
 
+    // Audio owner only; never concurrently with process(). GUI rate reads
+    // and parameter setters remain safe while a new producer is prepared.
     void prepare(double sampleRate);
 
     void setEnabled(bool on) noexcept;
@@ -73,6 +75,13 @@ public:
     // loud passages clean while adding harmonic warmth on quiet ones.
     void  setEnvelopeAmount(float v) noexcept;       // -1..+1
     float envelopeAmount() const noexcept;
+    // Fixed at kAttackMs — no surface offers it any more. It only shapes the
+    // envelope follower, and the follower only reaches the output through
+    // `envAmount * envLin`: at the default envelope amount of 0 this changed
+    // nothing at all, and when the modulation is turned up it is the release
+    // that carries the character. The setter stays for the per-slice mirror
+    // in RxClientEffects, which copies whatever the master holds.
+    static constexpr float kAttackMs = 5.0f;
     void  setAttackMs(float ms) noexcept;            // 0.1..30 ms
     float attackMs() const noexcept;
     void  setReleaseMs(float ms) noexcept;           // 10..500 ms
@@ -89,7 +98,12 @@ public:
     float outputPeakDb() const noexcept;
     float driveAppliedDb() const noexcept;   // dynamic instantaneous drive
 
-    double sampleRate() const noexcept { return m_sampleRate; }
+    // Audio owner: mirror a presented auxiliary source into UI-facing meters.
+    // Copies atomic snapshots only; parameters and processing histories stay local.
+    void copyMeteringFrom(const ClientTube& source) noexcept;
+
+    double sampleRate() const noexcept
+    { return m_sampleRate.load(std::memory_order_relaxed); }
 
 private:
     struct Atomics {
@@ -101,7 +115,7 @@ private:
         std::atomic<float>    outputGainDb{0.0f};
         std::atomic<float>    dryWet{1.0f};
         std::atomic<float>    envelopeAmount{0.0f};
-        std::atomic<float>    attackMs{5.0f};
+        std::atomic<float>    attackMs{kAttackMs};
         std::atomic<float>    releaseMs{35.0f};
         std::atomic<uint64_t> version{0};
     };
@@ -129,7 +143,8 @@ private:
     void recacheIfDirty() noexcept;
     float shape(float x) const noexcept;   // waveshaper per Model + bias
 
-    double m_sampleRate{24000.0};
+    // Audio owner writes in prepare(); UI reads the displayed processing rate.
+    std::atomic<double> m_sampleRate{24000.0};
     Atomics m_atomics;
     Cached  m_cached;
     Meters  m_meters;

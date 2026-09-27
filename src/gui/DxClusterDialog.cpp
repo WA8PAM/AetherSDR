@@ -1,4 +1,5 @@
 #include "DxClusterDialog.h"
+#include "ScopedChildWidget.h"
 #include "DxClusterStartupCommandsDialog.h"
 #include "FlowLayout.h"
 // For MessageMaxLength — the two surfaces share FreeDvMyMessage, so they
@@ -39,12 +40,39 @@
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QMessageBox>
+#include <QPointer>
 #include <QRegularExpression>
 #include <QSignalBlocker>
 #include <QTimer>
 #include "core/ThemeManager.h"
 
 namespace AetherSDR {
+
+namespace {
+
+QColor getColorForLiveParent(const QColor& initial, DxClusterDialog* parent,
+                            const QString& title)
+{
+    const QPointer<DxClusterDialog> parentGuard(parent);
+    const QColor color = QColorDialog::getColor(initial, parent, title);
+    return parentGuard ? color : QColor();
+}
+
+// Normalizes a callsign before a "calling me?" comparison — same logic as
+// MainWindow_Spots.cpp. Applied to both the message token and the configured
+// callsign so /P-style suffixes and <hash> calls match on both sides (#5823).
+QString normalizeCallForMatch(QString c)
+{
+    c = c.trimmed();
+    if (c.size() > 2 && c.startsWith(QLatin1Char('<')) && c.endsWith(QLatin1Char('>')))
+        c = c.mid(1, c.size() - 2);
+    const int slash = c.indexOf(QLatin1Char('/'));
+    if (slash > 0)
+        c = c.left(slash);
+    return c;
+}
+
+} // namespace
 
 // GuardedSlider variant that resets to a stored default on left
 // double-click.  Used for the Filter Match Window slider (#2609) so
@@ -495,10 +523,13 @@ DxClusterDialog::DxClusterDialog(DxClusterClient* clusterClient, DxClusterClient
         bool isPOTA = msg.contains("CQ POTA");
         bool isCallingMe = false;
         {
-            QString myCall = as.value("DxClusterCallsign").toString();
+            // Same fallback and normalization as MainWindow_Spots.cpp (#5823).
+            QString myCall = normalizeCallForMatch(
+                as.value("DxClusterCallsign").toString());
             if (!myCall.isEmpty()) {
                 QStringList parts = msg.split(' ', Qt::SkipEmptyParts);
-                if (parts.size() >= 2 && parts[0] == myCall)
+                if (parts.size() >= 2 &&
+                    normalizeCallForMatch(parts[0]).compare(myCall, Qt::CaseInsensitive) == 0)
                     isCallingMe = true;
             }
         }
@@ -956,7 +987,7 @@ void DxClusterDialog::buildClusterTab(QTabWidget* tabs)
         "QPushButton { background: %1; border: 2px solid #405060; border-radius: 3px; }"
         "QPushButton:hover { border-color: #c8d8e8; }").arg(dxcColor.name()));
     connect(dxcColorBtn, &QPushButton::clicked, this, [this, dxcColorBtn] {
-        QColor c = QColorDialog::getColor(
+        QColor c = getColorForLiveParent(
             QColor(AppSettings::instance().value("DxClusterSpotColor", "#D2B48C").toString()),
             this, "DX Cluster Spot Color");
         if (c.isValid()) {
@@ -1158,7 +1189,7 @@ void DxClusterDialog::buildRbnTab(QTabWidget* tabs)
         "QPushButton { background: %1; border: 2px solid #405060; border-radius: 3px; }"
         "QPushButton:hover { border-color: #c8d8e8; }").arg(rbnColor.name()));
     connect(rbnColorBtn, &QPushButton::clicked, this, [this, rbnColorBtn] {
-        QColor c = QColorDialog::getColor(
+        QColor c = getColorForLiveParent(
             QColor(AppSettings::instance().value("RbnSpotColor", "#4488FF").toString()),
             this, "RBN Spot Color");
         if (c.isValid()) {
@@ -1315,7 +1346,7 @@ void DxClusterDialog::buildWsjtxTab(QTabWidget* tabs)
     m_wsjtxColorCQ->setFixedSize(18, 18);
     m_wsjtxColorCQ->setStyleSheet(swatchStyle(cqColor));
     connect(m_wsjtxColorCQ, &QPushButton::clicked, this, [this, swatchStyle] {
-        QColor c = QColorDialog::getColor(QColor(AppSettings::instance().value("WsjtxColorCQ", "#00FF00").toString()), this, "CQ Spot Color");
+        QColor c = getColorForLiveParent(QColor(AppSettings::instance().value("WsjtxColorCQ", "#00FF00").toString()), this, "CQ Spot Color");
         if (c.isValid()) {
             m_wsjtxColorCQ->setStyleSheet(swatchStyle(c));
             AppSettings::instance().setValue("WsjtxColorCQ", c.name());
@@ -1341,7 +1372,7 @@ void DxClusterDialog::buildWsjtxTab(QTabWidget* tabs)
     m_wsjtxColorPOTA->setFixedSize(18, 18);
     m_wsjtxColorPOTA->setStyleSheet(swatchStyle(potaColor));
     connect(m_wsjtxColorPOTA, &QPushButton::clicked, this, [this, swatchStyle] {
-        QColor c = QColorDialog::getColor(QColor(AppSettings::instance().value("WsjtxColorPOTA", "#00FFFF").toString()), this, "CQ POTA Spot Color");
+        QColor c = getColorForLiveParent(QColor(AppSettings::instance().value("WsjtxColorPOTA", "#00FFFF").toString()), this, "CQ POTA Spot Color");
         if (c.isValid()) {
             m_wsjtxColorPOTA->setStyleSheet(swatchStyle(c));
             AppSettings::instance().setValue("WsjtxColorPOTA", c.name());
@@ -1367,7 +1398,7 @@ void DxClusterDialog::buildWsjtxTab(QTabWidget* tabs)
     m_wsjtxColorCallingMe->setFixedSize(18, 18);
     m_wsjtxColorCallingMe->setStyleSheet(swatchStyle(callingMeColor));
     connect(m_wsjtxColorCallingMe, &QPushButton::clicked, this, [this, swatchStyle] {
-        QColor c = QColorDialog::getColor(QColor(AppSettings::instance().value("WsjtxColorCallingMe", "#FF0000").toString()), this, "Calling Me Spot Color");
+        QColor c = getColorForLiveParent(QColor(AppSettings::instance().value("WsjtxColorCallingMe", "#FF0000").toString()), this, "Calling Me Spot Color");
         if (c.isValid()) {
             m_wsjtxColorCallingMe->setStyleSheet(swatchStyle(c));
             AppSettings::instance().setValue("WsjtxColorCallingMe", c.name());
@@ -1392,7 +1423,7 @@ void DxClusterDialog::buildWsjtxTab(QTabWidget* tabs)
     m_wsjtxColorDefault->setFixedSize(18, 18);
     m_wsjtxColorDefault->setStyleSheet(swatchStyle(defaultColor));
     connect(m_wsjtxColorDefault, &QPushButton::clicked, this, [this, swatchStyle] {
-        QColor c = QColorDialog::getColor(QColor(AppSettings::instance().value("WsjtxColorDefault", "#FFFFFF").toString()), this, "Default Spot Color");
+        QColor c = getColorForLiveParent(QColor(AppSettings::instance().value("WsjtxColorDefault", "#FFFFFF").toString()), this, "Default Spot Color");
         if (c.isValid()) {
             m_wsjtxColorDefault->setStyleSheet(swatchStyle(c));
             AppSettings::instance().setValue("WsjtxColorDefault", c.name());
@@ -1671,7 +1702,7 @@ void DxClusterDialog::buildPotaTab(QTabWidget* tabs)
         "QPushButton { background: %1; border: 2px solid #405060; border-radius: 3px; }"
         "QPushButton:hover { border-color: #c8d8e8; }").arg(potaColor.name()));
     connect(potaColorBtn, &QPushButton::clicked, this, [this, potaColorBtn] {
-        QColor c = QColorDialog::getColor(
+        QColor c = getColorForLiveParent(
             QColor(AppSettings::instance().value("PotaSpotColor", "#FFFF00").toString()),
             this, "POTA Spot Color");
         if (c.isValid()) {
@@ -1848,7 +1879,7 @@ void DxClusterDialog::buildEiBiTab(QTabWidget* tabs)
     };
     updateColorBtnStyle(eibiColor.name());
     connect(eibiColorBtn, &QPushButton::clicked, this, [this, updateColorBtnStyle] {
-        QColor c = QColorDialog::getColor(
+        QColor c = getColorForLiveParent(
             QColor(AppSettings::instance().value("EiBiSpotColor", "#8aa8c0").toString()),
             this, "EiBi Spot Color");
         if (c.isValid()) {
@@ -2048,7 +2079,7 @@ void DxClusterDialog::buildN1mmTab(QTabWidget* tabs)
             colorBtn, swatchTemplate.arg(statusColor(spec).name()));
         connect(colorBtn, &QPushButton::clicked, this,
                 [this, colorBtn, swatchTemplate, statusColor, specPtr] {
-            QColor c = QColorDialog::getColor(statusColor(*specPtr), this, "N1MM Status Color");
+            QColor c = getColorForLiveParent(statusColor(*specPtr), this, "N1MM Status Color");
             if (c.isValid()) {
                 ThemeManager::instance().applyStyleSheet(
                     colorBtn, swatchTemplate.arg(c.name()));
@@ -2201,13 +2232,24 @@ void DxClusterDialog::buildFreeDvTab(QTabWidget* tabs)
             }
 
             if (callsign.isEmpty() || grid.isEmpty()) {
-                QMessageBox::warning(this, "FreeDV Reporter",
-                    "Please set both a callsign and a grid square before "
-                    "enabling reporter broadcasting.\n\n"
-                    "Reporter broadcasts to a public, community-shared map; "
-                    "blank or placeholder values would pollute it.");
-                QSignalBlocker block(m_fdvReportCheck);
-                m_fdvReportCheck->setChecked(false);
+                const QPointer<DxClusterDialog> self(this);
+                const QPointer<QCheckBox> reportCheck(m_fdvReportCheck);
+                ScopedChildWidget<QMessageBox> warningOwner(this);
+                QMessageBox& warning = *warningOwner.get();
+                warning.setIcon(QMessageBox::Warning);
+                warning.setWindowTitle("FreeDV Reporter");
+                warning.setText("Please set both a callsign and a grid square before "
+                                "enabling reporter broadcasting.\n\n"
+                                "Reporter broadcasts to a public, community-shared map; "
+                                "blank or placeholder values would pollute it.");
+                warning.setStandardButtons(QMessageBox::Ok);
+                warning.exec();
+                if (!self || !reportCheck || self->m_fdvReportCheck != reportCheck.data()
+                    || !warningOwner) {
+                    return;
+                }
+                QSignalBlocker block(reportCheck);
+                reportCheck->setChecked(false);
                 return;
             }
         }
@@ -2353,7 +2395,7 @@ void DxClusterDialog::buildFreeDvTab(QTabWidget* tabs)
         "QPushButton { background: %1; border: 2px solid #405060; border-radius: 3px; }"
         "QPushButton:hover { border-color: #c8d8e8; }").arg(freedvColor.name()));
     connect(freedvColorBtn, &QPushButton::clicked, this, [this, freedvColorBtn] {
-        QColor c = QColorDialog::getColor(
+        QColor c = getColorForLiveParent(
             QColor(AppSettings::instance().value("FreeDvSpotColor", "#FF8C00").toString()),
             this, "FreeDV Spot Color");
         if (c.isValid()) {
@@ -2512,7 +2554,8 @@ void DxClusterDialog::buildSpotListTab(QTabWidget* tabs)
                        QString::fromUtf8(QJsonDocument(obj).toJson(QJsonDocument::Compact)));
             s.save();
         };
-        QMenu menu(this);
+        ScopedChildWidget<QMenu> menuOwner(this);
+        QMenu& menu = *menuOwner.get();
         KeepMenuOpenOnToggle keepOpen;
         menu.installEventFilter(&keepOpen);
         for (const auto& tc : kToggleCols) {
@@ -2872,7 +2915,7 @@ void DxClusterDialog::buildDisplayTab(QTabWidget* tabs)
     colorBtn->setFixedSize(24, 24);
     updateSwatch(colorBtn, spotColor);
     connect(colorBtn, &QPushButton::clicked, this, [this, colorBtn, updateSwatch, save, spotColor]() mutable {
-        QColor c = QColorDialog::getColor(spotColor, this, "Spot Text Color");
+        QColor c = getColorForLiveParent(spotColor, this, "Spot Text Color");
         if (c.isValid()) {
             spotColor = c;
             updateSwatch(colorBtn, c);
@@ -2911,7 +2954,7 @@ void DxClusterDialog::buildDisplayTab(QTabWidget* tabs)
     bgColorBtn->setFixedSize(24, 24);
     updateSwatch(bgColorBtn, bgColor);
     connect(bgColorBtn, &QPushButton::clicked, this, [this, bgColorBtn, updateSwatch, save, bgColor]() mutable {
-        QColor c = QColorDialog::getColor(bgColor, this, "Spot Background Color");
+        QColor c = getColorForLiveParent(bgColor, this, "Spot Background Color");
         if (c.isValid()) {
             bgColor = c;
             updateSwatch(bgColorBtn, c);
@@ -3044,7 +3087,7 @@ void DxClusterDialog::buildDisplayTab(QTabWidget* tabs)
             QColor* colPtr = sw.colPtr;
             connect(btn, &QPushButton::clicked, this, [this, btn, key, colPtr, updateSwatch, save]() {
                 const QColor cur = colPtr ? *colPtr : QColor(Qt::gray);
-                QColor c = QColorDialog::getColor(cur, this, "Pick Colour");
+                QColor c = getColorForLiveParent(cur, this, "Pick Colour");
                 if (!c.isValid()) return;
                 if (colPtr) *colPtr = c;
                 updateSwatch(btn, c);
@@ -3064,15 +3107,19 @@ void DxClusterDialog::buildDisplayTab(QTabWidget* tabs)
         // Wire browse button — always arms the file watcher automatically so
         // spot colours update whenever the user exports a new log (#logbook-autoreload).
         connect(browseBtn, &QPushButton::clicked, this, [this, adifPathLabel, save](bool) {
+            const QPointer<DxClusterDialog> self(this);
+            const QPointer<QLabel> pathLabel(adifPathLabel);
             const QString path = QFileDialog::getOpenFileName(
                 this, "Select ADIF Log File", QDir::homePath(),
                 "ADIF Log Files (*.adi *.adif);;All Files (*)");
-            if (path.isEmpty()) return;
-            adifPathLabel->setText(QFileInfo(path).fileName());
+            if (!self || !pathLabel || path.isEmpty()) {
+                return;
+            }
+            pathLabel->setText(QFileInfo(path).fileName());
             save("DxccAdifFilePath", path);
-            if (m_dxccProvider) {
-                m_dxccProvider->importAdifFile(path);   // importStarted → "Updating…" via signal below
-                m_dxccProvider->setAutoReload(true, path);  // always watch after selection
+            if (self->m_dxccProvider) {
+                self->m_dxccProvider->importAdifFile(path);   // importStarted → "Updating…" via signal below
+                self->m_dxccProvider->setAutoReload(true, path);  // always watch after selection
             }
         });
 
@@ -3177,7 +3224,7 @@ void DxClusterDialog::buildDisplayTab(QTabWidget* tabs)
             QColor* colPtr = sw.colPtr;
             connect(btn, &QPushButton::clicked, this,
                     [this, btn, key, colPtr, updateSwatch, save]() {
-                QColor c = QColorDialog::getColor(*colPtr, this, "Pick Colour");
+                QColor c = getColorForLiveParent(*colPtr, this, "Pick Colour");
                 if (!c.isValid()) return;
                 *colPtr = c;
                 updateSwatch(btn, c);

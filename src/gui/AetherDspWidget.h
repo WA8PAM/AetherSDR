@@ -4,6 +4,10 @@
 #include <QStringList>
 #include <QList>
 #include <array>
+#include <functional>
+#include <vector>
+
+#include "core/NnrControls.h"
 
 class QSlider;
 class QLabel;
@@ -15,6 +19,7 @@ class QStackedWidget;
 class QLineEdit;
 class QProgressBar;
 class QGridLayout;
+class QFrame;
 
 namespace AetherSDR {
 
@@ -22,13 +27,15 @@ class AudioEngine;
 class NvidiaAfxPack;
 
 // AetherDSP settings body — the QTabWidget + per-tab controls shared by the
-// modeless AetherDspDialog (Settings menu)
+// modeless AetherRxDialog (Settings menu)
 // and the docked ClientRxDspApplet (PooDoo Audio RX side).
 //
 // Signals fire on every parameter change (after the new value lands in the
 // feature-owned settings model) so MainWindow can push it into AudioEngine. Both
 // the dialog and the applet expose a `widget()` accessor so callers can
 // connect to these signals directly.
+class NrGainStrip;
+
 class AetherDspWidget : public QWidget {
     Q_OBJECT
 
@@ -37,7 +44,10 @@ public:
     // activators for the six client-side noise-reduction modules.  The
     // button checked-state is the engine enable state; clicking the
     // active button toggles it off (no DSP active).
-    enum DspId { NR2 = 0, NR4, MNR, DFNR, RN2, BNR, NumDsps };
+    // NNR is appended rather than inserted: the ids are used as stack
+    // indices and in persisted state, so renumbering the existing six would
+    // silently repoint them.
+    enum DspId { NR2 = 0, NR4, MNR, DFNR, RN2, BNR, NNR, NumDsps };
 
     explicit AetherDspWidget(AudioEngine* audio, QWidget* parent = nullptr);
 
@@ -53,7 +63,7 @@ public:
 
     // Scale every child QPushButton / QLabel font to 13 px to match the
     // VFO DSP toggle row.  The applet path leaves this off; only the
-    // Settings-menu AetherDspDialog calls it.
+    // Settings-menu AetherRxDialog calls it.
     void setDialogMode(bool on);
 
     // Disable the NR2 selector button when compressed (Opus / SmartLink)
@@ -73,12 +83,20 @@ signals:
     void nr2GainMethodChanged(int method);
     void nr2NpeMethodChanged(int method);
     void nr2AeFilterChanged(bool on);
+    // One signal for the whole post-processing group: every control writes to
+    // Nr2SettingsModel first, so the listener only needs to know that
+    // something changed, not which. (#5702)
+    void nr2Post2RunChanged(bool on);
+    void nr2Post2SettingsChanged();
     // MNR parameter changes
     void mnrStrengthChanged(float value);
     // DFNR parameter changes
     void rn2DryMixChanged(float mix);
     void dfnrAttenLimitChanged(float dB);
     void dfnrPostFilterBetaChanged(float beta);
+    // NNR parameter changes
+    void nnrStrengthChanged(int value);
+    void nnrModelChanged(int slot);
     // NR4 parameter changes
     void nr4ReductionChanged(float dB);
     void nr4SmoothingChanged(float pct);
@@ -95,12 +113,16 @@ signals:
     void nr2EnableWithWisdomRequested();
 
 private:
+    // Repaint the status strip's method reading from the current controls.
+    void refreshStatusStrip();
+
     QWidget* buildNr2Page();
     QWidget* buildNr4Page();
     QWidget* buildMnrPage();
     QWidget* buildRn2Page();
     QWidget* buildBnrPage();
     QWidget* buildDfnrPage();
+    QWidget* buildNnrPage();
 
     // Restore defaults for the currently-selected DSP page.  No-op for
     // RN2 / BNR which expose no adjustable parameters.
@@ -134,10 +156,44 @@ private:
     QStackedWidget* m_dspStack{nullptr};
     std::array<QPushButton*, NumDsps> m_dspBtns{};
 
+    // NNR controls. The six advanced ones are uniform -- a slider, its value
+    // label and the spec that says where its default marker goes -- so they
+    // live in one table rather than eighteen members.
+    struct NnrAdvancedControl {
+        const Nnr::ControlSpec* spec;
+        const char* title;
+        int decimals;
+        double scale;                  // slider int <-> control double
+        QSlider* slider;
+        QLabel* value;
+        std::function<void(double)> apply;
+    };
+    std::vector<NnrAdvancedControl> m_nnrAdvanced;
+    QSlider*      m_nnrStrengthSlider{nullptr};
+    // Status strip (shared by every tab, below the page stack).
+    QFrame*       m_statusFrame{nullptr};
+    QLabel*       m_statusDot{nullptr};
+    QLabel*       m_statusValue{nullptr};
+    QLabel*       m_gainLabel{nullptr};
+    NrGainStrip*  m_gainStrip{nullptr};
+    // Which method the strip is currently describing, so a change can clear
+    // the trace instead of splicing two methods' histories together.
+    int           m_lastActiveDsp{-1};
+
+    QLabel*       m_nnrStrengthLabel{nullptr};
+    QButtonGroup* m_nnrModelGroup{nullptr};
+
     // NR2 controls
     QButtonGroup* m_nr2GainGroup{nullptr};
     QButtonGroup* m_nr2NpeGroup{nullptr};
     QCheckBox*    m_nr2AeCheck{nullptr};
+    QCheckBox*    m_nr2Post2Check{nullptr};
+    QSlider*      m_nr2Post2NlevelSlider{nullptr};
+    QLabel*       m_nr2Post2NlevelLabel{nullptr};
+    QSlider*      m_nr2Post2FactorSlider{nullptr};
+    QLabel*       m_nr2Post2FactorLabel{nullptr};
+    QSlider*      m_nr2Post2TaperSlider{nullptr};
+    QLabel*       m_nr2Post2TaperLabel{nullptr};
     QSlider*      m_nr2GainMaxSlider{nullptr};
     QLabel*       m_nr2GainMaxLabel{nullptr};
     QSlider*      m_nr2GainFloorSlider{nullptr};
