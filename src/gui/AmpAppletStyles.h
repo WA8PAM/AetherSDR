@@ -31,7 +31,9 @@ inline QString ampPillStyle(AmpPillState state)
                 "border-radius: 3px; font-size: 9px; font-weight: bold; padding: 2px 6px; }");
         case AmpPillState::Standby:
             return QStringLiteral(
-                "QLabel { background: #12222e; color: #7fc4dc; border: 1px solid #2a5a70; "
+                "QLabel { background: {{color.accessory.key.standby.background}}; "
+                "color: {{color.accessory.key.standby.foreground}}; "
+                "border: 1px solid {{color.accessory.key.standby.foreground}}; "
                 "border-radius: 3px; font-size: 9px; font-weight: bold; padding: 2px 6px; }");
         default:
             return QStringLiteral(
@@ -61,6 +63,17 @@ inline QString ampNeutralBtnStyle()
         "QPushButton { background: {{color.background.2}}; border: 1px solid {{color.background.2}}; "
         "border-radius: 3px; color: {{color.text.primary}}; font-size: 10px; font-weight: bold; }"
         "QPushButton:hover { background: {{color.background.1}}; }");
+}
+
+// Compact CLEAR FAULT button — amber-on-dark, sized to sit in-grid rather
+// than the full button row. Used by AcomApplet and Kpa500Applet.
+inline QString ampClearFaultBtnStyle()
+{
+    return QStringLiteral(
+        "QPushButton { background: #2a2210; border: 1px solid #5a4a1a; "
+        "border-radius: 3px; color: #ffb84d; font-size: 9px; font-weight: bold; padding: 1px 4px; }"
+        "QPushButton:hover { background: #3a2e14; }"
+        "QPushButton:disabled { background: #181c22; border: 1px solid #232a33; color: #3a4552; }");
 }
 
 }  // namespace AetherSDR
