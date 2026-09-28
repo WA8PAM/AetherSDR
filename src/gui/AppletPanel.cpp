@@ -874,7 +874,7 @@ AppletPanel::AppletPanel(QWidget* parent) : QWidget(parent)
 
     // Elecraft KPA500 serial amplifier — strictly serial (no TCP), independent
     // of every other amplifier applet. See
-    // docs/architecture/kpa500-amplifier-design.md.
+    // docs/architecture/elecraft-kpa500-kat500-design.md.
     m_kpa500Applet = new Kpa500Applet;
     {
         auto entry = makeEntry("KPA500", "Elecraft KPA500 Amplifier", m_kpa500Applet,

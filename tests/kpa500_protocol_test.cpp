@@ -52,6 +52,19 @@ int main()
     report("buildQuery(\"RVM\") emits ^RVM; (3-letter cmd)",
            buildQuery("RVM") == QByteArrayLiteral("^RVM;"));
 
+    // ── buildSetFanSpeed: qBound(0, n, 6) ────────────────────────────────────
+    // Source: KPA500 Programmer's Reference Rev. A2, §^FC.
+    report("buildSetFanSpeed(3) emits ^FC3;",
+           buildSetFanSpeed(3) == QByteArrayLiteral("^FC3;"));
+    report("buildSetFanSpeed(0) emits ^FC0; (minimum)",
+           buildSetFanSpeed(0) == QByteArrayLiteral("^FC0;"));
+    report("buildSetFanSpeed(6) emits ^FC6; (maximum)",
+           buildSetFanSpeed(6) == QByteArrayLiteral("^FC6;"));
+    report("buildSetFanSpeed(-1) clamps to ^FC0; (below minimum)",
+           buildSetFanSpeed(-1) == QByteArrayLiteral("^FC0;"));
+    report("buildSetFanSpeed(7) clamps to ^FC6; (above maximum)",
+           buildSetFanSpeed(7) == QByteArrayLiteral("^FC6;"));
+
     // ── FrameParser: well-formed frames ──────────────────────────────────────
 
     {
@@ -124,6 +137,23 @@ int main()
         // Null-command echo (bare ';') is silently discarded.
         auto frames = parse(";^OS0;");
         report("Null-command echo ';' discarded before ^OS0;",
+               frames.size() == 1 && frames[0].first == "OS");
+    }
+
+    // ── FrameParser: kMaxFrameBytes overflow cap ──────────────────────────────
+    {
+        // Feed more than kMaxFrameBytes bytes with no semicolon — the buffer
+        // cap at the tail of feed() clears it rather than growing unboundedly.
+        // A valid frame arriving immediately after must still decode.
+        QList<QPair<QString, QString>> frames;
+        FrameParser parser;
+        parser.setCallback([&](const QString& cmd, const QString& arg) {
+            frames.append({cmd, arg});
+        });
+        parser.feed(QByteArray(kMaxFrameBytes + 1, 'X'));
+        report("kMaxFrameBytes+1 garbage bytes: no callback fired", frames.isEmpty());
+        parser.feed(QByteArray("^OS1;"));
+        report("kMaxFrameBytes cap: valid frame after overflow still decodes",
                frames.size() == 1 && frames[0].first == "OS");
     }
 
@@ -232,15 +262,13 @@ int main()
                    && s.faultCode && *s.faultCode == 99);
     }
     {
-        // Verify we reject hex fault notation the KPA1500 uses — not applicable
-        // to KPA500, which uses plain decimal. "B0" as toInt() decimal = 0
-        // (because 'B' stops the parse), so it would be silently treated as "0".
-        // The KPA500 spec does NOT use hex fault codes, so this is not a real
-        // scenario, but document the behaviour: our toInt() decimal parse stops
-        // at the first non-digit, so "B0" → 0 (no fault). Acceptable since the
-        // KPA500 spec only defines decimal fault codes.
+        // The KPA1500 uses hex fault codes; the KPA500 does not. "B0" is not a
+        // valid decimal integer — toInt() sets ok=false, the guard rejects it,
+        // and faultCode stays unset. Correct: the KPA500 spec only defines
+        // decimal codes (00–99), so a hex-formatted value is a malformed reply.
         Status s;
-        applyMessage("FL", "B0", s);  // no report — behaviour is spec-correct
+        report("^FL hex-notation 'B0' — toInt decimal fails, field unchanged",
+               !applyMessage("FL", "B0", s) && !s.faultCode);
     }
 
     // ── applyMessage: ^OS operate/standby ────────────────────────────────────

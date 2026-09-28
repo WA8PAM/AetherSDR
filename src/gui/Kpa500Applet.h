@@ -15,7 +15,7 @@ class HGauge;
 
 // Dedicated applet for an Elecraft KPA500 serial amplifier — a peripheral
 // accessory alongside AcomApplet/SpeApplet, not a variant of AmpApplet.
-// See docs/architecture/kpa500-amplifier-design.md.
+// See docs/architecture/elecraft-kpa500-kat500-design.md.
 //
 // Principle II: no control method latches its own state. setOperate() is
 // wired to Kpa500Connection::setOperate(); the applet repaints when the

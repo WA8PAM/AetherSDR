@@ -7093,7 +7093,7 @@ void MainWindow::wireMeters()
     }
 
     // ── Elecraft KPA500 amplifier — serial only, no FlexRadio relay ──────────
-    // See docs/architecture/kpa500-amplifier-design.md. Wire ALL signals
+    // See docs/architecture/elecraft-kpa500-kat500-design.md. Wire ALL signals
     // before the auto-connect trigger — connectSerial() can call
     // onTransportUp() synchronously, so anything wired after the trigger
     // misses the first connected().
