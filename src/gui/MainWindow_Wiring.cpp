@@ -6355,6 +6355,7 @@ void MainWindow::wireMeters()
             this, [this](float fwd, float swr, bool swrValid) {
         if ((m_radioModel.amplifier().present() && m_radioModel.amplifier().operate())
             || (m_kpa500Conn.isConnected()
+                && m_kpa500Conn.isResponding()
                 && m_kpa500Conn.lastStatus().operate.value_or(false)))
             return;
         // Absent SWR is forwarded as 1.0: RadioSwrValidityFilter downstream
@@ -6379,6 +6380,7 @@ void MainWindow::wireMeters()
         if ((m_radioModel.amplifier().present()
              && m_radioModel.amplifier().operate())
             || (m_kpa500Conn.isConnected()
+                && m_kpa500Conn.isResponding()
                 && m_kpa500Conn.lastStatus().operate.value_or(false))) {
             return;
         }
@@ -7171,6 +7173,7 @@ void MainWindow::wireMeters()
         // so the 2kW PGXL scale would make every reading look tiny.
         if (!ampActive
             && m_kpa500Conn.isConnected()
+            && m_kpa500Conn.isResponding()
             && m_kpa500Conn.lastStatus().operate.value_or(false)) {
             maxW = 500;
         }
@@ -7184,6 +7187,7 @@ void MainWindow::wireMeters()
     // Re-evaluate scale when KPA500 operate state changes or disconnects.
     connect(&m_kpa500Conn, &Kpa500Connection::statusUpdated, this, updatePowerScale);
     connect(&m_kpa500Conn, &Kpa500Connection::disconnected, this, updatePowerScale);
+    connect(&m_kpa500Conn, &Kpa500Connection::respondingChanged, this, updatePowerScale);
     // Also refresh on infoChanged (#4813): maxPowerLevelChanged only fires when
     // the numeric value actually changes, which it doesn't on connect if the
     // radio's exciter limit matches TransmitModel's compiled-in default (100W —

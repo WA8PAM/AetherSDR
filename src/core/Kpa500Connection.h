@@ -35,6 +35,7 @@ public:
     explicit Kpa500Connection(QObject* parent = nullptr);
 
     bool isConnected() const { return m_connected; }
+    bool isResponding() const { return m_responding; }
     // "COM4 @ 4800" — for status display in RadioSetupDialog indicator.
     QString description() const;
 

@@ -312,6 +312,27 @@ void Kpa500Applet::setConnected(bool connected)
 void Kpa500Applet::setResponding(bool responding)
 {
     m_responding = responding;
+    if (!responding) {
+        // Clear live readouts — "NO RESPONSE" next to a confident SWR 1.2:1
+        // is the dangerous state (#4953 triage, safety label). Band is kept
+        // (it doesn't change when the amp goes silent); fault banner and
+        // firmware tooltip are kept too (they describe a condition, not a
+        // live measurement).
+        m_fwdW  = 0.0f;
+        m_swr   = 0.0f;
+        m_tempC = 0.0f;
+        m_voltV = 0.0f;
+        m_currA = 0.0f;
+        m_pwrDirty  = false;
+        m_infoDirty = false;
+        m_pwrLabel->setText("PWR");
+        m_swrLabel->setText("SWR  —");
+        m_tempLabel->setText("TMP  —");
+        m_voltLabel->setText("V  — V");
+        m_currLabel->setText("I  — A");
+        m_pwrGauge->setValueImmediate(0.0f);
+        m_pwrGauge->clearPeak();
+    }
     updateStatusPill();
 }
 
