@@ -150,7 +150,8 @@ int main()
         parser.setCallback([&](const QString& cmd, const QString& arg) {
             frames.append({cmd, arg});
         });
-        parser.feed(QByteArray(kMaxFrameBytes + 1, 'X'));
+        // kMaxFrameBytes == 64 (Kpa500Protocol.h); feed one byte over the cap.
+        parser.feed(QByteArray(65, 'X'));
         report("kMaxFrameBytes+1 garbage bytes: no callback fired", frames.isEmpty());
         parser.feed(QByteArray("^OS1;"));
         report("kMaxFrameBytes cap: valid frame after overflow still decodes",
