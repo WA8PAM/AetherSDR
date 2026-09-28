@@ -31,9 +31,7 @@ inline QString ampPillStyle(AmpPillState state)
                 "border-radius: 3px; font-size: 9px; font-weight: bold; padding: 2px 6px; }");
         case AmpPillState::Standby:
             return QStringLiteral(
-                "QLabel { background: {{color.accessory.key.standby.background}}; "
-                "color: {{color.accessory.key.standby.foreground}}; "
-                "border: 1px solid {{color.accessory.key.standby.foreground}}; "
+                "QLabel { background: #12222e; color: #7fc4dc; border: 1px solid #2a5a70; "
                 "border-radius: 3px; font-size: 9px; font-weight: bold; padding: 2px 6px; }");
         default:
             return QStringLiteral(
@@ -62,6 +60,18 @@ inline QString ampNeutralBtnStyle()
     return QStringLiteral(
         "QPushButton { background: {{color.background.2}}; border: 1px solid {{color.background.2}}; "
         "border-radius: 3px; color: {{color.text.primary}}; font-size: 10px; font-weight: bold; }"
+        "QPushButton:hover { background: {{color.background.1}}; }");
+}
+
+// Standby-state key — amber via theme tokens, matching AmpApplet's
+// kPanelKeyStandbyStyle. Used when the amp is connected, responding,
+// and in standby (not operate).
+inline QString ampStandbyBtnStyle()
+{
+    return QStringLiteral(
+        "QPushButton { background: {{color.accessory.key.standby.background}}; "
+        "border: 1px solid {{color.accessory.key.standby.foreground}}; border-radius: 3px; "
+        "color: {{color.accessory.key.standby.foreground}}; font-size: 10px; font-weight: bold; }"
         "QPushButton:hover { background: {{color.background.1}}; }");
 }
 

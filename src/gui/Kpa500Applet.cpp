@@ -330,7 +330,7 @@ void Kpa500Applet::updateStatusPill()
         ampPillStyle(kpa500PillState(m_connected, m_responding, m_operate)));
     theme.applyStyleSheet(m_standbyBtn,
         (m_connected && m_responding && !m_operate)
-            ? ampActiveBtnStyle(QStringLiteral("#12222e"), QStringLiteral("#2a5a70"))
+            ? ampStandbyBtnStyle()
             : ampNeutralBtnStyle());
     theme.applyStyleSheet(m_operateBtn,
         (m_connected && m_responding && m_operate)
