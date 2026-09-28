@@ -128,7 +128,7 @@ set `m_responding = false` → `respondingChanged(false)`.
 | Operate / Standby (^OS) | Yes | Core operational control. |
 | Fan minimum speed (^FC set) | Yes | User-adjustable from applet combo. |
 | Fault clear (^FLC) | Yes | Operator recovery action. |
-| Power off (^ON0) | Builder only — no UI wire | `^ON0;` is a one-way power-cut with no reply; power-on is a bootloader command that cannot be reliably issued over the same port. Wiring power-off to a UI control is deferred — a confirmation step is a prerequisite and was out of scope for this PR. |
+| Power off / on (^ON0 / ^ON1) | Builders only — no UI wire | Both work over the normal serial port (confirmed by KPA500 Remote and third-party applications). Power-off needs a confirmation step; power-on needs a verified round-trip test on hardware. Both are deferred to a follow-on commit. |
 | Band push (^BN set) | **Never** | The amp senses band from the drive signal via its own frequency counter; AetherSDR explicitly does not push band to it (§5). |
 | Baud-rate negotiation (^BRP) | Not implemented | The port-selector combo covers units already reconfigured; dynamic renegotiation via ^BRP is deferred. |
 

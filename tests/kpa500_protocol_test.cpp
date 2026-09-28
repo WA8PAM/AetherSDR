@@ -45,6 +45,8 @@ int main()
            buildClearFault() == QByteArrayLiteral("^FLC;"));
     report("buildPowerOff() emits ^ON0; (§^ON: 'SET format: ^ON0; turns the KPA500 off')",
            buildPowerOff() == QByteArrayLiteral("^ON0;"));
+    report("buildPowerOn() emits ^ON1; (§^ON, confirmed over serial by KPA500 Remote)",
+           buildPowerOn() == QByteArrayLiteral("^ON1;"));
     report("buildNullCommand() emits bare ';'",
            buildNullCommand() == QByteArrayLiteral(";"));
     report("buildQuery(\"WS\") emits ^WS;",

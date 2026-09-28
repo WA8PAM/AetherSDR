@@ -123,10 +123,13 @@ QByteArray buildStandby();
 // Source: §^FL "SET format: ^FLC; clears the current fault."
 QByteArray buildClearFault();
 
-// ^ON0; — power off the amplifier.
-// Power-ON is via the boot-loader 'P' command (sent before main firmware
-// starts) — not implemented here.
+// ^ON0; / ^ON1; — power the amplifier off / on.
+// Both directions work over the normal serial port (confirmed by KPA500
+// Remote and third-party applications). No UI is wired for either command
+// in this PR — power-off needs a confirmation step, power-on needs a
+// verified round-trip test. Builders are provided for future use.
 QByteArray buildPowerOff();
+QByteArray buildPowerOn();
 
 // ^FCn; — set fan minimum speed (0 = off, 6 = high).
 // Source: KPA500 Programmer's Reference Rev. A2, §^FC.

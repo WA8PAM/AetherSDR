@@ -214,6 +214,14 @@ QByteArray buildPowerOff()
     return QByteArrayLiteral("^ON0;");
 }
 
+QByteArray buildPowerOn()
+{
+    // Source: KPA500 Programmer's Reference Rev. A2, §^ON.
+    // Works over the normal serial port (confirmed by KPA500 Remote and
+    // third-party applications). No UI wired in this PR — see header.
+    return QByteArrayLiteral("^ON1;");
+}
+
 QByteArray buildSetFanSpeed(int n)
 {
     // Source: KPA500 Programmer's Reference Rev. A2, §^FC:
