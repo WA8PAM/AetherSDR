@@ -2,6 +2,8 @@
 
 #include <QStringList>
 
+#include <cctype>
+
 namespace AetherSDR {
 namespace Kpa500 {
 
@@ -23,10 +25,11 @@ QString bandName(int band)
 
 void FrameParser::feed(const QByteArray& bytes)
 {
-    // Guard against unbounded growth before appending.
-    if (m_buf.size() + bytes.size() > kMaxFrameBytes * 4)
-        m_buf.clear();
+    // Guard against unbounded growth. Append first so a chunk that would
+    // complete a buffered partial frame is not discarded before it arrives.
     m_buf.append(bytes);
+    if (m_buf.size() > kMaxFrameBytes * 4)
+        m_buf.clear();
 
     while (true) {
         int semi = m_buf.indexOf(';');

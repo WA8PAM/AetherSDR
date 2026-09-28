@@ -101,6 +101,9 @@ private:
 
     // Rotating index into slowPollCommands() — one command per slow tick.
     int m_slowIndex{0};
+    // Rotating index into fastPollCommands() — member so reconnect resets it
+    // and multiple instances don't share state.
+    int m_fastIndex{0};
     // One-shot connect commands: sent in sequence after transport comes up,
     // one per fast-poll tick, before regular polling starts.
     int  m_connectCmdIndex{0};

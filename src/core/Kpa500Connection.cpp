@@ -120,6 +120,7 @@ void Kpa500Connection::onTransportUp()
     m_status    = {};
     m_parser.reset();
     m_slowIndex       = 0;
+    m_fastIndex       = 0;
     m_connectCmdIndex = 0;
     m_connectCmdsDone = false;
     m_silentTicks     = 0;
@@ -206,9 +207,8 @@ void Kpa500Connection::fastPollTick()
     // Rotate through fast-poll commands.
     const QStringList& cmds = Kpa500::fastPollCommands();
     if (!cmds.isEmpty()) {
-        static int s_fastIndex = 0;
-        s_fastIndex = (s_fastIndex + 1) % cmds.size();
-        sendRaw(Kpa500::buildQuery(cmds[s_fastIndex].toLatin1().constData()));
+        m_fastIndex = (m_fastIndex + 1) % cmds.size();
+        sendRaw(Kpa500::buildQuery(cmds[m_fastIndex].toLatin1().constData()));
     }
 }
 

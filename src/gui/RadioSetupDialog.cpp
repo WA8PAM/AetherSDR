@@ -9560,8 +9560,8 @@ QWidget* RadioSetupDialog::buildPeripheralsTab()
 
     // KPA500 amplifier — serial only (KPA500 Programmer's Ref does not define
     // a network protocol; communication is RS-232/USB-serial exclusively). The
-    // default rate is 4800 baud per §^BRP; it is not user-configurable here
-    // because the spec documents no alternative rate negotiation.
+    // default rate is 4800 baud per §^BRP; configurable via the selector below
+    // for units previously reconfigured with ^BRP.
     if (m_kpa500) {
         const int row = grid->rowCount();
         auto& tm = AetherSDR::ThemeManager::instance();
