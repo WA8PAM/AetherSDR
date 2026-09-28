@@ -144,8 +144,13 @@ void Kpa500Connection::onTransportUp()
 
 void Kpa500Connection::onTransportDown(const QString& reason)
 {
+#ifdef HAVE_SERIALPORT
     if (!m_connected && !m_serial.isOpen())
         return;
+#else
+    if (!m_connected)
+        return;
+#endif
 
     m_fastPollTimer.stop();
     m_slowPollTimer.stop();
