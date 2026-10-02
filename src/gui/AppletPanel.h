@@ -200,8 +200,7 @@ public:
     // ACOM/SPE/VKAMP; LpMeterConnection keeps the link when the meter stops
     // answering (the tile shows NO DATA), so only an absent transport hides it.
 
-    upstream/main
-    void setLpMeterVisible(bool visible);
+     void setLpMeterVisible(bool visible);
 
     // Show/hide the AG button and applet based on Antenna Genius presence.
     void setAgVisible(bool visible);
