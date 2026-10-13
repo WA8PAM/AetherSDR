@@ -1,6 +1,6 @@
 # Elecraft KPA500 / KAT500 Support — Design Note
 
-**Status:** KPA500 implementation in this change; KAT500 deferred to a follow-on commit
+**Status:** KPA500 implementation in this change; KAT500 deferred to a separate PR
 under the same issue (#4953).
 
 **Scope:** A dedicated `Kpa500Applet` driven by `Kpa500Connection` (serial or raw TCP
@@ -179,7 +179,7 @@ transmit gate and the amplifier's own protections remain independent.
 
 ---
 
-## 6. KAT500 — same issue, separate commit
+## 6. KAT500 — same issue, separate PR
 
 Issue #4953 covers both the KPA500 amplifier and the KAT500 antenna tuner.
 This PR delivers the KPA500 half. The KAT500 is deliberately **not** shared
@@ -195,7 +195,7 @@ is registered before its applet exists, and both must be gated on their own
 device detection. Full model names remain in titles and device settings.
 
 The KAT500's protocol, transport, applet, and settings row are left for the
-follow-on commit. Nothing in this PR's architecture prevents them from being
+separate PR. Nothing in this PR's architecture prevents them from being
 added as a clean parallel structure.
 
 ---
@@ -231,8 +231,9 @@ the UI *includes*, not `gui/` files themselves.
   faults in mini mode, guarded band/fan dropdowns, no colour-only state.
 - **Hardware evidence:** GET-only lab replies from firmware 1.54 confirm
   standby, zero RF, identity, voltage/current, temperature, band, fan and
-  fault framing. This is not a transmitted-power, setter or end-to-end
-  application validation.
+  fault framing. Windows serial and Mac raw-TCP application checks also cover
+  configuration backup, banner readback and stored fault history. Physical
+  restore/banner-write persistence and transmitted-power accuracy remain unverified.
 
 ## Raw TCP serial proxy
 

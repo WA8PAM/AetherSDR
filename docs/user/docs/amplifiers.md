@@ -124,6 +124,10 @@ failed or dropped link. Serial and network targets are saved separately.
 serial number from readback; unreported values remain unknown. The same
 information appears in the applet's **Settings**.
 
+<img src="/img/kpa500/kpa500-applet-full.png" width="360" alt="KPA500 applet in Standby with confirmed ON state and zero forward power." />
+
+*The KPA500 applet shows amplifier readback. This capture was taken without RF.*
+
 The **KP500** applet-bar button opens **Elecraft KPA500 Amplifier**. Its shorter
 label fits the standard button width and preserves the full name in the applet title.
 The button appears after a valid amplifier reply, not just an open connection.
@@ -172,6 +176,14 @@ full view with History. Meters and graphs follow the window width, and History
 uses extra height for taller graphs. Controls stay grouped at the top. A vertical
 scrollbar keeps expanded History and Debug accessible in a smaller window.
 
+<img src="/img/kpa500/kpa500-applet-mini.png" width="360" alt="KPA500 Mini mode with power, SWR, band and Standby controls." />
+
+*Mini mode keeps the essential controls and readings visible.*
+
+<img src="/img/kpa500/kpa500-applet-history.png" width="420" alt="KPA500 expanded history graphs for power, SWR, temperature, voltage and current." />
+
+*History uses amplifier measurements; SWR remains unmeasured without RF.*
+
 **Settings** includes **Temperature in °F**, connection endpoint (and local serial speed), last valid
 reply age, firmware and serial number, plus an explanation of history gaps and
 scales. **Debug** normally shows connection and
@@ -181,6 +193,10 @@ power transitions, control requests, errors and pending band changes. Enable
 changes the displayed history; polling chatter does not displace normal events. **Pause** freezes the display while each bounded 2,000-line view
 continues collecting; **Resume** catches up. **Copy** and **Save…** export the
 visible paused log or the current buffer.
+
+<img src="/img/kpa500/kpa500-applet-settings-debug.png" width="480" alt="KPA500 Settings with Follow TX flag, device information, Advanced shortcut and Debug." />
+
+*Settings and Debug. Station identifiers are redacted.*
 
 **NO RESPONSE** means the connection is open without valid amplifier replies.
 Cached readings clear after silence; individual missing fast and slow fields
@@ -226,6 +242,10 @@ Writes are never retried or resumed automatically. An incomplete restore may
 have changed part of the configuration; reconnect and inspect the amplifier
 before attempting another restore. Fault history is not part of a configuration
 backup and is never overwritten by Restore.
+
+<img src="/img/kpa500/kpa500-advanced-window.png" width="720" alt="Peripherals with a NETWORK-connected KPA500 and Advanced backup, restore, banner and stored fault history controls." />
+
+*Advanced maintenance after reading the banner and stored fault history. Station identifiers are redacted.*
 
 ## Using the Elecraft KPA1500
 
