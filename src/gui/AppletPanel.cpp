@@ -328,7 +328,8 @@ AppletPanel::AppletPanel(QWidget* parent) : QWidget(parent)
             "color: {{color.text.primary}}; "
             "border: 1px solid {{color.accent.bright}}; }"
             "QPushButton:disabled { color: {{color.text.disabled}}; "
-            "border-color: {{color.background.1}}; }");
+            "border-color: {{color.background.1}}; }"
+            "QPushButton#kpa500BarButton { font-size: 10px; }");
 
     m_favRow = new QWidget;
     m_favRow->setObjectName("barContainer");
@@ -888,7 +889,7 @@ AppletPanel::AppletPanel(QWidget* parent) : QWidget(parent)
         m_appletOrder.append(entry);
     }
 
-    // Elecraft KPA500 serial amplifier — strictly serial (no TCP), independent
+    // Elecraft KPA500 serial/raw-TCP amplifier, independent
     // of every other amplifier applet. See
     // docs/architecture/elecraft-kpa500-kat500-design.md.
     m_kpa500Applet = new Kpa500Applet;
@@ -898,7 +899,6 @@ AppletPanel::AppletPanel(QWidget* parent) : QWidget(parent)
         m_kpa500Btn = entry.btn;
         m_kpa500Btn->setObjectName(QStringLiteral("kpa500BarButton"));
         m_kpa500Btn->setAccessibleName(tr("Elecraft KPA500 amplifier"));
-        m_kpa500Btn->setStyleSheet(QStringLiteral("QPushButton { font-size: 10px; }"));
         markHardwareConditional("KPA500");
         if (auto* container = qobject_cast<ContainerWidget*>(entry.widget)) {
             container->setDefaultFloatingSize(QSize(560, 720));
