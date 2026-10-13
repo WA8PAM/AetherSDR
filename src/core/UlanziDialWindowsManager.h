@@ -18,10 +18,11 @@ namespace AetherSDR {
 //   buttonEvent(sig, action)     — see EvdevEncoderManager for signature
 //   connectionChanged(bool, name)
 // The dial enumerates as several HID interfaces (Keyboard for Ctrl+chords,
-// Consumer Control for media keys, maybe Mouse); every device whose
-// product_string contains "Ulanzi Dial" is opened and polled, and report diffs
-// feed the shared chord decoder. No exclusive grab on Windows, so keystrokes
-// still reach the focused window (RawInput design: #3232).
+// Consumer Control for media keys, maybe Mouse); every interface with the
+// dial's VID/PID whose product_string contains "Ulanzi Dial" is opened and
+// polled, and report diffs feed the shared chord decoder. No exclusive grab
+// on Windows, so keystrokes still reach the focused window (RawInput design:
+// #3232).
 class UlanziDialWindowsManager : public QObject {
     Q_OBJECT
 public:
@@ -30,6 +31,11 @@ public:
 
     void start();
     void stop();
+    // Re-announce the current state through stateReported() for the mapper
+    // dialog, which opens long after the edges it would otherwise have heard.
+    // Deliberately NOT connectionChanged(): that edge also drives the dial's
+    // TX disconnect fence, and a re-report must never look like a detach.
+    void reportState();
 
     bool isConnected() const { return !m_devices.isEmpty(); }
     QString deviceName() const { return m_deviceName; }
@@ -38,6 +44,8 @@ signals:
     void tuneSteps(int steps);
     void buttonEvent(const QString& signature, int action);
     void connectionChanged(bool connected, const QString& name);
+    // Current state, emitted only from reportState(). Not an edge.
+    void stateReported(bool connected, const QString& name);
 
 private slots:
     void poll();

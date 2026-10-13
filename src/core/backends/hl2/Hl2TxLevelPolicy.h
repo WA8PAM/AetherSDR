@@ -29,7 +29,7 @@ namespace AetherSDR::hl2 {
 // The slider as the modulator's linear multiplier; level 0 mutes. Applies to
 // Microphone and ClientLeveled audio (voice, AX.25, TCI/DAX), not the WSPR
 // pump (Hl2TxDsp substitutes 1.0), so 0 does not silence a beacon. The ALC
-// only reduces, and reduction is instantaneous (`m_alcGain = target`), so a
+// only reduces, and reduction has no attack constant (Hl2TxAlc.h), so a
 // full-scale source at the slider top is limited by the ALC, not flat-topped
 // by the modulator clamp; hl2_txdsp_test's slider-top case asserts it.
 [[nodiscard]] inline double micSliderToLinear(int level) noexcept
@@ -62,9 +62,9 @@ inline constexpr int kMicLevelCurve = 2;
 // ---- Forward-power peak hold -----------------------------------------------
 
 // One step of the TX forward-power peak hold, in watts. Forward power is one
-// unaveraged 12-bit I2C ADC sample at 10 Hz (rtl/slow_adc.v), which almost
-// never lands on a speech peak, so SSB reads 8-12 dB under PEP. Instant attack
-// and exponential release accumulate the max across an over. Unkeyed, the
+// unaveraged 12-bit I2C ADC sample (rtl/slow_adc.v), re-sampled every other EP6
+// response (control.v:261); the input is each publish window's maximum. Instant
+// attack and exponential release carry the max across an over. Unkeyed, the
 // reading follows the instant sample so the gauge drops when TX stops.
 [[nodiscard]] constexpr double fwdPeakHoldStep(double previousPeakW,
                                                double instantW,

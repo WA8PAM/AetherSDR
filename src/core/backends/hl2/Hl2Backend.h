@@ -6,6 +6,7 @@
 #include "core/dsp/WdspSMeter.h"
 
 #include <QElapsedTimer>
+#include <QJsonObject>
 #include <QPointer>
 #include <QString>
 #include <QThread>
@@ -90,10 +91,24 @@ public:
     void setSliceFilter(int sliceId, int lowHz, int highHz) override;
     void setCwPitch(int hz) override;
     void setSliceAgc(int sliceId, const QString& mode, int thresholdDb) override;
-    // Impulse noise blanker, run in host WDSP (the HL2 has no firmware DSP). NR and
-    // ANF are deliberately not implemented and stay hidden.
-    void setSliceNoiseBlanker(int sliceId, bool on, int level) override;
+    // Impulse noise blankers, run in host WDSP (the HL2 has no firmware DSP); at
+    // most one of the two runs. NR and ANF are deliberately not implemented and
+    // stay hidden.
+    void setSliceNoiseBlanker(int sliceId, AetherSDR::NoiseBlankerKind kind,
+                              int level, AetherSDR::NoiseBlankerFill fill) override;
+    ReceiveDispatch requestSliceDsp(int sliceId, const SliceDspRequest& request) override;
+    ReceiveDispatch requestSliceControl(int sliceId, const SliceControlRequest& request) override;
+    ReceiveDispatch requestTransmitControl(const TransmitControlRequest& request,
+        TunePowerContext context = TunePowerContext::Deferred) override;
+    ReceiveDispatch requestSliceAudio(int sliceId, const SliceAudioRequest& request) override;
+    ReceiveDispatch requestSliceSquelch(int sliceId, const SliceSquelchRequest& request) override;
     void setSliceSquelch(int sliceId, bool on, int level) override;
+    // Host-side CW APF and AGC-off level, per receiver; see Hl2RxDsp.
+    void setSliceApf(int sliceId, bool on, int level) override;
+    // Handles SliceAgcRequest::Field::OffLevel (the WDSP fixed gain) and drops
+    // a recalled AGC mode in DIGU/DIGL; the rest goes to the base, i.e.
+    // setSliceAgc().
+    void requestSliceAgc(int sliceId, const SliceAgcRequest& request) override;
     void setSliceAudioMute(int sliceId, bool mute) override;
     void setSliceAudioGain(int sliceId, int gainPercent) override;
     void setSliceAudioPan(int sliceId, int panPercent) override;
@@ -112,6 +127,22 @@ private:
 
 public:
     void setPanFrameRate(const QString& panId, int fps) override;
+    // The operator's FFT AVG (0..100) and weighted toggle. This backend owns
+    // the panadapter's averaging (RFC #5782), so both land in the receiver's
+    // Hl2Spectrum; see averageTimeMsForStep() and Hl2Spectrum::setAverageTimeMs().
+    void setPanAverage(const QString& panId, int average) override;
+    void setPanWeightedAverage(const QString& panId, bool on) override;
+
+    // One FFT AVG step is 10 ms of averaging time constant, so 0..100 spans
+    // 0..1 s: the ANAN's unit (AnanBackend's kMsPerAverageStep), so one setting
+    // means one time constant on both families. A time, not a frame count: a
+    // depth in frames would move with the fps slider. It does not match a Flex,
+    // whose `average=` has no documented unit.
+    static constexpr int kMsPerAverageStep = 10;
+    [[nodiscard]] static constexpr int averageTimeMsForStep(int average) noexcept
+    {
+        return (average < 0 ? 0 : (average > 100 ? 100 : average)) * kMsPerAverageStep;
+    }
     bool createPanadapter() override;
     bool removePanadapter(const QString& panId) override;
     void createNotch(double centerHz, double widthHz) override;
@@ -124,6 +155,7 @@ public:
                        TxAudioSource source,
                        const TxCoordinator::Context& context) override;
     void setTxPower(int percent) override;
+    void setTunePower(int percent) override;
     void setTxFilter(int lowHz, int highHz) override;
     void setMicGain(int level) override;
     // No default argument: defaults on virtuals bind statically and would diverge
@@ -153,10 +185,12 @@ public:
     [[nodiscard]] int lnaEffectiveDb() const noexcept;
     [[nodiscard]] bool autoRfGainEnabled() const noexcept { return m_autoRfGainEnabled; }
 
-    // Max attenuation the loop may apply, in dB below the operator's baseline.
-    // Default 26 dB. It was sized from #5354's sweep, whose gain labels read 32 dB
-    // low (one unit's defect, #5943), so it is not a measured bound. Everything else
-    // in Hl2AutoGainPolicy.h is deliberately not operator-settable.
+    // Max attenuation the loop may apply, in dB below the operator's baseline. The
+    // floor belongs to the law: 24 dB for "bandscope" (what a backend starts with)
+    // and "probe", 26 for "ramp" and "binary". The 26 was sized from #5354's sweep,
+    // whose gain labels read 32 dB low (one unit's defect, #5943), so it is not a
+    // measured bound. Everything else in Hl2AutoGainPolicy.h is deliberately not
+    // operator-settable.
     void setAutoRfGainFloorDb(int floorDb);
     [[nodiscard]] int autoRfGainFloorDb() const noexcept
     {
@@ -164,7 +198,7 @@ public:
     }
     // The deepest floor the operator may configure: the whole native span, so
     // from any armable baseline the loop can be allowed to dig to the register
-    // floor. The default floor (Hl2AutoGainPolicy.h maxOffsetDb) is separate.
+    // floor. The default floor belongs to the installed law (above).
     static constexpr int kAutoRfGainFloorMaxDb = hl2::kLnaGainMaxDb - hl2::kLnaGainMinDb;
 
     // Which Hl2AutoGainPolicy.h configuration the loop runs:
@@ -175,7 +209,9 @@ public:
     //             interval. What "bandscope" degenerates to without the measurement.
     // "binary"    binaryHighLowConfig(): two-state per-band switch.
     // Same state machine, different numbers; selecting a mode installs its floor.
-    // Returns false, changing nothing, on an unknown name.
+    // "default" names the law a backend starts with. A chosen law and floor are
+    // persisted per radio (rfGain); "default" clears the choice. Returns false,
+    // changing nothing, on an unknown name.
     bool setAutoRfGainMode(const QString& mode);
 
     // IAutoRfGainControl (AutoRfGainControl.h), thin forwarders. autoRfGainControl()
@@ -242,10 +278,23 @@ private:
     friend struct Hl2PcmTestAccess;
     friend struct Hl2TxGateTestAccess;
     friend struct Hl2UnkeyHoldTestAccess;
+    // Hands receiver 0 a configured Hl2RxDsp so the APF and AGC-off verbs can
+    // be followed from the seam into WDSP without a socket.
+    friend struct Hl2ApfAgcOffTestAccess;
+    // The same hand-off, so hl2_rxdsp_squelch_test follows an LNA change into
+    // the squelch gate.
+    friend struct Hl2SquelchTestAccess;
     // Delivers one bandscope block through MetisClient's signal and ages the mirror,
     // so converter-row expiry is testable without a radio.
     friend struct Hl2HealthBlockTestAccess;
+    // Reads the receive shift/NCO and adds a second receiver's state without a
+    // socket or DSP, for hl2_rit_xit_test. Reaches nothing else.
+    friend struct Hl2RitXitTestAccess;
     friend struct Hl2Cl1ReferenceTestAccess;
+    // Fires link edges through MetisClient's signals and seeds the connect
+    // baseline, so hl2_auto_gain_law_test reads the installed law without a radio.
+    friend struct Hl2AutoGainLawTestAccess;
+    friend struct Hl2SessionMemoryTestAccess;
     void applyKeying(bool key, const TxCoordinator::Operation& operation,
                      const TxCoordinator::Completion& completion, bool cwBreakIn);
     void invalidateTxDspConfiguration();
@@ -356,6 +405,9 @@ private:
     // Clamp 0..100, map onto the drive register, honour the transmit gate.
     // Shared by setTxPower() and setTune() so the mapping exists exactly once.
     void applyDrive(int percent);
+    void beginTxTail();
+    void cancelTxTail();
+    void finishTxTail();
     static double temperatureCelsius(int raw);
     // Coupler counts -> watts is AetherSDR::hl2::directionalWatts() in MetisProtocol.
     // Watts -> dBm for the meter seam, floored so 0 W does not become -inf.
@@ -447,6 +499,17 @@ private:
         // shift, and the NCO moves only when the target would leave the window.
         double sliceFreqHz = 10'000'000.0;   // slice
         double ncoHz       = 10'000'000.0;   // DDC / pan centre
+        // True while the NCO sits off the dial only because RIT pushed the
+        // receive frequency out of the window (the dial alone fitted), so
+        // clearing RIT re-centres it on the dial. A pan drag clears it.
+        bool ncoMovedForRit = false;
+
+        // RIT / XIT, Hz from the dial. Nothing on the wire echoes them, so
+        // emitSliceState() publishes these back as the readout.
+        bool ritOn = false;
+        int  ritHz = 0;
+        bool xitOn = false;
+        int  xitHz = 0;
 
         QString mode = QStringLiteral("USB");
         // Overwritten from defaultPassbandForMode(mode) on the first linkUp of each
@@ -457,11 +520,31 @@ private:
         // so the first sliceChanged reports what WDSP was actually opened with.
         QString agcMode = QStringLiteral("med");
         int agcThresholdDb = 65;
+        // The AGC mode held while DIGU/DIGL run AGC off (followModeAgc());
+        // restored on leaving them unless the operator set AGC since. Empty
+        // when nothing is waiting. A receiver seeded from another copies it.
+        QString agcModeBeforeDigital;
 
         // Authoritative noise-blanker state: nothing echoes it, and a rebuilt receiver
-        // must be told again. Defaults mirror SliceModel's (off, level 50).
-        bool nbOn = false;
+        // must be told again. Defaults mirror SliceModel's (off, level 50, zero fill).
+        AetherSDR::NoiseBlankerKind nbKind = AetherSDR::NoiseBlankerKind::Off;
         int  nbLevel = 50;
+        AetherSDR::NoiseBlankerFill nbFill = AetherSDR::kDefaultNoiseBlankerFill;
+        // A restored blanker still to be published once (emitSliceState).
+        bool nbEchoPending = false;
+
+        // APF request and AGC-off level, held like the blanker: nothing echoes
+        // them and a fresh chain must be told again. Literal defaults match
+        // Hl2RxDsp::kDefaultApfLevel / kDefaultAgcOffLevel (the test pins it).
+        bool apfOn = false;
+        int  apfLevel = 50;
+        int  agcOffLevel = 10;
+
+        // The operator's panadapter averaging, held for the same reason: a
+        // chain built on reconnect or for an added pan starts at none.
+        // panAverage is the operator's 0..100; see averageTimeMsForStep().
+        int  panAverage = 0;
+        bool panWeightedAverage = false;
 
         // Authoritative squelch state, for the blanker's reasons: nothing on
         // this radio echoes it and every rebuilt chain opens with it off.
@@ -504,9 +587,26 @@ private:
     // The receiver's passband in the demodulator's audio domain: carrier-relative
     // cuts slid up (CWU) or down (CWL) onto the pitch.
     [[nodiscard]] std::pair<double, double> dspFilterHz(const Receiver& r) const noexcept;
+    // Moves r's AGC with its mode: off on entering DIGU/DIGL from
+    // previousMode, the held AGC on leaving them. Every site that writes
+    // Receiver::mode calls it. True when agcMode changed.
+    static bool followModeAgc(Receiver& r, const QString& previousMode);
     // WDSP shift: the slice's offset from the NCO less the BFO, so the marker lands
     // on the pitch.
     [[nodiscard]] double rxShiftHz(const Receiver& r) const noexcept;
+    // Where a receiver actually listens: its dial plus its own RIT. Feeds the
+    // NCO window and the shift; sliceFreqHz stays the dial.
+    [[nodiscard]] double rxTunedHz(const Receiver& r) const noexcept;
+    // Re-run one receiver's tune after its RIT changed.
+    void retuneReceiver(int ddc);
+    // The offset clamped to kRitXitMaxHz, logging when the clamp bites.
+    [[nodiscard]] static int clampRitXit(const char* what, int hz);
+    // qCInfo naming the receiver and slice an RIT/XIT change landed on.
+    void logRitXit(const char* what, int ddc, bool on, int hz) const;
+    // SmartCatProtocol's kRitMaxHz. Only SmartCAT clamps to it: SliceModel::
+    // setRit() and the VFO's RIT/XIT steppers do not, so an offset past it can
+    // reach the setters, and they log when this clamp bites.
+    static constexpr int kRitXitMaxHz = 9999;
 
     // The operator's CW pitch via setCwPitch(). Defaults to TransmitModel's 600.
     int m_cwPitchHz = 600;
@@ -534,6 +634,28 @@ private:
 
     // Index of `notchId` in m_notches — which IS its WDSP handle — or -1.
     [[nodiscard]] int notchIndexFor(int notchId) const;
+
+    // Session memory beyond the flat fields (Receivers and Notches domains),
+    // validated by applyRestoredState() and replayed once per connect by
+    // replayRestoredSession(). Index 0 is receiver A; ids in the notches are unused.
+    std::vector<Receiver> m_restoredReceivers;
+    std::vector<NotchRecord> m_restoredNotches;
+    int m_restoredTxReceiver = 0;   // the list index that held transmit
+    // Remembered receivers the replay could not reopen (ceiling, failed open).
+    // Captured after the live ones so a short connect does not erase them;
+    // dropped once the operator adds or closes a receiver.
+    std::vector<Receiver> m_replayUnreopened;
+    bool m_sessionReplayPending = false;
+    void replayRestoredSession();
+    // The open receivers' own setpoints from the document, before their DSPs
+    // open: receiver A's extras, and the whole entry for any a numRx param opened.
+    void seedOpenReceiversFromMemory();
+    void seedReceiverExtras(Receiver& r, const Receiver& memory) const;
+    [[nodiscard]] static QJsonObject receiverMemoryJson(const Receiver& r);
+    // Nullopt for an entry with no usable frequency or mode; other bad fields drop alone.
+    [[nodiscard]] std::optional<Receiver> receiverFromMemory(const QJsonObject& o) const;
+    // createPanadapter() with the new receiver's state given rather than copied.
+    bool addReceiver(const Receiver& seed);
     // Push the whole notch set + tune frequency into a receiver added later.
     void seedNotches(const Receiver& r);
     // Re-point a receiver's notch axis at its current NCO; call wherever ncoHz moves.
@@ -543,6 +665,14 @@ private:
     void pushNoiseBlanker(const Receiver& r);
     // Same, for the squelch, and needed at the same places for the same reason.
     void pushSquelch(const Receiver& r);
+    // Same, for the panadapter averaging (Receiver::panAverage / weighted).
+    void pushPanAveraging(const Receiver& r);
+    // This receiver's NCO just moved: the averaged bins describe the old
+    // frequency axis. Called beside pushNotchTune() at the two retune sites.
+    void dropPanAverage(const Receiver& r);
+    // Same, for the APF (centred on the current CW pitch) and the AGC-off level.
+    void pushApf(const Receiver& r);
+    void pushAgcOffLevel(const Receiver& r);
 
     // I/O THREAD ONLY: the chains the EP6 fan-out feeds, indexed by DDC. Never m_rx,
     // whose push_back/erase can move storage under the fan-out. Rebuilt by
@@ -562,6 +692,14 @@ private:
     // Empty mode = untouched this session.
     QString m_agcMode;
     int     m_agcThresholdDb = 0;
+    // The remembered AGC-off level per receiver index; -1 = none. It seeds a
+    // receiver at connect and when a panadapter opens, and it keeps the level
+    // of a receiver that is not open. m_agcOffLevelsLive: the open receivers
+    // hold the current levels (set by the seed and by the operator).
+    QList<int> m_agcOffLevels;
+    bool       m_agcOffLevelsLive = false;
+    int  rememberedAgcOffLevel(int receiverIndex) const;
+    void rememberAgcOffLevel(int receiverIndex, int level);
     // The serial seedReceiverAgc() last ran for. A different radio is seeded; the
     // same radio reconnecting is not (buildReceivers() kept its live AGC). Empty
     // until the first connect.
@@ -732,9 +870,23 @@ private:
     void publishFrontEndOverload();
     AetherSDR::FrontEndOverload m_lastFrontEndOverload;
     // The configuration's name, for the health row and reset path (the config struct
-    // is just numbers). Set in the constructor: bandscopeReleaseConfig() uses a
-    // logarithm and cannot be a constant initialiser.
-    QString m_autoGainMode = QStringLiteral("bandscope");
+    // is just numbers). No initialiser: installDefaultAutoGainLaw() sets name and
+    // config together, so there is one copy of the default.
+    QString m_autoGainMode;
+    // Whether the law and the floor are the operator's choice, so only a choice is
+    // persisted: a stored default would freeze it against a later build's default.
+    bool m_autoGainLawChosen = false;
+    bool m_autoGainFloorChosen = false;
+    // A law is a name and its numbers, kept as one value so neither is installed
+    // without the other.
+    struct AutoGainLaw {
+        QString name;
+        AetherSDR::hl2::AutoGainConfig config;
+    };
+    // The law a backend starts with: the one source for the constructor,
+    // applyRestoredState() and the name "default".
+    [[nodiscard]] static AutoGainLaw defaultAutoGainLaw();
+    void installDefaultAutoGainLaw();
     // Band and baseline as the loop last saw them, so changes reach the policy as
     // inputs.
     QString m_autoGainBandKey;
@@ -830,10 +982,16 @@ private:
     quint64 m_adcTotalSamples = 0;
     quint64 m_adcTotalOverloadSamples = 0;
     QElapsedTimer m_adcWindowClock;
+    // Session totals of Hl2Telemetry::forwardPowerSamples + forwardPowerSkipped,
+    // and of the skipped ones alone. Published in healthSnapshot(), driving
+    // nothing; the first is what makes a skipped count of 0 a reading.
+    quint64 m_fwdTotalResponses = 0;
+    quint64 m_fwdTotalSkipped = 0;
     // Below this many observations a window has no rate, only a numerator.
     static constexpr int kAdcMinWindowSamples = 4;
     bool m_keyed = false;
     bool m_tuning = false;
+    TxCoordinator::Operation m_tuneOperation;   // the TUNE carrier's admission
     bool m_cwAutoKeyed = false;
     QTimer* m_cwHangTimer = nullptr;
     TxCoordinator::Operation m_cwHangOperation;
@@ -855,6 +1013,18 @@ private:
     int m_unkeyUnmuteHoldMs = kUnkeyUnmuteHoldMs;
     // Single-shot, owned, on this thread, so applyKeying() cancels it without a lock.
     QTimer* m_unkeyUnmuteTimer = nullptr;
+    // How long the band filter and an owed RF drive wait after the MOX-off is
+    // queued. Gateware defaults put the radio's tail at 20 ms FIFO + 12 ms hang
+    // (radio.v:934-935; 0x17 is never written); one unit measured 40-54 ms
+    // end-to-end, and the RX hold above measured 51.66-66.15 ms of the same
+    // tail. Never below kUnkeyUnmuteHoldMs. A member so tests can shorten it.
+    static constexpr int kTxTailHoldMs = kUnkeyUnmuteHoldMs;
+    int m_txTailHoldMs = kTxTailHoldMs;
+    QTimer* m_txTailTimer = nullptr;
+    bool m_txTailPending = false;
+    // The drive register holds a tune level; the operator's RF drive is owed
+    // once no tune carrier or tail is radiating.
+    bool m_rfDriveOwed = false;
     // The flags above flip synchronously while setAudioMuted rides a queued
     // connection, so at key-up they claim "sampling" a block early. This gate answers
     // from the reading's stamp instead; healthSnapshot() feeds it to adcPairing().
@@ -886,6 +1056,15 @@ private:
     // True while band-memory/restore code drives setTxPower(): only operator intent
     // bootstraps the baseline or records into the per-band map.
     bool m_applyingBandMemory = false;
+    // TUNE power per band, with the same first-set baseline rule as drive. -1 in
+    // m_tunePowerPercent: nothing known yet, TransmitModel's value stands.
+    QMap<QString, int> m_tuneByBand;
+    int m_tuneDefaultPercent = -1;
+    int m_tunePowerPercent = -1;
+    // Records an operator's TUNE power under the current band; false when unchanged.
+    bool recordTunePower(int percent);
+    // The band's remembered TUNE power, echoed to TransmitModel; nothing when unknown.
+    void applyTuneMemoryFor(const QString& bandKey);
 
     // The operator's TX passband and whether they have set one.
     // defaultTxPassbandForMode() is re-pushed on every mode set and TX-slice move
@@ -916,9 +1095,6 @@ private:
     // what the transmitter runs. setTxFilter() is the one push that bypasses this;
     // see the definition.
     void pushTxPassband(const QString& mode);
-    // Tune-carrier amplitude, full scale. Radiated power is set by the TX drive
-    // register; scaling here too would make the power control non-linear.
-    static constexpr double kTuneCarrierAmplitude = 1.0;
     int m_lastFwdRaw = -1;
 
     // Meter ballistics: the S-meter's rate gate and EMA are SMeterSmoother's
@@ -934,12 +1110,13 @@ private:
 
     // Forward-power peak hold: a PEP ESTIMATE. The HL2 has no peak detector: forward
     // power is one 12-bit slow_adc I2C conversion, round-robined with reverse power,
-    // temperature and bias (rtl/slow_adc.v, rtl/control.v ~L262), seen every
-    // kTelemetryMinIntervalMs. 10 Hz sampling misses speech peaks (SSB read 8-12 dB
-    // below PEP), so the max is held across the over: instant attack, release 0.05
-    // per 10 Hz sample (~2 s, like an outboard PEP meter), in WATTS because the
-    // calibration curve is non-linear. Raw counts are still logged and published.
-    // TxApplet's own PEP tick (#2561) therefore tracks the gauge fill on an HL2.
+    // temperature and bias (rtl/slow_adc.v, rtl/control.v ~L262), reported in RADDR 1
+    // up to ~190 times a second. Keyed, the input is each publish window's maximum
+    // (Hl2Telemetry::forwardPowerPeakRaw); the hold carries it across windows:
+    // instant attack, release 0.05 per kTelemetryMinIntervalMs window (~2 s, like an
+    // outboard PEP meter), in WATTS because the calibration curve is non-linear. Raw
+    // counts are still logged and published. TxApplet's PEP tick (#2561) therefore
+    // tracks the gauge fill on an HL2.
     static constexpr double kFwdPeakReleaseAlpha = 0.05;
     double m_fwdPeakWatts = 0.0;
 

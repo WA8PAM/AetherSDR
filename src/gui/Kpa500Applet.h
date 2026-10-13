@@ -1,102 +1,114 @@
 #pragma once
 
+#include "CanonSurface.h"
 #include "core/Kpa500Protocol.h"
-
-#include <QWidget>
-#include <QComboBox>
-#include <QPushButton>
+#include <QElapsedTimer>
 #include <QTimer>
+#include <array>
+#include <deque>
 
 class QLabel;
+class QPushButton;
+class QComboBox;
+class QCheckBox;
+class QPlainTextEdit;
+class QScrollArea;
+class QSpacerItem;
 
 namespace AetherSDR {
-
 class HGauge;
 
-// Dedicated applet for an Elecraft KPA500 serial amplifier — a peripheral
-// accessory alongside AcomApplet/SpeApplet, not a variant of AmpApplet.
-// See docs/architecture/elecraft-kpa500-kat500-design.md.
-//
-// Principle II: no control method latches its own state. setOperate() is
-// wired to Kpa500Connection::setOperate(); the applet repaints when the
-// ^OS poll reply lands.
-class Kpa500Applet : public QWidget {
+class Kpa500Applet : public CanonApplet {
     Q_OBJECT
-
 public:
     explicit Kpa500Applet(QWidget* parent = nullptr);
-
-    // Apply a status snapshot — call on every statusUpdated() from the connection.
     void applyStatus(const Kpa500::Status& status);
-
-    // Reflect transport state. Disconnected → resets all live readouts and
-    // disables controls.
     void setConnected(bool connected);
-
-    // Amp responding to polls within the silence window (vs. transport up but
-    // amp not answering — e.g. USB-serial with the amp switched off).
     void setResponding(bool responding);
-
-    // Diagnostic info (firmware version + serial number), shown as a tooltip
-    // on the status pill so it doesn't consume permanent panel space.
-    void setDiagnosticTooltip(const QString& text);
+    void setConnectionDescription(const QString& text);
+    void setBandTrackingText(const QString& text);
+    void setRadioTransmitting(bool transmitting);
+    void setMaintenanceBusy(bool busy);
+    void recordTelemetry(const QString& command, const Kpa500::Status& status);
+    void appendDiagnostic(const QString& line);
+    void setFloating(bool floating);
+    bool followTx() const;
+    QSize sizeHint() const override;
+    QSize minimumSizeHint() const override;
+    void setIdentification(const QString& firmware, const QString& serial);
 
 signals:
-    void operateToggled(bool on);  // true = OPERATE clicked, false = STANDBY clicked
+    void advancedSettingsRequested();
+    void operateToggled(bool operate);
     void clearFaultClicked();
-    // Emitted when the user changes the fan minimum speed combo (0–6).
-    void fanSpeedChangeRequested(int n);
+    void fanSpeedChangeRequested(int speed);
+    void powerRequested(bool on);
+    void speakerRequested(bool on);
+    void bandRequested(int band);
+    void followTxChanged(bool enabled);
+
+protected:
+    bool eventFilter(QObject* watched, QEvent* event) override;
 
 private:
-    void updateStatusPill();
-    void updateValueLabels();  // 10 Hz throttled text refresh
-
-    HGauge* m_pwrGauge{nullptr};
-
-    QLabel* m_pwrLabel{nullptr};
-    QLabel* m_swrLabel{nullptr};
-    QLabel* m_tempLabel{nullptr};
-    QLabel* m_voltLabel{nullptr};
-    QLabel* m_currLabel{nullptr};
-    QLabel* m_bandLabel{nullptr};
-
-    QLabel*      m_statusPill{nullptr};
-    QPushButton* m_standbyBtn{nullptr};
-    QPushButton* m_operateBtn{nullptr};
-
-    QLabel*      m_faultLabel{nullptr};
-    QPushButton* m_clearFaultBtn{nullptr};
-
-    QComboBox*   m_fanCombo{nullptr};
-
-    QTimer m_labelTimer;
-
-    // Last decoded values, updated by applyStatus() at telemetry rate.
-    // Rendered to labels on the 10 Hz m_labelTimer tick.
-    float   m_fwdW{0.0f};
-    float   m_swr{0.0f};
-    float   m_tempC{0.0f};
-    float   m_voltV{0.0f};
-    float   m_currA{0.0f};
-    int     m_band{-1};
-    int     m_faultCode{-1};
-    int     m_fanSpeed{-1};
-    bool    m_operate{false};
-
+    friend class Kpa500AppletTest;
+    void refresh();
+    void updatePresentation();
+    void savePreferences();
+    void renderHistory();
+    QString debugText() const;
+    struct Point { qint64 time; std::optional<float> value; };
+    static constexpr int kHistorySeconds = 600;
+    static constexpr int kHistorySamples = 4096;
+    static constexpr int kDebugLines = 2000;
+    std::array<std::deque<Point>, 5> m_history;
+    std::deque<QString> m_debugLines;
+    std::deque<QString> m_verboseDebugLines;
+    Kpa500::Status m_status;
+    QElapsedTimer m_clock;
+    qint64 m_lastReply{-1};
+    QString m_connection;
     bool m_connected{false};
     bool m_responding{false};
-
-    // One-shot identification fields — cached so the tooltip survives future
-    // statusUpdated() calls that don't include these rarely-changing fields.
-    QString m_firmware;
-    QString m_serial;
-
-    // Dirty flags for 10 Hz throttle — set by applyStatus(), consumed by tick.
-    bool m_pwrDirty{false};
-    bool m_infoDirty{false};
-    bool m_faultDirty{false};
-    bool m_fanDirty{false};
-    bool m_statusDirty{false};
+    bool m_radioTransmitting{false};
+    bool m_maintenanceBusy{false};
+    bool m_mini{false};
+    bool m_floating{false};
+    bool m_historyExpanded{false};
+    bool m_fahrenheit{false};
+    QTimer m_timer;
+    QLabel* m_state;
+    QLabel* m_fault;
+    QLabel* m_tracking;
+    QLabel* m_link;
+    QLabel* m_identity;
+    QLabel* m_graph;
+    QLabel* m_historyHelp;
+    std::array<QLabel*, 5> m_readouts{};
+    std::array<HGauge*, 5> m_gauges{};
+    QPushButton* m_power;
+    QPushButton* m_operate;
+    QPushButton* m_standby;
+    QPushButton* m_clear;
+    QPushButton* m_miniButton;
+    QPushButton* m_historyButton;
+    QPushButton* m_settingsButton;
+    QPushButton* m_debugButton;
+    QPushButton* m_pause;
+    QComboBox* m_band;
+    QComboBox* m_fan;
+    QComboBox* m_range;
+    QCheckBox* m_verbose;
+    QCheckBox* m_follow;
+    QCheckBox* m_units;
+    QCheckBox* m_speaker;
+    QScrollArea* m_scroll;
+    QWidget* m_content;
+    QSpacerItem* m_bottomSpace;
+    QWidget* m_detail;
+    QWidget* m_historyPane;
+    QWidget* m_settingsPane;
+    QWidget* m_debugPane;
+    QPlainTextEdit* m_debug;
 };
-
-}  // namespace AetherSDR
+} // namespace AetherSDR

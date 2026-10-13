@@ -37,6 +37,10 @@ public:
 
     struct Params {
         QHostAddress host;
+        // When set, bind the streaming socket to this local interface. This is
+        // the interface on which discovery reached the radio; retaining it
+        // avoids handing a multi-homed host back to the route table.
+        QHostAddress localAddress;
         quint16 port = kMetisPort;
         SampleRate sampleRate = SampleRate::R48k;
         // RX1's NCO. Receivers beyond the first start here too and are moved by
@@ -100,6 +104,7 @@ public:
     struct Discovered {
         DiscoveryReply reply;
         QHostAddress address;
+        QHostAddress localAddress;
     };
 
     // Transport counters for the network readouts, measured on this socket. Gaps are
@@ -912,6 +917,9 @@ private:
     // rate exists: downstream sees a ~10 Hz emit of a bit cycling up to ~190 times/s.
     int m_adcWindowSamples = 0;
     int m_adcWindowOverload = 0;
+    // Forward-power maximum for the same window; see
+    // Hl2Telemetry::forwardPowerPeakRaw for why the last value is not enough.
+    ForwardPowerWindow m_fwdWindow;
 
     // ---- transport counters (see LinkCounters) ----
     LinkCounters  m_link;

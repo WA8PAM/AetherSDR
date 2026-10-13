@@ -4,6 +4,7 @@
 #include "UlanziDialWindowsManager.h"
 #include "core/LogManager.h"
 #include "core/UlanziChordDecoder.h"
+#include "core/UlanziDialIds.h"
 
 #include <QDebug>
 #include <QTimer>
@@ -69,11 +70,23 @@ UlanziDialWindowsManager::~UlanziDialWindowsManager()
 
 void UlanziDialWindowsManager::start()
 {
+    // Idempotent like the Linux and macOS backends: MainWindow re-applies the
+    // enable setting on every serial-settings change, and rescan() closes the
+    // open dial first, which would drop and reattach it each time.
+    if (!m_devices.isEmpty()) {
+        m_hotplugTimer->start();
+        return;
+    }
     if (rescan()) {
         m_pollTimer->start();
         emit connectionChanged(true, m_deviceName);
     }
     m_hotplugTimer->start();
+}
+
+void UlanziDialWindowsManager::reportState()
+{
+    emit stateReported(!m_devices.isEmpty(), m_deviceName);
 }
 
 void UlanziDialWindowsManager::stop()
@@ -86,10 +99,21 @@ void UlanziDialWindowsManager::stop()
 bool UlanziDialWindowsManager::rescan()
 {
     closeAll();
-    struct hid_device_info* infos = hid_enumerate(0, 0);
+    // Filtered by VID/PID so hidapi reads only the cached attributes of other
+    // HID devices. An unfiltered scan asks every device on the machine for its
+    // strings and descriptor on each hotplug tick, on the thread that also
+    // polls the RC-28 (#6225, #6204).
+    struct hid_device_info* infos =
+        hid_enumerate(static_cast<unsigned short>(kUlanziVendorId),
+                      static_cast<unsigned short>(kUlanziProductId));
     for (auto* info = infos; info; info = info->next) {
         if (!info->product_string) continue;
-        if (wcsstr(info->product_string, kProductMatch) == nullptr) continue;
+        if (wcsstr(info->product_string, kProductMatch) == nullptr) {
+            qCDebug(lcDevices) << "UlanziDialWindowsManager: ignoring"
+                               << QString::fromWCharArray(info->product_string)
+                               << "at the dial's VID/PID (#3485)";
+            continue;
+        }
         hid_device* h = hid_open_path(info->path);
         if (!h) continue;
         hid_set_nonblocking(h, 1);
@@ -103,6 +127,8 @@ bool UlanziDialWindowsManager::rescan()
     hid_free_enumeration(infos);
     if (m_devices.isEmpty()) { m_deviceName.clear(); return false; }
     m_deviceName = m_devices.first().productString;
+    qCInfo(lcDevices) << "UlanziDialWindowsManager: attached" << m_deviceName
+                      << "(" << m_devices.size() << "HID interface(s))";
     return true;
 }
 
@@ -118,6 +144,7 @@ void UlanziDialWindowsManager::closeAll()
     if (!m_deviceName.isEmpty()) {
         const QString name = m_deviceName;
         m_deviceName.clear();
+        qCInfo(lcDevices) << "UlanziDialWindowsManager: detached" << name;
         emit connectionChanged(false, name);
     }
     m_decoder.reset();
@@ -154,6 +181,7 @@ void UlanziDialWindowsManager::poll()
         const QString name = m_deviceName;
         m_deviceName.clear();
         m_pollTimer->stop();
+        qCInfo(lcDevices) << "UlanziDialWindowsManager: detached" << name;
         emit connectionChanged(false, name);
     }
 }

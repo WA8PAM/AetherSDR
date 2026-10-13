@@ -7,6 +7,7 @@
 #include "models/BandSettings.h"
 #include "models/MemoryEntry.h"
 #include "models/RadioModel.h"
+#include "models/SliceModel.h"
 #include "models/XvtrPolicy.h"
 #include "models/TnfModel.h"
 
@@ -21,11 +22,26 @@
 
 namespace AetherSDR {
 
+bool requestSlicePanCenter(RadioModel& model, int sliceId, double centerMhz)
+{
+    const SliceModel* slice = model.slice(sliceId);
+    if (!slice) { return false; }
+    if (model.confirmsReceiveControls()) {
+        // A reveal must admit capture placement with the preserved receiver.
+        // Range is for zoom: RTL deliberately clamps it to existing capture.
+        // Even an admitted Center remains pending until hardware/DSP adoption.
+        model.requestConfirmedReceiveTune(sliceId, centerMhz,
+            IRadioBackend::ReceiveTuneView::Center);
+        return false;
+    }
+    return model.requestPanCenter(slice->panId(), centerMhz);
+}
+
 // ─── Platform checks ─────────────────────────────────────────────────────────
 
 bool macDaxDriverInstalled()
 {
-#ifdef Q_OS_MAC
+#ifdef Q_OS_MACOS
     const QFileInfo driverBundle("/Library/Audio/Plug-Ins/HAL/AetherSDRDAX.driver");
     if (!driverBundle.exists() || !driverBundle.isDir())
         return false;

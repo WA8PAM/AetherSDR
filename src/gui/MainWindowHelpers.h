@@ -30,10 +30,14 @@ struct MemoryEntry;
 struct RadioInfo;
 struct WanRadioInfo;
 
+// Dispatch a deliberate slice reveal through the canonical pan request.
+// False also covers an admitted request awaiting confirmed capture adoption.
+bool requestSlicePanCenter(RadioModel& model, int sliceId, double centerMhz);
+
 // ─── Platform checks ─────────────────────────────────────────────────────────
 
 // True when the macOS DAX HAL driver bundle is installed (always true on
-// non-mac platforms; the caller is itself #ifdef Q_OS_MAC-gated).
+// non-mac platforms; the caller is itself #ifdef Q_OS_MACOS-gated).
 bool macDaxDriverInstalled();
 
 // ─── Band admissibility ──────────────────────────────────────────────────────

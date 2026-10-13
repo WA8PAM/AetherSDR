@@ -267,10 +267,13 @@ int main(int argc, char** argv)
     check(cwReturn > 0.0, "CWU: the tone comes back and is measurable");
     check(cwReturn <= cwFresh + 5.0,
           "CWU: the return is no slower than the chain's own latency either");
-    // Linear phase at 8192 taps is 4096 samples (85.3 ms) of group delay that
-    // minimum phase removes; allow generous room either side of it.
-    check(usbReturn > 0.0 && cwReturn - usbReturn > 60.0,
-          "the fix: outside CW the band comes back >60 ms sooner than on the "
+    // CW keeps linear phase, and without a notch it runs
+    // Hl2RxDsp::kRxShortFilterTaps (4096, #5578): (4096-1)/2 samples = 42.7 ms
+    // of group delay that minimum phase removes outside CW. Allow generous
+    // room either side of it. (At 8192 taps -- CW with a notch -- the gap is
+    // ~85 ms; hl2_rxdsp_adaptive_taps_test owns the length.)
+    check(usbReturn > 0.0 && cwReturn - usbReturn > 30.0,
+          "the fix: outside CW the band comes back >30 ms sooner than on the "
           "linear-phase chain CW keeps");
     check(usbReturn > 0.0 && usbReturn < 80.0,
           "the fix: the USB return is under 80 ms (was ~128 ms at linear phase)");
@@ -305,7 +308,9 @@ int main(int argc, char** argv)
         const Hl2RxDsp::Config usbCfg = config(M::Usb);
         dsp.beginRebuild(usbCfg);
         dsp.setMode(M::Cwu);   // deferred: a rebuild is in flight
-        check(dsp.installRebuiltChannel(Hl2RxDsp::buildChannel(usbCfg, false, 0)),
+        check(dsp.installRebuiltChannel(Hl2RxDsp::buildChannel(
+                  usbCfg, WdspChannel::NoiseBlanker::Off, 0,
+                  WdspChannel::NoiseBlankerFill::Zero)),
               "rebuild: the rebuilt chain installs");
         const double r = unmuteReturnMs(dsp);
         std::printf("      MEASURED: rebuilt for USB, CWU set mid-build: return %.1f ms\n", r);

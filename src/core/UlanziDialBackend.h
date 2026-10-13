@@ -14,7 +14,7 @@
 #elif defined(Q_OS_WIN) && defined(HAVE_HIDAPI)
     #include "core/UlanziDialWindowsManager.h"
     namespace AetherSDR { using UlanziDialBackend = UlanziDialWindowsManager; }
-#elif defined(Q_OS_MAC)
+#elif defined(Q_OS_MACOS)
     #include "core/UlanziDialMacOSManager.h"
     namespace AetherSDR { using UlanziDialBackend = UlanziDialMacOSManager; }
 #else
@@ -33,10 +33,12 @@
         void stop()  {}
         bool isConnected() const { return false; }
         QString deviceName() const { return {}; }
+        void reportState() { emit stateReported(false, {}); }
     signals:
         void tuneSteps(int steps);
         void buttonEvent(const QString& signature, int action);
         void connectionChanged(bool connected, const QString& name);
+        void stateReported(bool connected, const QString& name);
     };
     } // namespace AetherSDR
 #endif

@@ -25,10 +25,9 @@ struct Status {
     // ^OS — 0=standby, 1=operate.
     std::optional<bool> operate;
 
-    // ^ON — true while the amplifier is on. The amp sends no reply when off,
-    // so this is set on each ^ON1; RSP and cleared on connection loss, never
-    // by an explicit off-response (there isn't one by design).
+    // ^ON — power status; a final ^ON0; may precede silence after power-off.
     std::optional<bool> powerOn;
+    std::optional<bool> speakerOn;
 
     // ^BN — band index 0–10 (160m–6m), see bandName()
     std::optional<int> band;
@@ -36,7 +35,7 @@ struct Status {
     // ^WS — forward output power, watts (0–999). Zero when not transmitting.
     std::optional<float> forwardPowerW;
 
-    // ^WS — SWR (1.0–99.0). 0.0 when not transmitting.
+    // ^WS — SWR (1.0–99.0). Unmeasured (nullopt) when raw value is 000.
     // Source: implied decimal point after 2nd digit, so raw "015" → 1.5.
     std::optional<float> swr;
 
@@ -66,7 +65,7 @@ struct Status {
     std::optional<QString> serialNumber;
 
     bool hasAnyField() const {
-        return operate || powerOn || band || forwardPowerW || swr
+        return operate || powerOn || speakerOn || band || forwardPowerW || swr
             || paTemperatureC || paVoltageV || paCurrentA
             || faultCode || fanMinSpeed || firmwareVersion || serialNumber;
     }
@@ -89,23 +88,27 @@ public:
     // well-formed frame. cmd is always upper-case.
     using Callback = std::function<void(const QString& cmd, const QString& arg)>;
     void setCallback(Callback cb) { m_cb = std::move(cb); }
+    void setErrorCallback(std::function<void(const QString&)> cb) { m_error = std::move(cb); }
 
     void feed(const QByteArray& bytes);
     void reset() { m_buf.clear(); }
 
 private:
-    // The longest legitimate KPA500 frame is ^RVMnn.nn; (~12 bytes); this cap
-    // prevents a chatty wrong-device from growing m_buf without bound.
-    static constexpr int kMaxFrameBytes = 64;
+    // A 64-byte EEPROM reply uses 128 hex payload characters plus its header
+    // and checksum. Keep enough room for that frame while bounding noisy input.
+    static constexpr int kMaxFrameBytes = 160;
     QByteArray m_buf;
     Callback   m_cb;
+    std::function<void(const QString&)> m_error;
 };
 
 // ── Message decode ────────────────────────────────────────────────────────────
 // Applies one decoded (cmd, arg) pair to status, returning true if any field
 // changed. All scaling constants verified against KPA500 Programmer's Reference
 // Rev. A2.
-bool applyMessage(const QString& cmd, const QString& arg, Status& status);
+// accepted distinguishes a valid unchanged reply from malformed/unknown input.
+bool applyMessage(const QString& cmd, const QString& arg, Status& status,
+                  bool* accepted = nullptr);
 
 // ── Command builders ──────────────────────────────────────────────────────────
 // All command text verified against KPA500 Programmer's Reference Rev. A2.
@@ -123,13 +126,12 @@ QByteArray buildStandby();
 // Source: §^FL "SET format: ^FLC; clears the current fault."
 QByteArray buildClearFault();
 
-// ^ON0; / ^ON1; — power the amplifier off / on.
-// Both directions work over the normal serial port (confirmed by KPA500
-// Remote and third-party applications). No UI is wired for either command
-// in this PR — power-off needs a confirmation step, power-on needs a
-// verified round-trip test. Builders are provided for future use.
+// ^ON0; — power the amplifier off. No power-on SET is defined here.
 QByteArray buildPowerOff();
+// Bootloader wake: a single uppercase P, with no terminator (Rev. A2).
 QByteArray buildPowerOn();
+QByteArray buildSetBand(int band);
+QByteArray buildSetSpeaker(bool on);
 
 // ^FCn; — set fan minimum speed (0 = off, 6 = high).
 // Source: KPA500 Programmer's Reference Rev. A2, §^FC.
@@ -139,10 +141,10 @@ QByteArray buildSetFanSpeed(int n);
 QByteArray buildNullCommand();
 
 // Poll schedules used by Kpa500Connection.
-// Fast (~200 ms): values that change on every TX/RX cycle.
-const QStringList& fastPollCommands();   // {"WS", "OS"}
-// Slow (one command per ~2 s, rotated): config/status that rarely changes.
-const QStringList& slowPollCommands();   // {"TM", "VI", "BN", "FL", "ON"}
+// Fast: one command per 200 ms, each field queried every 800 ms.
+const QStringList& fastPollCommands();   // {"WS", "OS", "BN", "FL"}
+// Slow (one command per 500 ms, rotated): config/status that rarely changes.
+const QStringList& slowPollCommands();   // {"TM", "VI", "ON", "FC", "SP"}
 // One-shot after first connect.
 const QStringList& connectCommands();    // {"RVM", "SN"}
 

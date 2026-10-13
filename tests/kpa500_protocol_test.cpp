@@ -45,8 +45,6 @@ int main()
            buildClearFault() == QByteArrayLiteral("^FLC;"));
     report("buildPowerOff() emits ^ON0; (§^ON: 'SET format: ^ON0; turns the KPA500 off')",
            buildPowerOff() == QByteArrayLiteral("^ON0;"));
-    report("buildPowerOn() emits ^ON1; (§^ON, confirmed over serial by KPA500 Remote)",
-           buildPowerOn() == QByteArrayLiteral("^ON1;"));
     report("buildNullCommand() emits bare ';'",
            buildNullCommand() == QByteArrayLiteral(";"));
     report("buildQuery(\"WS\") emits ^WS;",
@@ -144,17 +142,18 @@ int main()
 
     // ── FrameParser: kMaxFrameBytes overflow cap ──────────────────────────────
     {
-        // Feed more than kMaxFrameBytes bytes with no semicolon — the buffer
-        // cap at the tail of feed() clears it rather than growing unboundedly.
-        // A valid frame arriving immediately after must still decode.
+        // An unterminated frame exceeding the 160-byte cap is discarded;
+        // the next valid frame must still decode.
         QList<QPair<QString, QString>> frames;
         FrameParser parser;
         parser.setCallback([&](const QString& cmd, const QString& arg) {
             frames.append({cmd, arg});
         });
-        // kMaxFrameBytes == 64 (Kpa500Protocol.h); feed one byte over the cap.
-        parser.feed(QByteArray(65, 'X'));
-        report("kMaxFrameBytes+1 garbage bytes: no callback fired", frames.isEmpty());
+        int errors = 0;
+        parser.setErrorCallback([&](const QString&) { ++errors; });
+        parser.feed(QByteArray("^SN") + QByteArray(158, '1'));
+        report("An oversized unterminated frame is discarded with a diagnostic",
+               frames.isEmpty() && errors == 1);
         parser.feed(QByteArray("^OS1;"));
         report("kMaxFrameBytes cap: valid frame after overflow still decodes",
                frames.size() == 1 && frames[0].first == "OS");
@@ -181,10 +180,10 @@ int main()
     {
         // Not transmitting: both fields zero.
         Status s;
-        report("^WS000 000; → 0 W, SWR 0.0 (not transmitting)",
+        report("^WS000 000; → 0 W, SWR unmeasured (not transmitting)",
                applyMessage("WS", "000 000", s)
                    && s.forwardPowerW && *s.forwardPowerW == 0.0f
-                   && s.swr && *s.swr == 0.0f);
+                   && !s.swr);
     }
 
     // ── applyMessage: ^VI voltage + current ──────────────────────────────────
@@ -329,6 +328,86 @@ int main()
         bool changed = applyMessage("TM", "046", s);
         report("Different value — second call returns true (changed)",
                changed && s.paTemperatureC && *s.paTemperatureC == 46.0f);
+    }
+
+    {
+        const auto frames = parse("^BAD^OS0;");
+        report("New caret resynchronizes a truncated frame in the same read",
+               frames.size() == 1 && frames[0].first == "OS" && frames[0].second == "0");
+    }
+    {
+        const QByteArray batch = QByteArray("^OS0;").repeated(60);
+        const auto frames = parse(batch.constData());
+        report("Large coalesced read preserves all 60 valid frames", frames.size() == 60);
+    }
+    {
+        const QByteArray frame = "^ER000040" + QByteArray(128, '0') + "C0;";
+        const auto frames = parse(frame.constData());
+        report("A complete 64-byte EEPROM reply fits the bounded frame parser",
+               frame.size() == 140 && frames.size() == 1 && frames[0].first == "ER"
+               && frames[0].second == QString::fromLatin1(frame.mid(3, frame.size() - 4)));
+    }
+    {
+        const QByteArray oversized = "^SN" + QByteArray(161, '1') + ";^OS0;";
+        const auto frames = parse(oversized.constData());
+        report("An oversized complete frame is dropped without losing the next frame",
+               frames.size() == 1 && frames[0].first == "OS");
+    }
+    {
+        Status s;
+        bool accepted = false;
+        applyMessage("OS", "0", s);
+        report("Unchanged valid reply is still accepted for liveness",
+               !applyMessage("OS", "0", s, &accepted) && accepted);
+        report("Malformed reply is not accepted for liveness",
+               !applyMessage("OS", "+1", s, &accepted) && !accepted && s.operate == false);
+        report("Unknown command is not accepted for liveness",
+               !applyMessage("XX", "1", s, &accepted) && !accepted);
+    }
+    {
+        Status s;
+        bool accepted = false;
+        applyMessage("WS", "500 015", s);
+        report("No measurement clears the previous SWR",
+               applyMessage("WS", "000 000", s, &accepted) && accepted && !s.swr);
+        for (const char* payload : {"000 001", "000 009", "000 991", "000 999",
+                                    "1000 015", "000 1000", "-01 015", "000  015"}) {
+            report(payload, !applyMessage("WS", QLatin1String(payload), s, &accepted)
+                            && !accepted && s.forwardPowerW == 0.0f && !s.swr);
+        }
+        report("SWR lower bound 010 is accepted", applyMessage("WS", "000 010", s));
+        report("SWR upper bound 990 is accepted", applyMessage("WS", "000 990", s));
+    }
+    {
+        Status s;
+        bool accepted = false;
+        report("VI inclusive maximum accepted", applyMessage("VI", "999 999", s)
+               && s.paVoltageV == 99.9f && s.paCurrentA == 99.9f);
+        for (const char* payload : {"1000 000", "000 1000", "+01 000", "000 -01"}) {
+            report(payload, !applyMessage("VI", QLatin1String(payload), s, &accepted)
+                            && !accepted && s.paVoltageV == 99.9f && s.paCurrentA == 99.9f);
+        }
+    }
+    {
+        Status s;
+        bool accepted = false;
+        report("Firmware 1.54 wire reply ^FC00; is accepted",
+               applyMessage("FC", "00", s, &accepted) && accepted && s.fanMinSpeed == 0);
+        report("Two digit fan reply 06 accepted", applyMessage("FC", "06", s)
+               && s.fanMinSpeed == 6);
+        report("Rev. A2 one digit fan reply accepted", applyMessage("FC", "3", s)
+               && s.fanMinSpeed == 3);
+        for (const char* payload : {"07", "99", "000", "+1", ""}) {
+            report(payload, !applyMessage("FC", QLatin1String(payload), s, &accepted)
+                            && !accepted && s.fanMinSpeed == 3);
+        }
+        report("Firmware 1.54 version accepted", applyMessage("RVM", "1.54", s));
+        report("Malformed firmware is rejected", !applyMessage("RVM", "garbage", s, &accepted)
+               && !accepted);
+        report("Malformed serial number is rejected", !applyMessage("SN", "123x5", s, &accepted)
+               && !accepted);
+        report("Final power-off status is accepted", applyMessage("ON", "0", s)
+               && s.powerOn == false);
     }
 
     // ── Band name table ───────────────────────────────────────────────────────

@@ -25,51 +25,43 @@ QString bandName(int band)
 
 void FrameParser::feed(const QByteArray& bytes)
 {
-    // Guard against unbounded growth. Append first so a chunk that would
-    // complete a buffered partial frame is not discarded before it arrives.
-    m_buf.append(bytes);
-    if (m_buf.size() > kMaxFrameBytes * 4)
+    for (const char byte : bytes) {
+        // A newer start marker replaces a truncated frame, including within
+        // one read. Limit each pending frame, not the size of a serial read.
+        if (byte == '^') {
+            if (!m_buf.isEmpty() && m_error) { m_error(QStringLiteral("Truncated frame; resynchronizing")); }
+            m_buf = QByteArrayLiteral("^");
+            continue;
+        }
+        if (m_buf.isEmpty()) {
+            continue;
+        }
+        if (m_buf.size() >= kMaxFrameBytes) {
+            if (m_error) { m_error(QStringLiteral("Oversized frame discarded")); }
+            m_buf.clear();
+            continue;
+        }
+        if (byte != ';') {
+            m_buf.append(byte);
+            continue;
+        }
+
+        const QByteArray body = m_buf.mid(1);
         m_buf.clear();
-
-    while (true) {
-        int semi = m_buf.indexOf(';');
-        if (semi < 0)
-            break;
-
-        // Extract everything up to and including the semicolon.
-        QByteArray raw = m_buf.left(semi + 1);
-        m_buf.remove(0, semi + 1);
-
-        // Discard anything before the first '^' (includes null-command echo).
-        int caret = raw.indexOf('^');
-        if (caret < 0)
+        int tokenLength = 0;
+        while (tokenLength < body.size()
+               && std::isalpha(static_cast<unsigned char>(body[tokenLength]))) {
+            ++tokenLength;
+        }
+        if (tokenLength < 2 || tokenLength > 3) {
+            if (m_error) { m_error(QStringLiteral("Malformed command token discarded")); }
             continue;
-
-        // Body is between '^' (exclusive) and ';' (exclusive).
-        QByteArray body = raw.mid(caret + 1, raw.size() - caret - 2);
-        if (body.isEmpty())
-            continue;
-
-        // Split: cmd = leading letters (upper-cased), arg = rest (trimmed).
-        // The amp always responds upper-case, but toUpper() is cheap insurance.
-        int i = 0;
-        while (i < body.size() && isalpha(static_cast<unsigned char>(body[i])))
-            ++i;
-
-        QString cmd = QString::fromLatin1(body.left(i)).toUpper();
-        QString arg = QString::fromLatin1(body.mid(i)).trimmed();
-
-        if (cmd.isEmpty() || cmd.size() > 3)
-            continue;  // Malformed command token — skip
-
-        if (m_cb)
-            m_cb(cmd, arg);
+        }
+        if (m_cb) {
+            m_cb(QString::fromLatin1(body.left(tokenLength)).toUpper(),
+                 QString::fromLatin1(body.mid(tokenLength)));
+        }
     }
-
-    // If a '^' frame arrived without its ';', cap the buffer so we don't
-    // accumulate indefinitely on a chatty/wrong peer.
-    if (m_buf.size() > kMaxFrameBytes)
-        m_buf.clear();
 }
 
 // ── Message decode ────────────────────────────────────────────────────────────
@@ -84,102 +76,98 @@ static bool assignIfChanged(std::optional<T>& field, T value)
     return true;
 }
 
-bool applyMessage(const QString& cmd, const QString& arg, Status& status)
+static std::optional<int> decimalField(const QString& text, int minDigits, int maxDigits)
+{
+    if (text.size() < minDigits || text.size() > maxDigits) {
+        return std::nullopt;
+    }
+    for (const QChar c : text) {
+        if (c < QLatin1Char('0') || c > QLatin1Char('9')) {
+            return std::nullopt;
+        }
+    }
+    return text.toInt();
+}
+
+bool applyMessage(const QString& cmd, const QString& arg, Status& status, bool* accepted)
 {
     bool changed = false;
+    bool valid = false;
 
-    if (cmd == QLatin1String("OS")) {
-        // ^OSn; — 0=standby, 1=operate.
-        bool ok;
-        int v = arg.toInt(&ok);
-        if (ok && (v == 0 || v == 1))
-            changed |= assignIfChanged(status.operate, v == 1);
-
-    } else if (cmd == QLatin1String("ON")) {
-        // ^ONn; — RSP is always n=1 (on). No response when off — we never
-        // receive a '0' here; cleared by the connection on loss instead.
-        bool ok;
-        int v = arg.toInt(&ok);
-        if (ok && v == 1)
-            changed |= assignIfChanged(status.powerOn, true);
-
+    if (cmd == QLatin1String("OS") || cmd == QLatin1String("ON") || cmd == QLatin1String("SP")) {
+        const std::optional<int> value = decimalField(arg, 1, 1);
+        if (value && *value <= 1) {
+            valid = true;
+            changed = cmd == QLatin1String("OS")
+                ? assignIfChanged(status.operate, *value == 1)
+                : cmd == QLatin1String("ON") ? assignIfChanged(status.powerOn, *value == 1)
+                : assignIfChanged(status.speakerOn, *value == 1);
+        }
     } else if (cmd == QLatin1String("BN")) {
-        // ^BNnn; — band index 0–10.
-        bool ok;
-        int v = arg.toInt(&ok);
-        if (ok && v >= 0 && v <= 10)
-            changed |= assignIfChanged(status.band, v);
-
-    } else if (cmd == QLatin1String("WS")) {
-        // ^WSppp sss; — space-separated, two fields.
-        // ppp = forward power watts (integer 0–999, no implied decimal).
-        // sss = SWR with implied decimal after 2nd digit (so "015" → 1.5).
-        // Source: KPA500 Programmer's Reference Rev. A2, §^WS.
-        const QStringList parts = arg.split(QLatin1Char(' '), Qt::SkipEmptyParts);
+        const std::optional<int> value = decimalField(arg, 2, 2);
+        if (value && *value <= 10) {
+            valid = true;
+            changed = assignIfChanged(status.band, *value);
+        }
+    } else if (cmd == QLatin1String("WS") || cmd == QLatin1String("VI")) {
+        // Rev. A2 specifies two three-digit decimal fields separated by a space.
+        const QStringList parts = arg.split(QLatin1Char(' '));
         if (parts.size() == 2) {
-            bool ok1, ok2;
-            int ppp = parts[0].toInt(&ok1);
-            int sss = parts[1].toInt(&ok2);
-            if (ok1 && ok2 && ppp >= 0 && ppp <= 999 && sss >= 0) {
-                changed |= assignIfChanged(status.forwardPowerW, static_cast<float>(ppp));
-                changed |= assignIfChanged(status.swr, sss / 10.0f);
+            const std::optional<int> first = decimalField(parts[0], 3, 3);
+            const std::optional<int> second = decimalField(parts[1], 3, 3);
+            if (first && second) {
+                if (cmd == QLatin1String("VI")) {
+                    valid = true;
+                    changed |= assignIfChanged(status.paVoltageV, *first / 10.0f);
+                    changed |= assignIfChanged(status.paCurrentA, *second / 10.0f);
+                } else if (*second == 0 || (*second >= 10 && *second <= 990)) {
+                    valid = true;
+                    changed |= assignIfChanged(status.forwardPowerW, static_cast<float>(*first));
+                    if (*second == 0) {
+                        changed |= status.swr.has_value();
+                        status.swr.reset();
+                    } else {
+                        changed |= assignIfChanged(status.swr, *second / 10.0f);
+                    }
+                }
             }
         }
-
-    } else if (cmd == QLatin1String("VI")) {
-        // ^VIvvv iii; — space-separated, two fields.
-        // vvv = PA voltage, iii = PA current. Both have implied decimal after
-        // 2nd digit, so raw "120" → 12.0 V and raw "053" → 5.3 A.
-        // Source: KPA500 Programmer's Reference Rev. A2, §^VI.
-        const QStringList parts = arg.split(QLatin1Char(' '), Qt::SkipEmptyParts);
-        if (parts.size() == 2) {
-            bool ok1, ok2;
-            int vvv = parts[0].toInt(&ok1);
-            int iii = parts[1].toInt(&ok2);
-            if (ok1 && ok2 && vvv >= 0 && iii >= 0) {
-                changed |= assignIfChanged(status.paVoltageV, vvv / 10.0f);
-                changed |= assignIfChanged(status.paCurrentA, iii / 10.0f);
-            }
-        }
-
     } else if (cmd == QLatin1String("TM")) {
-        // ^TMnnn; — temperature 0–150 °C.
-        bool ok;
-        int v = arg.toInt(&ok);
-        if (ok && v >= 0 && v <= 150)
-            changed |= assignIfChanged(status.paTemperatureC, static_cast<float>(v));
-
+        const std::optional<int> value = decimalField(arg, 3, 3);
+        if (value && *value <= 150) {
+            valid = true;
+            changed = assignIfChanged(status.paTemperatureC, static_cast<float>(*value));
+        }
     } else if (cmd == QLatin1String("FL")) {
-        // ^FLnn; RSP — decimal fault code, 00 = no fault.
-        // Note: ^FLC; is a SET (clear command) not a RSP — it is never echoed
-        // back by the amp, so we will never receive cmd=="FL" arg=="C" here.
-        // Source: KPA500 Programmer's Reference Rev. A2, §^FL.
-        bool ok;
-        int v = arg.toInt(&ok);
-        if (ok && v >= 0 && v <= 99)
-            changed |= assignIfChanged(status.faultCode, v);
-
+        const std::optional<int> value = decimalField(arg, 2, 2);
+        if (value) {
+            valid = true;
+            changed = assignIfChanged(status.faultCode, *value);
+        }
     } else if (cmd == QLatin1String("FC")) {
-        // ^FCn; — fan minimum speed 0–6.
-        // Source: KPA500 Programmer's Reference Rev. A2, §^FC.
-        bool ok;
-        int v = arg.toInt(&ok);
-        if (ok && v >= 0 && v <= 6)
-            changed |= assignIfChanged(status.fanMinSpeed, v);
-
+        // Rev. A2 documents one digit; firmware 1.54 also replies with 00–06.
+        const std::optional<int> value = decimalField(arg, 1, 2);
+        if (value && *value <= 6) {
+            valid = true;
+            changed = assignIfChanged(status.fanMinSpeed, *value);
+        }
     } else if (cmd == QLatin1String("RVM")) {
-        // ^RVMnn.nn; — firmware version, one-shot on connect.
-        QString ver = arg.trimmed();
-        if (!ver.isEmpty())
-            changed |= assignIfChanged(status.firmwareVersion, ver);
-
+        const QStringList parts = arg.split(QLatin1Char('.'));
+        if (parts.size() == 2 && decimalField(parts[0], 1, 2)
+            && decimalField(parts[1], 2, 2)) {
+            valid = true;
+            changed = assignIfChanged(status.firmwareVersion, arg);
+        }
     } else if (cmd == QLatin1String("SN")) {
-        // ^SNnnnnn; — serial number, one-shot on connect.
-        QString sn = arg.trimmed();
-        if (!sn.isEmpty())
-            changed |= assignIfChanged(status.serialNumber, sn);
+        if (decimalField(arg, 5, 5)) {
+            valid = true;
+            changed = assignIfChanged(status.serialNumber, arg);
+        }
     }
 
+    if (accepted) {
+        *accepted = valid;
+    }
     return changed;
 }
 
@@ -214,12 +202,17 @@ QByteArray buildPowerOff()
     return QByteArrayLiteral("^ON0;");
 }
 
-QByteArray buildPowerOn()
+QByteArray buildPowerOn() { return QByteArrayLiteral("P"); }
+
+QByteArray buildSetBand(int band)
 {
-    // Source: KPA500 Programmer's Reference Rev. A2, §^ON.
-    // Works over the normal serial port (confirmed by KPA500 Remote and
-    // third-party applications). No UI wired in this PR — see header.
-    return QByteArrayLiteral("^ON1;");
+    if (band < 0 || band > 10) { return {}; }
+    return "^BN" + QByteArray::number(band).rightJustified(2, '0') + ';';
+}
+
+QByteArray buildSetSpeaker(bool on)
+{
+    return on ? QByteArrayLiteral("^SP1;") : QByteArrayLiteral("^SP0;");
 }
 
 QByteArray buildSetFanSpeed(int n)
@@ -241,26 +234,25 @@ QByteArray buildNullCommand()
 
 const QStringList& fastPollCommands()
 {
-    // Values that change on every TX/RX cycle or QSY — queried every ~200 ms.
-    // BN is here (not slow) so a band change shows within one fast-poll cycle
-    // rather than waiting up to 10 s for the slow rotation to reach it.
+    // One command every 200 ms, so each field is refreshed every 800 ms.
     static const QStringList kFast{
         QStringLiteral("WS"),  // power + SWR
         QStringLiteral("OS"),  // operate/standby
-        QStringLiteral("BN"),  // band — fast so QSY is reflected immediately
+        QStringLiteral("BN"),  // confirmed amplifier band
+        QStringLiteral("FL"),  // faults remain visible in mini mode
     };
     return kFast;
 }
 
 const QStringList& slowPollCommands()
 {
-    // Config/status that rarely changes — one command rotated per ~2 s.
+    // Config/status that rarely changes — one command rotated per 500 ms.
     static const QStringList kSlow{
         QStringLiteral("TM"),  // PA temperature
         QStringLiteral("VI"),  // voltage + current
-        QStringLiteral("FL"),  // fault code
         QStringLiteral("ON"),  // power status
         QStringLiteral("FC"),  // fan minimum speed
+        QStringLiteral("SP"),  // fault speaker; queried only while confirmed on
     };
     return kSlow;
 }
