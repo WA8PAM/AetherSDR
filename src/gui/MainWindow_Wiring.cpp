@@ -7527,12 +7527,8 @@ void MainWindow::wireMeters()
 #endif
     }
 
-    // Fwd power gauge scale from radio max power and amp presence, applied to
-    // TxApplet, TunerApplet and SMeterWidget together; with the PGXL in STANDBY
-    // use the barefoot scale. Redundant re-applies are skipped inside each
-    // gauge's setPowerScale(), not here: infoChanged bursts on ordinary status,
-    // and an automation test action writes the widget scale directly, so a
-    // cache here could skip a needed re-apply.
+    // Elecraft telemetry changes only the VU/PWR meter scale; the radio-side
+    // controls retain their existing scale policy.
     auto updatePowerScale = [this]() {
         int maxW = m_radioModel.transmitModel().maxPowerLevel();
         // Aurora (AU-) radios have an integrated 600W PA (Overlord) but
@@ -7544,20 +7540,17 @@ void MainWindow::wireMeters()
         }
         const bool ampActive = m_radioModel.amplifier().present()
                             && m_radioModel.amplifier().operate();
-        // When KPA500 is in OPERATE (but no PGXL present), override maxW so
-        // the 600W gauge tier activates rather than the barefoot 200W range.
-        // hasAmplifier (ampActive) stays false — KPA500 is 500W, not 1.5kW,
-        // so the 2kW PGXL scale would make every reading look tiny.
+        m_appletPanel->txApplet()->setPowerScale(maxW, ampActive);
+        m_appletPanel->tunerApplet()->setPowerScale(maxW, ampActive);
+        m_appletPanel->healthApplet()->setPowerScale(maxW, ampActive);
+        // The KPA500 uses the 600 W meter tier, below the PGXL's 2 kW tier.
         if (!ampActive
             && m_kpa500Conn.isConnected()
             && m_kpa500Conn.isResponding()
             && m_kpa500Conn.lastStatus().operate.value_or(false)) {
             maxW = 500;
         }
-        m_appletPanel->txApplet()->setPowerScale(maxW, ampActive);
-        m_appletPanel->tunerApplet()->setPowerScale(maxW, ampActive);
         m_appletPanel->setMeterPowerScale(maxW, ampActive);
-        m_appletPanel->healthApplet()->setPowerScale(maxW, ampActive);
     };
     connect(&m_radioModel.amplifier(), &AmpModel::presenceChanged, this, updatePowerScale);
     connect(&m_radioModel.amplifier(), &AmpModel::stateChanged, this, updatePowerScale);
