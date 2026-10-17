@@ -2,6 +2,7 @@
 
 #include <functional>
 #include <optional>
+#include <utility>
 
 #include <QByteArray>
 #include <QMetaType>

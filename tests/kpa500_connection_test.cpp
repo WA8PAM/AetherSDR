@@ -236,13 +236,23 @@ public:
         follow.requestBand(1);
         check("Explicit reselection retries a failed command", writes.count("^BN01;") == 1);
         follow.m_parser.feed("^BN01;");
+        follow.m_parser.feed("^OS1;^WS100 015;");
+        check("Fresh powered Operate telemetry selects amplifier meters", follow.hasLiveTxMeters());
         follow.m_received["WS"] = follow.m_clock.elapsed() - 3001;
         follow.expireTelemetry();
         check("Individual stale power clears despite other valid replies", !follow.lastStatus().forwardPowerW && follow.isResponding());
+        check("Other live replies cannot retain amplifier meter selection after power expires",
+              !follow.hasLiveTxMeters());
+        follow.m_parser.feed("^BN01;^OS1;");
+        check("Band and Operate replies cannot restore the expired amplifier meter source",
+              !follow.hasLiveTxMeters());
         writes.clear();
         follow.requestBand(5);
         check("Unknown RF measurement blocks a band change", writes.isEmpty());
         follow.m_parser.feed("^WS000 000;");
+        check("A fresh measured zero restores amplifier meter selection", follow.hasLiveTxMeters());
+        follow.m_parser.feed("^OS0;");
+        check("Standby releases amplifier meter selection", !follow.hasLiveTxMeters());
         follow.m_parser.feed("^BN05;");
         writes.clear();
         follow.setTransmitting(true);

@@ -87,6 +87,11 @@ MainWindow_Wiring (wireMeters / wireMiscApplets)
   silent.
 ```
 
+Shared meter selection additionally requires current power-on and forward-power
+readbacks (`Kpa500Connection::hasLiveTxMeters()`). Individual `^WS` expiry releases
+both radio-meter suppression gates and the amplifier scale even when other
+replies keep the transport responding. A fresh measured zero is valid telemetry.
+
 ---
 
 ## 3. Protocol summary

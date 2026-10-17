@@ -28,6 +28,7 @@
 #include <QTextDocument>
 #include <QVBoxLayout>
 #include <algorithm>
+#include <array>
 #include <cmath>
 
 namespace AetherSDR {

@@ -181,6 +181,11 @@ to show the radio’s forward power and SWR on the radio scale, so drive remains
 visible. Its **RF Power** and **Tune Pwr** sliders show percentages.
 **Mini** has no DRV row.
 
+The shared **VU** and **PWR** meters use KPA500 output only while its power-on,
+Operate and forward-power readbacks are current. If amplifier power telemetry
+expires while other replies continue, the shared meters and scale return to
+the radio until a fresh amplifier measurement arrives.
+
 The KPA500 SWR scale runs from **1 to 5**, matching the amplifier faceplate;
 its display turns amber at 2 and red at 2.5. No RF means SWR is unmeasured.
 

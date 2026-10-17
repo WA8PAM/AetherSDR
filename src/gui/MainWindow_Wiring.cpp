@@ -6512,9 +6512,7 @@ void MainWindow::wireMeters()
     connect(&m_radioModel.meterModel(), &MeterModel::txMetersChanged,
             this, [this](float fwd, float swr, bool swrValid) {
         if ((m_radioModel.amplifier().present() && m_radioModel.amplifier().operate())
-            || (m_kpa500Conn.isConnected()
-                && m_kpa500Conn.isResponding()
-                && m_kpa500Conn.lastStatus().operate.value_or(false)))
+            || m_kpa500Conn.hasLiveTxMeters())
             return;
         // Absent SWR is forwarded as 1.0: RadioSwrValidityFilter downstream
         // reads <1.0 WITH forward power as the radio's over-range sentinel
@@ -6537,9 +6535,7 @@ void MainWindow::wireMeters()
                          bool swrValid, bool reflectedPowerMeasured) {
         if ((m_radioModel.amplifier().present()
              && m_radioModel.amplifier().operate())
-            || (m_kpa500Conn.isConnected()
-                && m_kpa500Conn.isResponding()
-                && m_kpa500Conn.lastStatus().operate.value_or(false))) {
+            || m_kpa500Conn.hasLiveTxMeters()) {
             return;
         }
         // The cross-needle already clamps sub-1.0 values to 1.0 (its rest
@@ -7467,8 +7463,7 @@ void MainWindow::wireMeters()
             [this](const AetherSDR::Kpa500::Status& s) {
         m_appletPanel->kpa500Applet()->applyStatus(s);
         if (!(m_radioModel.amplifier().present() && m_radioModel.amplifier().operate())
-            && m_kpa500Conn.isConnected() && m_kpa500Conn.isResponding()
-            && s.operate.value_or(false) && s.forwardPowerW.has_value()) {
+            && m_kpa500Conn.hasLiveTxMeters()) {
             applyAmpTxMeters(s.forwardPowerW.value(), s.swr.value_or(1.0f),
                              /*fromRelay=*/false);
         }
@@ -7545,10 +7540,7 @@ void MainWindow::wireMeters()
         m_appletPanel->tunerApplet()->setPowerScale(maxW, ampActive);
         m_appletPanel->healthApplet()->setPowerScale(maxW, ampActive);
         // The KPA500 uses the 600 W meter tier, below the PGXL's 2 kW tier.
-        if (!ampActive
-            && m_kpa500Conn.isConnected()
-            && m_kpa500Conn.isResponding()
-            && m_kpa500Conn.lastStatus().operate.value_or(false)) {
+        if (!ampActive && m_kpa500Conn.hasLiveTxMeters()) {
             maxW = 500;
         }
         m_appletPanel->setMeterPowerScale(maxW, ampActive);

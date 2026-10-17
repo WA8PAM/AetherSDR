@@ -43,6 +43,11 @@ public:
     bool isConnecting() const { return m_connecting; }
     bool isNetworkConnection() const { return m_network; }
     bool isResponding() const { return m_responding; }
+    // Other replies can stay live after power telemetry expires.
+    bool hasLiveTxMeters() const {
+        return m_connected && m_responding && m_status.powerOn == true
+            && m_status.operate == true && m_status.forwardPowerW.has_value();
+    }
     // A valid reply has identified the amp during this open transport session.
     bool isDetected() const { return m_detected; }
     // Serial endpoint/rate or raw TCP endpoint; bridge baud is server-configured.
