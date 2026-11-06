@@ -256,6 +256,11 @@ private:
 
     float m_fwdPower{0.0f};
     float m_swr{1.0f};
+    // True while m_fwdPower >= 5 W. The active antenna button turns red while
+    // this is set, mirroring the hardware display. Tracked as a flag so the
+    // threshold crossing triggers exactly one setStyleSheet call rather than
+    // one per meter update (~60 Hz while keyed).
+    bool  m_antTxActive{false};
 
     // Throttles the numeric PWR/SWR text; the bar itself is not throttled.
     QElapsedTimer m_readoutClock;
